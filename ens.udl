@@ -1,0 +1,227 @@
+/// Log severity levels, ordered from most to least severe.
+enum LogLevel {
+    "Error",
+    "Warning",
+    "Info",
+    "Debug",
+    "Trace",
+};
+
+/// Callback for receiving log messages from the library.
+callback interface LogCallback {
+    /// Called when the library produces a log message at or below the
+    /// configured maximum level. Messages are censored in release builds
+    /// to remove sensitive data.
+    void log(LogLevel log_level, string message);
+};
+
+/// Errors returned by ENS library operations.
+///
+/// Each variant carries a human-readable reason string. Reason strings are
+/// censored in release builds to remove sensitive data (e.g. credentials,
+/// server addresses) before they reach the caller's logs.
+[Error]
+interface EnsError {
+    /// Network or TLS failure while talking to the ENS server.
+    TransportError(string reason);
+
+    /// The ENS server returned a gRPC status error.
+    StatusError(string reason);
+
+    /// The library reached a state it does not know how to recover from.
+    InternalError(string reason);
+
+    /// A library function was called before `init()`, or after
+    /// `deinit()`. Call `init()` before any other function.
+    NotInitialized(string reason);
+
+    /// `init()` called after previous `init()` without `deinit()` in between.
+    AlreadyInitialized();
+};
+
+/// Classification of a connection-level error notification received from
+/// the VPN server. These describe problems with the VPN connection itself,
+/// not with the ENS client-to-server link.
+[Enum]
+interface ConnectionErrorNotificationKind {
+    /// The server sent a notification kind this version of the library
+    /// does not recognize. The actuall enum value is stored in the `kind`
+    /// field.
+    Unknown(i32 kind);
+    /// The account has reached its concurrent-device limit.
+    ConnectionLimitReached();
+    /// The server is going into maintenance. This is the only notification
+    /// kind for which the caller can automatically reconnect to a
+    /// different server.
+    ServerMaintenance();
+    /// The credentials presented for the VPN connection are not valid.
+    Unauthenticated();
+    /// A newer session for the same account has taken over on this
+    /// server. This session is being terminated.
+    Superseded();
+};
+
+/// A single connection-error notification pushed from the VPN server.
+dictionary ConnectionErrorNotification {
+    /// Machine-readable classification of the notification.
+    ConnectionErrorNotificationKind kind;
+    /// Free-form, server-supplied context. May be empty. Not
+    /// machine-parseable - intended for human display or logging only.
+    string? additional_info;
+};
+
+/// Callback for receiving ENS events for a single `Connection`.
+///
+/// All callback methods are invoked from a library-owned thread and must
+/// not block. Callers should hand off any nontrivial work to their own
+/// executor.
+callback interface ErrorNotificationCallback {
+    /// Delivers a connection-error notification received from the server.
+    /// May be called zero or more times over the life of the connection.
+    void notify(ConnectionErrorNotification notification);
+
+    /// Signals that the ENS session has ended and no further `notify`
+    /// calls will be made on this callback. Called at most once per
+    /// `Connection`. Calling `shutdown()` will trigger 
+    /// `disconnected("shutdown")`.
+    void disconnected(string? reason);
+};
+
+[Custom]
+typedef string SocketAddr;
+
+/// Which VPN protocol the accompanying `Credentials` are for. Reserved
+/// for future protocol-specific behavior; currently the library treats
+/// both variants identically on the wire.
+enum CredentialsKind {
+    "OpenVPN",
+    "NordWhisper"
+};
+
+/// Service credentials used to authenticate to ENS for OpenVPN and
+/// NordWhisper VPN sessions.
+///
+/// These are the same `{username, password}` the client already sends to
+/// the VPN server itself (OpenVPN's management-socket auth,
+/// NordWhisper's `X-Auth-Password` header), obtained from the NordVPN
+/// backend via `/v1/users/services/credentials`. They are backend-issued
+/// high-entropy random strings, not user-chosen passwords.
+dictionary Credentials {
+    /// Service username (`Credentials.OpenVPNUsername` on the client
+    /// side).
+    string username;
+    /// Service password (`Credentials.OpenVPNPassword` on the client
+    /// side). Treat as secret; do not log.
+    string password;
+    /// Which VPN protocol this credential pair authenticates.
+    CredentialsKind kind;
+};
+
+/// Which VPN protocol the accompanying `Keys` are for. Reserved for
+/// future protocol-specific behavior; currently only NordLynx (WireGuard)
+/// uses key-based ENS authentication.
+enum KeyKind {
+    "NordLynx"
+};
+
+/// Public/private key material used to authenticate to ENS for WireGuard
+/// (NordLynx) VPN sessions.
+///
+/// ENS authentication for NordLynx uses an ECDH between the client's
+/// local NordLynx private key and the VPN server's public key, matching
+/// the identity model of the WireGuard tunnel itself. Both key halves
+/// are required.
+dictionary Keys {
+    /// Client's private key.
+    bytes local_private_key;
+    /// VPN server's public key - the same public key used to establish
+    /// the WireGuard tunnel.
+    bytes vpn_public_key;
+    /// Which VPN protocol this key material authenticates.
+    KeyKind kind;
+};
+
+/// Handle to a live ENS session created by `connect()`.
+///
+/// Holding the returned `Connection` keeps the session and its
+/// background task alive. Dropping it without calling `shutdown()` is
+/// allowed and will terminate the session, but `shutdown()` is
+/// preferred because it lets the caller observe termination failures.
+interface Connection {
+    /// Terminates the ENS session and waits for the background task to
+    /// stop. After this returns, no further callbacks will fire on the
+    /// `ErrorNotificationCallback` that was passed to `connect()`
+    /// (except one final `disconnected("shutdown")` call).
+    ///
+    /// Safe to call multiple times; subsequent calls are no-ops.
+    [Throws=EnsError]
+    void shutdown();
+};
+
+/// Authentication material for an ENS session.
+///
+/// Tagged union: exactly one variant is used per `connect()` call, and
+/// the variant must match the VPN protocol whose connection ENS is
+/// monitoring - `Credentials` for OpenVPN and NordWhisper, `Keys` for
+/// NordLynx (WireGuard).
+[Enum]
+interface Authentication {
+    /// Username/password authentication for OpenVPN and NordWhisper.
+    Credentials(Credentials credentials);
+    /// Key-based authentication for NordLynx (WireGuard).
+    Keys(Keys keys);
+};
+
+/// Callback for protecting `socket_fd` from being routed through the VPN tunnel.
+callback interface ProtectCallback {
+    [Throws=EnsError]
+    void protect(i32 socket_fd);
+};
+
+namespace ens {
+    /// Initializes the library. Subsequent calls without a
+    /// matching `deinit()` return `AlreadyInitialized`.
+    [Throws=EnsError]
+    void init();
+
+    /// Tears down library-global state. After this returns, all other
+    /// entry points fail with `NotInitialized` until `init()` is called
+    /// again. Any live `Connection` handles are shut down as part of
+    /// this call.
+    [Throws=EnsError]
+    void deinit();
+
+    /// Returns the current heap memory usage of the library in bytes.
+    /// Intended for diagnostics.
+    u64 get_memory_usage();
+
+    /// Returns the library version string in the format "vX.Y.Z".
+    string get_version();
+
+    /// Registers a callback to receive log messages. Only messages at or
+    /// below `max_level` are forwarded. Sensitive data in log messages is
+    /// replaced with dots in release builds.
+    ///
+    /// Replaces any previously registered log callback. Passing a new
+    /// callback drops the previous one.
+    [Throws=EnsError]
+    void set_log_callback(LogLevel max_level, LogCallback callback);
+
+    /// Opens an ENS session to the VPN server at `ip:port` and starts
+    /// monitoring for connection-error notifications. Notifications are
+    /// delivered to `callback` on a library-owned thread.
+    ///
+    /// The returned `Connection` owns the background task; drop it or
+    /// call `shutdown()` on it to end the session.
+    ///
+    /// The `authentication` variant must match the VPN protocol whose
+    /// tunnel ENS is meant to monitor: `Credentials` for OpenVPN and
+    /// NordWhisper, `Keys` for NordLynx.
+    [Throws=EnsError]
+    Connection connect(
+        SocketAddr socket_addr,
+        ProtectCallback? protect_callback,
+        Authentication authentication,
+        ErrorNotificationCallback notification_callback
+    );
+};

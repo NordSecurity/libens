@@ -1,0 +1,19 @@
+debug/
+target/
+.DS_Store
+.codex
+
+**/*.rs.bk
+
+# MSVC Windows builds of rustc generate these, which store debugging information
+*.pdb
+
+.idea/
+
+/3rd-party/ci-helper-scripts
+
+# Added by cargo
+
+/target
+
+_nordtls.orig.udl

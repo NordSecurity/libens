@@ -1,0 +1,6 @@
+[bindings.kotlin]
+cdylib_name = "nordtls"
+package_name = "com.nordsec.nordtls"
+
+[bindings.csharp]
+cdylib_name = "nordtls"

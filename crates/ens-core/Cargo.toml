@@ -1,0 +1,19 @@
+[package]
+name = "ens-core"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "UNLICENSED"
+publish = false
+authors = ["LLT TCP team"]
+
+[dependencies]
+log = { version = "0.4", features = ["std"] }
+telio-utils = { git = "https://github.com/NordSecurity/libtelio.git" }
+telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git" }
+thiserror = "2"
+
+[dev-dependencies]
+
+[lints.clippy]
+empty-line-after-doc-comments = "allow"

@@ -1,0 +1,69 @@
+name: Build
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target_os: macos
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - arch: aarch64
+            target_os: macos
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - arch: aarch64
+            target_os: ios
+            runner: macos-15
+            target: aarch64-apple-ios
+          - arch: x86_64
+            target_os: windows
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            target_os: windows
+            runner: windows-2022
+            target: aarch64-pc-windows-msvc
+          - arch: x86_64
+            target_os: linux
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target_os: linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target_os }}-${{ matrix.arch }}
+      - name: Setup MSVC
+        uses: egor-tensin/vs-shell@54e4148eac794e4580591c2e0b7750f14b7891fc # v2.2
+        if: ${{ matrix.target_os == 'windows' }}
+      - name: Build libens
+        run: cargo build --release --target ${{ matrix.target }} --lib
+      - name: Upload shared library
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-${{ matrix.target_os }}-${{ matrix.arch }}
+          path: |
+            target/${{ matrix.target }}/release/libens.dylib
+            target/${{ matrix.target }}/release/libens.so
+            target/${{ matrix.target }}/release/ens.dll
+          if-no-files-found: error

@@ -4,11 +4,7 @@
     clippy::unwrap_used,
     clippy::expect_used
 )]
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::needless_pass_by_value,
-    clippy::empty_line_after_doc_comments
-)]
+#![allow(clippy::missing_errors_doc)]
 
 use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc};
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
@@ -128,6 +124,7 @@ pub fn connect(
     let protect: Option<telio_sockets::Protect> = match protect_cb {
         Some(protect) => {
             let protect = AssertUnwindSafe(protect);
+            #[allow(clippy::useless_conversion)]
             Some(Arc::new(move |fd| match fd.try_into() {
                 Ok(fd) => {
                     let protect_res = protect.protect(fd);
@@ -136,7 +133,7 @@ pub fn connect(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to convert file discriptor: {e}")
+                    eprintln!("Failed to convert file discriptor: {e}");
                 }
             }))
         }

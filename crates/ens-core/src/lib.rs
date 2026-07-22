@@ -21,6 +21,11 @@ pub use memory::get_memory_usage;
 
 use crate::logging::LogCallbackHolder;
 
+mod built_info {
+    // The file has been placed there by the build script.
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
 type Result<T> = std::result::Result<T, EnsError>;
 
 #[derive(Debug, Error)]
@@ -59,7 +64,7 @@ pub fn set_log_callback(max_level: LogLevel, callback: Box<dyn LogCallback>) -> 
 
 #[must_use]
 pub fn get_version() -> String {
-    todo!()
+    format!("v{}", built_info::PKG_VERSION)
 }
 
 /// Initialize the library. Needs to be called before any other function is called.
@@ -68,7 +73,21 @@ pub fn init() -> Result<()> {
     if was_initialized {
         return Err(EnsError::AlreadyInitialized);
     }
+    print_version_info();
     Ok(())
+}
+
+fn print_version_info() {
+    use built_info::{BUILT_TIME_UTC, GIT_DIRTY, GIT_VERSION, RUSTC_VERSION};
+    let version = get_version();
+    let git_version = GIT_VERSION.unwrap_or("unknown-git-version");
+    let dirty = match GIT_DIRTY {
+        Some(true) => "-dirty",
+        _ => "",
+    };
+    // This results in a log like this:
+    // libens initialized, version v0.0.1 (73159b9-dirty) built on Wed, 22 Jul 2026 14:55:18 +0000 using compiler rustc 1.97.1 (8bab26f4f 2026-07-14)
+    log::info!("libens initialized, version {version} ({git_version}{dirty}) built on {BUILT_TIME_UTC} using compiler {RUSTC_VERSION}");
 }
 
 /// Deinitializes the library. After calling this, calls to other functions

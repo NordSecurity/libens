@@ -10,7 +10,7 @@ authors = ["LLT TCP team"]
 [workspace]
 members = [
     ".",
-    # "cli",
+    "cli",
     "crates/ens-core",
 ]
 

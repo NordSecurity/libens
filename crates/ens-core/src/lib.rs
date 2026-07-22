@@ -7,6 +7,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod logging;
+mod memory;
 
 use std::{
     net::SocketAddr,
@@ -15,6 +16,8 @@ use std::{
 };
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use thiserror::Error;
+
+pub use memory::get_memory_usage;
 
 use crate::logging::LogCallbackHolder;
 
@@ -52,11 +55,6 @@ pub trait LogCallback: Send + Sync {
 pub fn set_log_callback(max_level: LogLevel, callback: Box<dyn LogCallback>) -> Result<()> {
     let callback = LogCallbackHolder::new(callback);
     logging::set_log_callback(max_level, callback)
-}
-
-#[must_use]
-pub fn get_memory_usage() -> u64 {
-    todo!()
 }
 
 #[must_use]

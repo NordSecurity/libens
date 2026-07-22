@@ -8,6 +8,7 @@
 
 mod logging;
 mod memory;
+mod panics;
 
 use std::{
     net::SocketAddr,
@@ -19,7 +20,10 @@ use thiserror::Error;
 
 pub use memory::get_memory_usage;
 
-use crate::logging::LogCallbackHolder;
+use crate::{
+    logging::LogCallbackHolder,
+    panics::{catch_panic, catch_panic_result},
+};
 
 mod built_info {
     // The file has been placed there by the build script.
@@ -58,23 +62,30 @@ pub trait LogCallback: Send + Sync {
 }
 
 pub fn set_log_callback(max_level: LogLevel, callback: Box<dyn LogCallback>) -> Result<()> {
-    let callback = LogCallbackHolder::new(callback);
-    logging::set_log_callback(max_level, callback)
+    catch_panic_result(|| {
+        let callback = LogCallbackHolder::new(callback);
+        logging::set_log_callback(max_level, callback)
+    })
 }
 
 #[must_use]
 pub fn get_version() -> String {
-    format!("v{}", built_info::PKG_VERSION)
+    catch_panic(
+        || format!("v{}", built_info::PKG_VERSION),
+        "unknown".to_owned(),
+    )
 }
 
 /// Initialize the library. Needs to be called before any other function is called.
 pub fn init() -> Result<()> {
-    let was_initialized = IS_INITIALIZED.swap(true, std::sync::atomic::Ordering::Relaxed);
-    if was_initialized {
-        return Err(EnsError::AlreadyInitialized);
-    }
-    print_version_info();
-    Ok(())
+    catch_panic_result(|| {
+        let was_initialized = IS_INITIALIZED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if was_initialized {
+            return Err(EnsError::AlreadyInitialized);
+        }
+        print_version_info();
+        Ok(())
+    })
 }
 
 fn print_version_info() {
@@ -93,13 +104,15 @@ fn print_version_info() {
 /// Deinitializes the library. After calling this, calls to other functions
 /// will fail.
 pub fn deinit() -> Result<()> {
-    let was_initialized = IS_INITIALIZED.swap(false, std::sync::atomic::Ordering::Relaxed);
-    if !was_initialized {
-        return Err(EnsError::NotInitialized {
-            reason: "deinit".to_owned(),
-        });
-    }
-    Ok(())
+    catch_panic_result(|| {
+        let was_initialized = IS_INITIALIZED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !was_initialized {
+            return Err(EnsError::NotInitialized {
+                reason: "deinit".to_owned(),
+            });
+        }
+        Ok(())
+    })
 }
 
 pub enum ConnectionErrorNotificationKind {

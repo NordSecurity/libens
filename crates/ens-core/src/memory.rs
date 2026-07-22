@@ -1,6 +1,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::panics::catch_panic;
+
 struct TrackingAllocator {
     allocated: AtomicUsize,
 }
@@ -26,5 +28,5 @@ static GLOBAL: TrackingAllocator = TrackingAllocator {
 
 #[must_use]
 pub fn get_memory_usage() -> u64 {
-    GLOBAL.allocated.load(Ordering::SeqCst) as u64
+    catch_panic(|| GLOBAL.allocated.load(Ordering::SeqCst) as u64, 0)
 }

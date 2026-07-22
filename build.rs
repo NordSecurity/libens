@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if target_os.as_str() == "windows" {
         let version = parse_version()?;
-        println!("cargo:warning=LIB_VERSION = {}", &version);
+        println!("cargo:warning=LIB_VERSION = {version}");
 
         create_winres(&version)?;
     }

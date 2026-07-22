@@ -11,6 +11,7 @@ authors = ["LLT TCP team"]
 telio-utils = { git = "https://github.com/NordSecurity/libtelio.git" }
 telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git" }
 thiserror = "2"
+log = { version = "0.4.33", features = ["std"] }
 
 [dev-dependencies]
 

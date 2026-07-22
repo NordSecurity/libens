@@ -453,6 +453,7 @@ dependencies = [
 name = "ens-core"
 version = "0.0.1"
 dependencies = [
+ "log",
  "telio-sockets",
  "telio-utils",
  "thiserror 2.0.19",

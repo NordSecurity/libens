@@ -6,9 +6,17 @@
 )]
 #![allow(clippy::missing_errors_doc)]
 
-use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc};
+mod logging;
+
+use std::{
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    sync::{atomic::AtomicBool, Arc},
+};
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use thiserror::Error;
+
+use crate::logging::LogCallbackHolder;
 
 type Result<T> = std::result::Result<T, EnsError>;
 
@@ -20,7 +28,7 @@ pub enum EnsError {
     StatusError { reason: String },
     #[error("Internal error: {reason}")]
     InternalError { reason: String },
-    #[error("Library not yet initialized")]
+    #[error("Library not yet initialized: {reason}")]
     NotInitialized { reason: String },
     #[error("Library already initialized")]
     AlreadyInitialized,
@@ -35,12 +43,15 @@ pub enum LogLevel {
     Trace,
 }
 
+static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 pub trait LogCallback: Send + Sync {
     fn log(&self, log_level: LogLevel, message: String);
 }
 
-pub fn set_log_callback(_max_level: LogLevel, _callback: Box<dyn LogCallback>) -> Result<()> {
-    todo!()
+pub fn set_log_callback(max_level: LogLevel, callback: Box<dyn LogCallback>) -> Result<()> {
+    let callback = LogCallbackHolder::new(callback);
+    logging::set_log_callback(max_level, callback)
 }
 
 #[must_use]
@@ -55,16 +66,23 @@ pub fn get_version() -> String {
 
 /// Initialize the library. Needs to be called before any other function is called.
 pub fn init() -> Result<()> {
-    let tmp = telio_utils::log_censor::LogCensor::default();
-    tmp.set_enabled(true);
-
-    todo!()
+    let was_initialized = IS_INITIALIZED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if was_initialized {
+        return Err(EnsError::AlreadyInitialized);
+    }
+    Ok(())
 }
 
 /// Deinitializes the library. After calling this, calls to other functions
 /// will fail.
 pub fn deinit() -> Result<()> {
-    todo!()
+    let was_initialized = IS_INITIALIZED.swap(false, std::sync::atomic::Ordering::Relaxed);
+    if !was_initialized {
+        return Err(EnsError::NotInitialized {
+            reason: "deinit".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub enum ConnectionErrorNotificationKind {

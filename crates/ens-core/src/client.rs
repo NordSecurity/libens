@@ -1,0 +1,1162 @@
+use std::{
+    net::{IpAddr, ToSocketAddrs},
+    str::FromStr,
+    sync::Arc,
+};
+
+use telio_crypto::{PublicKey, SecretKey, SharedSecret};
+use telio_sockets::SocketPool;
+use telio_utils::exponential_backoff::{self, Backoff};
+
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use blake3::{derive_key, keyed_hash};
+use http::Uri;
+use hyper_util::rt::TokioIo;
+use log::{debug, error, info, warn};
+use rustls::{
+    client::danger::ServerCertVerifier, crypto::CryptoProvider, pki_types::CertificateDer,
+    ClientConfig, RootCertStore,
+};
+use tokio::{
+    select,
+    sync::{
+        mpsc::{Receiver, Sender},
+        watch,
+    },
+    task::JoinHandle,
+};
+use tokio_rustls::TlsConnector;
+use tonic::{
+    metadata::{errors::InvalidMetadataValue, AsciiMetadataValue},
+    transport::{Channel, Endpoint},
+    Request, Status,
+};
+use tower::service_fn;
+use uuid::Uuid;
+
+use llt_proto::ens::{
+    ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
+};
+
+use crate::{Authentication, Keys};
+
+const CONTEXT: &str = "ens-auth";
+const AUTHENTICATION_KEY: &str = "authentication";
+const DEFAULT_ROOT_CERTIFICATE: &[u8] =
+    include_bytes!("../../../data/default_root_certificate.der");
+
+/// ENS errors
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Malformed VPN uri
+    #[error("Failed to parse the vpn server uri: {0}")]
+    MalformedVpnUri(#[from] http::Error),
+    /// Inner grpc/tonic error
+    #[error("ENS transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+    /// GRPC status error
+    #[error("GRPC status error: {0}")]
+    Status(#[from] tonic::Status),
+    /// Exponential backoff creation error
+    #[error("Exponential backoff creation failed {0}")]
+    ExponentialBackoff(#[from] exponential_backoff::Error),
+    #[error("Uuid parsing failed: {0}")]
+    UuidParsing(#[from] uuid::Error),
+    #[error("Grpc metadata parsing failed: {0}")]
+    InvalidMetadata(#[from] InvalidMetadataValue),
+    #[error("Invalid key: {reason}")]
+    InvalidKey { reason: String },
+}
+
+/// `ErrorNotificationService` manages tasks started and stopped to consume the ENS grpc error streams
+pub struct ErrorNotificationService {
+    quit: Option<(watch::Sender<bool>, JoinHandle<()>)>,
+    tx: Sender<(ConnectionError, String)>,
+    socket_pool: Arc<SocketPool>,
+    allow_only_mlkem: bool,
+    // DER encoded root certificate to be use for verification of TLS
+    root_certificate: Vec<u8>,
+}
+
+impl Drop for ErrorNotificationService {
+    fn drop(&mut self) {
+        let _ = self.stop_old_monitor(); // Can't wait on the handle in the Drop
+    }
+}
+
+impl ErrorNotificationService {
+    /// Create new instance with `buffer_size` used for the error notifications channel
+    pub fn new(
+        buffer_size: usize,
+        socket_pool: Arc<SocketPool>,
+        allow_only_mlkem: bool,
+        root_certificate_override: Option<Vec<u8>>,
+    ) -> (Self, Receiver<(ConnectionError, String)>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
+
+        if let Some(cert) = &root_certificate_override {
+            info!(
+                "Will use root certificate override: {:?}",
+                BASE64_STANDARD.encode(cert)
+            );
+        }
+
+        (
+            Self {
+                quit: None,
+                tx,
+                socket_pool,
+                allow_only_mlkem,
+                root_certificate: root_certificate_override
+                    .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
+            },
+            rx,
+        )
+    }
+
+    pub fn start_monitor_on_port(
+        &mut self,
+        vpn_ip: IpAddr,
+        ens_port: u16,
+        authentication: Authentication,
+        backoff: impl Backoff,
+    ) {
+        info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
+        self.stop();
+
+        let (quit_tx, quit_rx): (watch::Sender<bool>, watch::Receiver<bool>) =
+            watch::channel(false);
+
+        // Needs to be http and not https, otherwise grpc will add another layer of https
+        // on top of our own custom one
+        let vpn_uri = format!("http://{vpn_ip}:{ens_port}");
+
+        let pool = self.socket_pool.clone();
+        let tx = self.tx.clone();
+        let allow_only_mlkem = self.allow_only_mlkem;
+        let root_certificate = self.root_certificate.clone();
+
+        let join_handle = tokio::spawn(async move {
+            // This future is too big for keeping it on the stack
+            if let Err(e) = Box::pin(task(
+                &vpn_uri,
+                authentication,
+                pool.clone(),
+                tx,
+                quit_rx,
+                allow_only_mlkem,
+                backoff,
+                root_certificate,
+            ))
+            .await
+            {
+                warn!("ENS task for {vpn_uri} failed: {e}");
+            }
+        });
+
+        self.quit = Some((quit_tx, join_handle));
+    }
+
+    /// Stop ENS
+    pub fn stop(&mut self) {
+        if let Some(join_handle) = self.stop_old_monitor() {
+            debug!("Will wait for the old ENS task to end");
+            join_handle.abort(); // Since the task might be in the grpc connection establishment, it might not be able
+                                 // to receive and react to te quit signal. Which is why we need to cancel it here, so
+                                 // that we are not stuck for a long time in the await.
+        }
+    }
+
+    fn stop_old_monitor(&mut self) -> Option<JoinHandle<()>> {
+        if let Some((quit_channel, join_handle)) = self.quit.take() {
+            debug!("Previous ENS task will be stopped");
+            if let Err(e) = quit_channel.send(true) {
+                warn!("Failed to send stop request to previous ENS monitor: {e}");
+            } else {
+                return Some(join_handle);
+            }
+        }
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn task(
+    vpn_uri: &str,
+    authentication: Authentication,
+    pool: Arc<SocketPool>,
+    tx: Sender<(ConnectionError, String)>,
+    mut quit_rx: watch::Receiver<bool>,
+    allow_only_mlkem: bool,
+    mut backoff: impl Backoff,
+    root_certificate: Vec<u8>,
+) -> Result<(), Error> {
+    'outer: loop {
+        macro_rules! restart {
+            ($backoff: expr) => {
+                tokio::time::sleep(backoff.get_backoff()).await;
+                backoff.next_backoff();
+                continue 'outer;
+            };
+        }
+        /// If the Err is returned but ENS shouldn't quit yet, the outer loop will be restarted
+        /// and the task will reconnect. If we should quit, the task will terminate. In case of Ok
+        /// case, the macro will evaluate to the inner value of Ok.
+        macro_rules! handle_error {
+            ($value: expr, $backoff: expr) => {
+                match $value {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("ENS task transient failure: {e}");
+                        if *quit_rx.borrow() == true {
+                            break 'outer;
+                        }
+                        restart!($backoff);
+                    }
+                }
+            };
+        }
+
+        let pool = pool.clone();
+        let external_channel = handle_error!(
+            Box::pin(create_external_channel(
+                vpn_uri,
+                pool,
+                allow_only_mlkem,
+                root_certificate.clone()
+            ))
+            .await,
+            backoff
+        );
+
+        let authenticated_challenge = match &authentication {
+            Authentication::Credentials { .. } => todo!(),
+            Authentication::Keys { keys } => {
+                let keys = convert_keys(keys)?;
+
+                let authenticated_challenge = handle_error!(
+                    get_login_challenge(
+                        external_channel.clone(),
+                        keys.vpn_public_key,
+                        keys.local_private_key.clone(),
+                    )
+                    .await,
+                    backoff
+                );
+                authenticated_challenge
+            }
+        };
+
+        let mut client = ens_client::EnsClient::with_interceptor(
+            external_channel,
+            authentication_interceptor(authenticated_challenge),
+        );
+
+        let connection = handle_error!(
+            client
+                .connection_errors(ConnectionErrorRequest::default())
+                .await,
+            backoff
+        );
+        let mut stream = connection.into_inner();
+        loop {
+            select! {
+                _ = quit_rx.wait_for(|b| *b) => {
+                    info!("ENS monitor for '{vpn_uri}' ends");
+                    break 'outer;
+                }
+                error_notification = stream.message() => {
+                    warn!("Received error notification for '{vpn_uri}': {error_notification:?}");
+                    match error_notification {
+                        Ok(Some(error_notification)) => {
+                            backoff.reset();
+                            if let Err(e) = tx.try_send((error_notification, vpn_uri.to_owned())) {
+                                warn!("Failed to publish newly received error notification: {e}");
+                            }
+                        }
+                        Ok(None) => {
+                            debug!("'{vpn_uri}' closed the grpc stream");
+                            break 'outer;
+                        }
+                        Err(e) => {
+                            // After the first error, the stream will never return any new value, which means
+                            // we need to reconnect. For details, see: https://github.com/hyperium/tonic/blob/c9cc210cb7c6f3f937786a3134c682761a26c65c/tonic/src/codec/decode.rs#L392-L394
+                            error!("GRPC error: {e}");
+                            break;
+                        }
+                    }
+                }
+            };
+        }
+        restart!(&mut backoff);
+    }
+    debug!("ENS monitor for '{vpn_uri}' terminates");
+    Ok(())
+}
+
+async fn get_login_challenge(
+    external_channel: Channel,
+    vpn_public_key: PublicKey,
+    local_private_key: SecretKey,
+) -> Result<AsciiMetadataValue, Error> {
+    let mut login_client = login_client::LoginClient::new(external_channel);
+
+    let challenge_response = login_client
+        .get_challenge(ChallengeRequest::default())
+        .await?;
+    let challenge = &challenge_response.get_ref().challenge;
+    let challenge = Uuid::from_str(challenge)?;
+    let shared_secret = local_private_key.ecdh(&vpn_public_key);
+
+    let mut authentication = vec![];
+    authentication.extend_from_slice(&local_private_key.public());
+    authentication.extend_from_slice(&challenge.into_bytes());
+    let authentication_tag = authentication_tag(&shared_secret, &authentication);
+    authentication.extend_from_slice(&authentication_tag);
+    let authentication = BASE64_STANDARD.encode(&authentication);
+
+    Ok(AsciiMetadataValue::try_from(authentication)?)
+}
+
+fn authentication_interceptor(
+    authentication_value: AsciiMetadataValue,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> {
+    move |mut req: Request<()>| {
+        req.metadata_mut()
+            .insert(AUTHENTICATION_KEY, authentication_value.clone());
+        Ok(req)
+    }
+}
+
+async fn create_external_channel(
+    vpn_uri: &str,
+    pool: Arc<SocketPool>,
+    allow_only_mlkem: bool,
+    root_certificate: Vec<u8>,
+) -> Result<Channel, Error> {
+    let socket_factory = move |uri: Uri| {
+        let pool = pool.clone();
+        let root_certificate = root_certificate.clone();
+        async move {
+            let Some(host) = uri.host() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing host in vpn uri",
+                ));
+            };
+            let Some(port) = uri.port_u16() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing port in vpn uri",
+                ));
+            };
+
+            let socket = pool.new_external_tcp_v4(None)?;
+            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+            if let Some(resolved) = ((host, port).to_socket_addrs()?).next() {
+                let tcp_stream = socket.connect(resolved).await?;
+                let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate)?;
+                let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+                return Ok::<_, std::io::Error>(TokioIo::new(tls_stream));
+            }
+
+            Err(std::io::Error::other(format!(
+                "None of the IPs resolved from {host} accepted ENS over TLS"
+            )))
+        }
+    };
+
+    Ok(Endpoint::try_from(vpn_uri.to_owned())?
+        .connect_with_connector(service_fn(socket_factory))
+        .await?)
+}
+
+fn make_crypto_provider(allow_only_mlkem: bool) -> Arc<CryptoProvider> {
+    let mut provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+
+    if allow_only_mlkem {
+        provider.kx_groups =
+            vec![tokio_rustls::rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    }
+
+    Arc::new(provider)
+}
+
+fn make_trusted_root_cert_verifier(
+    crypto_provider: Arc<CryptoProvider>,
+    root_certificate: &[u8],
+) -> std::io::Result<Arc<impl ServerCertVerifier>> {
+    use rustls::{
+        client::{danger::HandshakeSignatureValid, WebPkiServerVerifier},
+        pki_types::{ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
+    };
+
+    #[derive(Debug)]
+    struct CertFingerprintLogger(Arc<WebPkiServerVerifier>);
+
+    impl ServerCertVerifier for CertFingerprintLogger {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            use sha2::{Digest, Sha256};
+            let hash: [u8; 32] = Sha256::digest(end_entity).into();
+            info!(
+                "Remote gRPC server ({server_name:?}) sha256 fingerprint: {}",
+                hex::encode(hash)
+            );
+
+            let verification = self.0.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+
+            info!("Remote gRPC TLS certificate verification result: {verification:?}");
+
+            verification
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.0.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.0.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.supported_verify_schemes()
+        }
+    }
+
+    let mut roots = RootCertStore::empty();
+    let (added, ignored) =
+        roots.add_parsable_certificates([CertificateDer::from_slice(root_certificate)]);
+    if ignored > 0 {
+        warn!("Added {added} certs to trusted store, ignored: {ignored}");
+        return Err(std::io::Error::other(
+            "Failed to add root cert to the root certificate store",
+        ));
+    }
+    debug!("Added {added} certs to trusted store, ignored: {ignored}");
+
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), crypto_provider)
+        .build()
+        .map_err(std::io::Error::other)?;
+    Ok(Arc::new(CertFingerprintLogger(verifier)))
+}
+
+fn make_tls_connector(
+    allow_only_mlkem: bool,
+    root_certificate: &[u8],
+) -> std::io::Result<TlsConnector> {
+    let provider = make_crypto_provider(allow_only_mlkem);
+
+    let mut tls_config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .dangerous()
+        .with_custom_certificate_verifier(make_trusted_root_cert_verifier(
+            provider,
+            root_certificate,
+        )?)
+        .with_no_client_auth();
+
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    Ok(TlsConnector::from(Arc::new(tls_config)))
+}
+
+fn authentication_tag(secret: &SharedSecret, message: &[u8]) -> [u8; 32] {
+    let key = derive_key(CONTEXT, secret);
+    *keyed_hash(&key, message).as_bytes()
+}
+
+struct ConvertedKeys {
+    vpn_public_key: PublicKey,
+    local_private_key: SecretKey,
+}
+fn convert_keys(keys: &Keys) -> Result<ConvertedKeys, Error> {
+    let vpn_public_key =
+        keys.vpn_public_key
+            .clone()
+            .try_into()
+            .map_err(|_e| Error::InvalidKey {
+                // error here is just a Vec<u8> so no point in adding it to the reason below
+                reason: "vpn public key conversion failed".to_owned(),
+            })?;
+    let local_private_key: SecretKey =
+        keys.local_private_key
+            .clone()
+            .try_into()
+            .map_err(|_e| Error::InvalidKey {
+                // error here is just a Vec<u8> so no point in adding it to the reason below
+                reason: "local private key conversion failed".to_owned(),
+            })?;
+
+    Ok(ConvertedKeys {
+        vpn_public_key,
+        local_private_key,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        net::Ipv4Addr,
+        sync::{atomic::AtomicUsize, LazyLock, Mutex, Once},
+        time::Duration,
+    };
+
+    use assert_matches::assert_matches;
+    use async_channel::{self, unbounded, Receiver as AsyncReceiver, Sender as AsyncSender};
+    use llt_proto::ens::{
+        ens_server::{self, EnsServer},
+        login_server::{self, LoginServer},
+        ChallengeResponse, ConnectionError,
+    };
+    use rcgen::{
+        generate_simple_self_signed, BasicConstraints, Certificate, CertificateParams,
+        CertifiedKey, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    };
+    use telio_crypto::SecretKey;
+    use telio_sockets::NativeProtector;
+    use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{service::Interceptor, transport::Server};
+
+    use crate::{init, Keys};
+
+    use super::*;
+
+    use llt_proto::ens::Error as EnsProtoError;
+
+    const SUBJECT_ALT_NAMES: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+
+    static INIT: Once = Once::new();
+
+    fn run_init() {
+        INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
+    }
+
+    #[derive(Debug)]
+    enum Command {
+        Send(ConnectionError),
+        Error(tonic::Status),
+        End,
+    }
+
+    struct State {
+        command_rx: AsyncReceiver<Command>,
+        challenges: Mutex<HashSet<Uuid>>,
+        vpn_server_private_key: SecretKey,
+    }
+
+    impl State {
+        fn new(command_rx: AsyncReceiver<Command>, vpn_server_private_key: SecretKey) -> Self {
+            Self {
+                challenges: Mutex::new(HashSet::default()),
+                vpn_server_private_key,
+                command_rx,
+            }
+        }
+    }
+
+    // Root CA and a leaf cert issued by it
+    #[derive(Debug)]
+    struct TlsConfig {
+        ca_cert: Certificate,
+        leaf_cert: Certificate,
+        leaf_key_pem: String,
+    }
+
+    impl TlsConfig {
+        fn new() -> Self {
+            let mut ca_params = CertificateParams::default();
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+
+            let mut ca_dn = DistinguishedName::new();
+            ca_dn.push(DnType::CommonName, "Test CA");
+            ca_dn.push(DnType::OrganizationName, "Test Org");
+            ca_params.distinguished_name = ca_dn;
+
+            let ca_key_pair = KeyPair::generate().unwrap();
+            let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
+            let issuer = Issuer::new(ca_params, ca_key_pair);
+
+            let mut leaf_params = CertificateParams::default();
+            let mut leaf_dn = DistinguishedName::new();
+            leaf_dn.push(DnType::CommonName, "localhost");
+            leaf_params.distinguished_name = leaf_dn;
+            leaf_params.subject_alt_names = vec![
+                rcgen::SanType::DnsName("localhost".parse().unwrap()),
+                rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            ];
+
+            let leaf_key_pair = KeyPair::generate().unwrap();
+            let leaf_cert = leaf_params.signed_by(&leaf_key_pair, &issuer).unwrap();
+
+            let leaf_key_pem = leaf_key_pair.serialize_pem();
+
+            TlsConfig {
+                ca_cert,
+                leaf_key_pem,
+                leaf_cert,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct GrpcStub(Arc<State>);
+
+    impl std::ops::Deref for GrpcStub {
+        type Target = State;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ens_server::Ens for GrpcStub {
+        type ConnectionErrorsStream = ReceiverStream<Result<ConnectionError, tonic::Status>>;
+        async fn connection_errors(
+            &self,
+            _request: tonic::Request<ConnectionErrorRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ConnectionErrorsStream>, tonic::Status>
+        {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+            let command_rx = self.command_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    println!("next loop iteration...");
+                    match command_rx.recv().await.unwrap() {
+                        Command::Send(e) => tx.send(Ok(e)).await.unwrap(),
+                        Command::Error(status) => tx.send(Err(status)).await.unwrap(),
+                        Command::End => break,
+                    }
+                }
+            });
+
+            Ok(tonic::Response::new(ReceiverStream::new(rx)))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl login_server::Login for GrpcStub {
+        async fn get_challenge(
+            &self,
+            _request: tonic::Request<ChallengeRequest>,
+        ) -> std::result::Result<tonic::Response<ChallengeResponse>, tonic::Status> {
+            let challenge = Uuid::new_v4();
+            self.challenges.lock().unwrap().insert(challenge);
+            Ok(tonic::Response::new(ChallengeResponse {
+                challenge: challenge.to_string(),
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CheckAuthenticationInterceptor(GrpcStub);
+
+    impl Interceptor for CheckAuthenticationInterceptor {
+        fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+            match req.metadata().get(AUTHENTICATION_KEY) {
+                Some(t) => {
+                    let decoded = BASE64_STANDARD.decode(&t).unwrap();
+                    let (client_public_key, challenge_uuid, received_authentication_code) = (
+                        PublicKey::new(decoded[..32].try_into().unwrap()),
+                        Uuid::from_slice(&decoded[32..48]).unwrap(),
+                        &decoded[48..],
+                    );
+
+                    if let Some(_) = self.0.challenges.lock().unwrap().take(&challenge_uuid) {
+                        let secret = self.0.vpn_server_private_key.ecdh(&client_public_key);
+                        if received_authentication_code
+                            == authentication_tag(&secret, &decoded[..48])
+                        {
+                            Ok(req)
+                        } else {
+                            Err(Status::unauthenticated("Challenge not authenticated"))
+                        }
+                    } else {
+                        Err(Status::unauthenticated("Unknown auth token"))
+                    }
+                }
+                _ => Err(Status::unauthenticated("No valid auth token")),
+            }
+        }
+    }
+
+    struct ServerConfig {
+        port: u16,
+        public_key: PublicKey,
+        command_tx: AsyncSender<Command>,
+        tls_config: TlsConfig,
+    }
+
+    async fn spawn_server() -> ServerConfig {
+        let server_private_key = SecretKey::gen();
+
+        let (command_tx, command_rx) = unbounded();
+        let grpc_stub = GrpcStub(Arc::new(State::new(command_rx, server_private_key.clone())));
+        let ens_srv = EnsServer::with_interceptor(
+            grpc_stub.clone(),
+            CheckAuthenticationInterceptor(grpc_stub.clone()),
+        );
+        let login_srv = LoginServer::new(grpc_stub.clone());
+        let (port_tx, port_rx) = oneshot::channel();
+        let tls_config = TlsConfig::new();
+
+        let cert_pem = tls_config.leaf_cert.pem().clone();
+        let key_pem = tls_config.leaf_key_pem.clone();
+        tokio::spawn({
+            let cert_pem = cert_pem.clone();
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let actual_addr = listener.local_addr().unwrap();
+                port_tx.send(actual_addr.port()).unwrap();
+
+                use tonic::transport::ServerTlsConfig;
+
+                let tonic_tls_config = ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
+
+                Server::builder()
+                    .tls_config(tonic_tls_config)
+                    .unwrap()
+                    .add_service(ens_srv)
+                    .add_service(login_srv)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        ServerConfig {
+            port: port_rx.await.unwrap(),
+            public_key: server_private_key.public(),
+            command_tx,
+            tls_config,
+        }
+    }
+
+    async fn send_errors(errors_to_emit: &[ConnectionError], errors_tx: AsyncSender<Command>) {
+        let errors_to_emit = errors_to_emit.to_vec();
+        for e in errors_to_emit {
+            errors_tx.send(Command::Send(e)).await.unwrap();
+        }
+        errors_tx.send(Command::End).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ens() {
+        run_init();
+
+        let bounds = ExponentialBackoffBounds::default();
+        let backoff = ExponentialBackoff::new(bounds).unwrap();
+        let client_private_key = SecretKey::gen();
+
+        let errors_to_emit = [
+            ConnectionError {
+                code: EnsProtoError::Unknown as i32,
+                additional_info: None,
+            },
+            ConnectionError {
+                code: EnsProtoError::ConnectionLimitReached as i32,
+                additional_info: Some("additional info".to_owned()),
+            },
+        ];
+
+        let server_config = spawn_server().await;
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(server_config.tls_config.ca_cert.der().to_vec()),
+        );
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server_config.port,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: client_private_key.to_vec(),
+                    vpn_public_key: server_config.public_key.to_vec(),
+                    kind: crate::KeyKind::NordLynx,
+                },
+            },
+            backoff.clone(),
+        );
+
+        send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
+        let _collected_errors = collect_errors(2, &mut rx).await;
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server_config.port,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: client_private_key.to_vec(),
+                    vpn_public_key: server_config.public_key.to_vec(),
+                    kind: crate::KeyKind::NordLynx,
+                },
+            },
+            backoff,
+        );
+
+        send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
+        let collected_errors = collect_errors(2, &mut rx).await;
+
+        assert_eq!(
+            errors_to_emit
+                .into_iter()
+                .map(|e| (
+                    e,
+                    format!("http://{}:{}", Ipv4Addr::LOCALHOST, server_config.port)
+                ))
+                .collect::<Vec<_>>(),
+            collected_errors
+        );
+
+        ens.stop();
+    }
+
+    async fn collect_errors(
+        n: usize,
+        rx: &mut Receiver<(ConnectionError, String)>,
+    ) -> Vec<(ConnectionError, String)> {
+        let mut ret = vec![];
+        for _ in 0..n {
+            ret.push(rx.recv().await.unwrap());
+        }
+        ret
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ens_backoff() {
+        let client_private_key = SecretKey::gen();
+
+        let errors_to_emit = [
+            ConnectionError {
+                code: EnsProtoError::Unknown as i32,
+                additional_info: None,
+            },
+            ConnectionError {
+                code: EnsProtoError::ConnectionLimitReached as i32,
+                additional_info: Some("additional info".to_owned()),
+            },
+        ];
+
+        let server_config = spawn_server().await;
+
+        let allow_only_mlkem = true;
+
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(server_config.tls_config.ca_cert.der().to_vec()),
+        );
+
+        let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
+
+        backoff.expect_reset().times(4).return_const(());
+        backoff
+            .expect_get_backoff()
+            .times(1)
+            .return_const(Duration::from_secs(1));
+        backoff.expect_next_backoff().times(1).return_const(());
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            server_config.port,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: client_private_key.to_vec(),
+                    vpn_public_key: server_config.public_key.to_vec(),
+                    kind: crate::KeyKind::NordLynx,
+                },
+            },
+            backoff,
+        );
+
+        for e in errors_to_emit.clone() {
+            server_config
+                .command_tx
+                .send(Command::Send(e))
+                .await
+                .unwrap();
+        }
+        server_config
+            .command_tx
+            .send(Command::Error(tonic::Status::unknown("some message")))
+            .await
+            .unwrap();
+        server_config.command_tx.send(Command::End).await.unwrap();
+        for e in errors_to_emit {
+            server_config
+                .command_tx
+                .send(Command::Send(e))
+                .await
+                .unwrap();
+        }
+        let _collected_errors = collect_errors(3, &mut rx).await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ens_fails_without_x25519mlkem768_support() {
+        run_init();
+
+        let server_private_key = SecretKey::gen();
+        let server_public_key = server_private_key.public();
+        let client_private_key = SecretKey::gen();
+
+        let (port_tx, port_rx) = oneshot::channel();
+        let expected_errors = Arc::new(AtomicUsize::new(0));
+
+        let expected_errors_clone = expected_errors.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let actual_addr = listener.local_addr().unwrap();
+            port_tx.send(actual_addr.port()).unwrap();
+
+            let CertifiedKey { cert, signing_key } =
+                generate_simple_self_signed(SUBJECT_ALT_NAMES.clone()).unwrap();
+
+            // Create a TLS server that explicitly does NOT support X25519MLKEM768
+            // by using a provider that only supports traditional key exchange algorithms
+            let mut provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+            provider.kx_groups = vec![
+                tokio_rustls::rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+                tokio_rustls::rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+                tokio_rustls::rustls::crypto::aws_lc_rs::kx_group::X25519,
+            ];
+
+            let server_config =
+                tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                            cert.der().to_vec(),
+                        )],
+                        tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(
+                            signing_key.serialize_der(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = tls_acceptor.clone();
+                let expected_errors = expected_errors_clone.clone();
+                tokio::spawn(async move {
+                    let err = acceptor.accept(stream).await.unwrap_err();
+                    let rustls_err = err
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<rustls::Error>()
+                        .unwrap();
+                    assert_eq!(
+                        *rustls_err,
+                        rustls::Error::PeerIncompatible(
+                            rustls::PeerIncompatible::NoKxGroupsInCommon
+                        )
+                    );
+                    // Making sure that we reach this point, tokio::spawn can 'swallow' panics
+                    expected_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        });
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) =
+            ErrorNotificationService::new(10, make_socket_pool(), allow_only_mlkem, None);
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port_rx.await.unwrap(),
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: client_private_key.to_vec(),
+                    vpn_public_key: server_public_key.to_vec(),
+                    kind: crate::KeyKind::NordLynx,
+                },
+            },
+            ExponentialBackoff::new(Default::default()).unwrap(),
+        );
+
+        // Wait a bit for the background task to attempt TLS handshake and fail
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Try to receive from the error channel - this should timeout
+        // because the connection should fail during TLS handshake before any errors are sent
+        let timeout_result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+
+        // We expect a timeout because the connection should fail during TLS handshake
+        // and never reach the point where it can send error notifications
+        assert!(timeout_result.is_err());
+
+        ens.stop();
+
+        assert_eq!(expected_errors.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn make_socket_pool() -> Arc<SocketPool> {
+        Arc::new(SocketPool::new(
+            NativeProtector::new(
+                #[cfg(target_os = "macos")]
+                false,
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn test_cert_verification_rejects_invalid_request() {
+        use rustls::{
+            client::danger::ServerCertVerifier,
+            internal::msgs::codec::{Codec, Reader},
+            DigitallySignedStruct, SignatureScheme,
+        };
+
+        let tls = TlsConfig::new();
+        let verifier =
+            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
+                .unwrap();
+        let leaf_cert = tls.leaf_cert.der();
+
+        // DigitallySignedStruct with incorrect signature bytes
+        // Wire format: 2 bytes scheme (big-endian u16) + 2 bytes length + signature bytes
+        let scheme_u16: u16 = SignatureScheme::ECDSA_NISTP256_SHA256.into();
+        let garbage_signature = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
+        let mut wire_bytes = Vec::new();
+        wire_bytes.extend_from_slice(&scheme_u16.to_be_bytes());
+        wire_bytes.extend_from_slice(&(garbage_signature.len() as u16).to_be_bytes());
+        wire_bytes.extend_from_slice(&garbage_signature);
+
+        let mut reader = Reader::init(&wire_bytes);
+        let dss = DigitallySignedStruct::read(&mut reader).expect("Failed to parse DSS");
+        assert_eq!(dss.scheme, SignatureScheme::ECDSA_NISTP256_SHA256);
+
+        let message = b"this is a TLS handshake message that was NOT signed by the cert's key";
+
+        let tls12_result = verifier.verify_tls12_signature(message, &leaf_cert, &dss);
+        assert_matches!(
+            tls12_result,
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            ))
+        );
+
+        let tls13_result = verifier.verify_tls13_signature(message, &leaf_cert, &dss);
+        assert_matches!(
+            tls13_result,
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            ))
+        );
+    }
+
+    #[test]
+    fn test_cert_verification_accepts_correct_request() {
+        use rustls::{
+            client::danger::ServerCertVerified,
+            pki_types::{ServerName, UnixTime},
+        };
+
+        let tls = TlsConfig::new();
+        let verifier =
+            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
+                .unwrap();
+
+        assert_matches!(
+            verifier.verify_server_cert(
+                tls.leaf_cert.der(),
+                &[tls.ca_cert.der().clone()],
+                &ServerName::DnsName("localhost".try_into().unwrap()),
+                &[],
+                UnixTime::now(),
+            ),
+            Ok(ServerCertVerified { .. })
+        );
+    }
+
+    #[test]
+    fn test_cert_verification_rejects_incorrect_request() {
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let tls = TlsConfig::new();
+        let verifier =
+            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
+                .unwrap();
+
+        assert_matches!(
+            verifier.verify_server_cert(
+                tls.leaf_cert.der(),
+                &[tls.ca_cert.der().clone()],
+                &ServerName::DnsName("some-other-name".try_into().unwrap()),
+                &[],
+                UnixTime::now(),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForNameContext {
+                    expected,
+                    presented
+                }
+            ))
+            if
+                expected == ServerName::DnsName("some-other-name".try_into().unwrap()) &&
+                presented == vec![ "DnsName(\"localhost\")", "IpAddress(127.0.0.1)" ]
+        );
+
+        let random_leaf_cert =
+            rcgen::generate_simple_self_signed(SUBJECT_ALT_NAMES.clone()).unwrap();
+
+        assert_matches!(
+            verifier.verify_server_cert(
+                random_leaf_cert.cert.der(),
+                &[tls.ca_cert.der().clone()],
+                &ServerName::DnsName("localhost".try_into().unwrap()),
+                &[],
+                UnixTime::now(),
+            ),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))
+        );
+    }
+}

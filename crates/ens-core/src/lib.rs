@@ -6,22 +6,27 @@
 )]
 #![allow(clippy::missing_errors_doc)]
 
+mod client;
 mod logging;
 mod memory;
 mod panics;
 mod runtime;
 
+use llt_proto::ens::ConnectionError;
+use log::{debug, warn};
 use parking_lot::Mutex;
-use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc};
+use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
+use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
 use thiserror::Error;
 
 pub use memory::get_memory_usage;
 
 use crate::{
+    client::ErrorNotificationService,
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_result},
-    runtime::{deinit_runtime, init_runtime},
+    runtime::{deinit_runtime, get_runtime, init_runtime},
 };
 
 mod built_info {
@@ -45,6 +50,34 @@ pub enum EnsError {
     NotInitialized { reason: String },
     #[error("Library already initialized")]
     AlreadyInitialized,
+    #[error("Unknown error: {reason}")]
+    UnknownError { reason: String },
+}
+
+impl From<client::Error> for EnsError {
+    fn from(value: client::Error) -> Self {
+        match value {
+            client::Error::MalformedVpnUri(error) => Self::InternalError {
+                reason: format!("Malformed vpn uri: {error}"),
+            },
+            client::Error::Transport(error) => Self::TransportError {
+                reason: error.to_string(),
+            },
+            client::Error::Status(status) => Self::StatusError {
+                reason: status.to_string(),
+            },
+            client::Error::ExponentialBackoff(error) => Self::InternalError {
+                reason: format!("Exponential backoff failure: {error}"),
+            },
+            client::Error::UuidParsing(error) => Self::InternalError {
+                reason: format!("UUID error: {error}"),
+            },
+            client::Error::InvalidMetadata(invalid_metadata_value) => Self::InternalError {
+                reason: format!("Invalid grpc metadata value: {invalid_metadata_value}"),
+            },
+            client::Error::InvalidKey { reason } => Self::UnknownError { reason },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,6 +175,33 @@ pub struct ConnectionErrorNotification {
     pub additional_info: Option<String>,
 }
 
+impl From<ConnectionError> for ConnectionErrorNotification {
+    fn from(value: ConnectionError) -> Self {
+        use llt_proto::ens::Error as GrpcError;
+
+        let kind = match value.code {
+            code if code == GrpcError::ConnectionLimitReached as i32 => {
+                ConnectionErrorNotificationKind::ConnectionLimitReached
+            }
+            code if code == GrpcError::ServerMaintenance as i32 => {
+                ConnectionErrorNotificationKind::ServerMaintenance
+            }
+            code if code == GrpcError::Unauthenticated as i32 => {
+                ConnectionErrorNotificationKind::Unauthenticated
+            }
+            code if code == GrpcError::Superseded as i32 => {
+                ConnectionErrorNotificationKind::Superseded
+            }
+            other => ConnectionErrorNotificationKind::Unknown { kind: other },
+        };
+
+        ConnectionErrorNotification {
+            kind,
+            additional_info: value.additional_info,
+        }
+    }
+}
+
 pub trait ErrorNotificationCallback: Send + Sync {
     fn notify(&self, notification: ConnectionErrorNotification);
     fn disconnected(&self, reason: Option<String>);
@@ -177,11 +237,84 @@ pub trait ProtectCallback: Send + Sync {
     fn protect(&self, _socket_id: i32) -> Result<()>;
 }
 
+#[derive(Clone)]
+struct ConfigState {
+    buffer_size: usize,
+    allow_only_pq: bool,
+    root_certificate_override: Option<Vec<u8>>,
+    backoff: ExponentialBackoffBounds,
+}
+
+pub struct Config {
+    state: Mutex<ConfigState>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Config {
+    #[must_use]
+    pub fn new() -> Self {
+        let state = ConfigState {
+            buffer_size: 5,
+            allow_only_pq: true,
+            root_certificate_override: None,
+            backoff: ExponentialBackoffBounds {
+                initial: Duration::from_secs(2),
+                maximal: Some(Duration::from_secs(120)),
+            },
+        };
+
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
+    pub fn set_buffer_size(&self, buffer_size: u32) {
+        self.state.lock().buffer_size = buffer_size as usize;
+    }
+
+    pub fn set_allow_only_pq(&self, allow_only_pq: bool) {
+        self.state.lock().allow_only_pq = allow_only_pq;
+    }
+
+    pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
+        self.state.lock().root_certificate_override = root_certificate_override;
+    }
+
+    pub fn set_backoff_initial(&self, seconds: u32) {
+        self.state.lock().backoff.initial = Duration::from_secs(seconds.into());
+    }
+
+    pub fn set_backoff_maximal(&self, seconds: Option<u32>) {
+        self.state.lock().backoff.maximal = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
 pub fn connect(
-    _ip: SocketAddr,
+    vpn: SocketAddr,
     protect_cb: Option<Box<dyn ProtectCallback>>,
-    _authentication: Authentication,
-    _callback: Box<dyn ErrorNotificationCallback>,
+    authentication: Authentication,
+    callback: Box<dyn ErrorNotificationCallback>,
+    config: Arc<Config>,
+) -> Result<Arc<Connection>> {
+    catch_panic_result(|| {
+        let config = config.state.lock().clone();
+
+        connect_impl(vpn, protect_cb, authentication, callback, config)
+    })
+}
+
+fn connect_impl(
+    vpn: SocketAddr,
+    protect_cb: Option<Box<dyn ProtectCallback>>,
+    authentication: Authentication,
+    callback: Box<dyn ErrorNotificationCallback>,
+    config: ConfigState,
 ) -> Result<Arc<Connection>> {
     let protect: Option<telio_sockets::Protect> = match protect_cb {
         Some(protect) => {
@@ -191,18 +324,18 @@ pub fn connect(
                 Ok(fd) => {
                     let protect_res = protect.protect(fd);
                     if let Err(err) = protect_res {
-                        eprintln!("Could not call protect callback due to {err:?}");
+                        warn!("Could not call protect callback due to {err:?}");
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to convert file discriptor: {e}");
+                    warn!("Failed to convert file descriptor: {e}");
                 }
             }))
         }
         _ => None,
     };
 
-    let _socket_pool = Arc::new({
+    let socket_pool = Arc::new({
         if let Some(protect) = protect {
             let external_protect = make_external_protector(protect);
             SocketPool::new(external_protect)
@@ -218,13 +351,49 @@ pub fn connect(
         }
     });
 
-    todo!()
+    let (mut client, mut receiver) = ErrorNotificationService::new(
+        config.buffer_size,
+        socket_pool,
+        config.allow_only_pq,
+        config.root_certificate_override,
+    );
+
+    let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
+        let ret = ExponentialBackoff::fallback();
+        warn!("Failed to construct backoff: {e}, falling back to: {ret:?}");
+        ret
+    });
+
+    client.start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff);
+
+    tokio::task::spawn(async move {
+        while let Some((connection_error, vpn)) = receiver.recv().await {
+            debug!("Received new connection error: {connection_error:?} from {vpn:?}");
+
+            callback.notify(connection_error.into());
+        }
+
+        debug!("Stopping ENS worker thread for {vpn:?}");
+    });
+
+    Ok(Arc::new(Connection {
+        client: tokio::sync::Mutex::new(client),
+    }))
 }
 
-pub struct Connection {}
+pub struct Connection {
+    client: tokio::sync::Mutex<ErrorNotificationService>,
+}
 
 impl Connection {
     pub fn shutdown(&self) -> Result<()> {
-        todo!()
+        let handle = get_runtime()?;
+
+        handle.block_on(async {
+            let mut client = self.client.lock().await;
+            client.stop();
+        });
+
+        Ok(())
     }
 }

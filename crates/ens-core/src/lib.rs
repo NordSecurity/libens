@@ -9,6 +9,7 @@
 mod logging;
 mod memory;
 mod panics;
+mod runtime;
 
 use parking_lot::Mutex;
 use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc};
@@ -20,6 +21,7 @@ pub use memory::get_memory_usage;
 use crate::{
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_result},
+    runtime::{deinit_runtime, init_runtime},
 };
 
 mod built_info {
@@ -78,12 +80,17 @@ pub fn init(app_version: String) -> Result<()> {
     catch_panic_result(|| {
         let mut ver = APP_VERSION.lock();
         let was_initialized = ver.is_some();
+
         if was_initialized {
             return Err(EnsError::AlreadyInitialized);
         }
 
-        print_version_info(&app_version);
+        init_runtime()?;
+
         *ver = Some(app_version);
+        if let Some(app_version) = ver.as_ref() {
+            print_version_info(app_version);
+        }
 
         Ok(())
     })
@@ -115,7 +122,9 @@ pub fn deinit() -> Result<()> {
             });
         }
 
+        deinit_runtime();
         *ver = None;
+
         Ok(())
     })
 }

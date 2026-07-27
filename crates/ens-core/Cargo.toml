@@ -8,11 +8,12 @@ publish = false
 authors = ["LLT TCP team"]
 
 [dependencies]
-telio-utils = { git = "https://github.com/NordSecurity/libtelio.git" }
-telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git" }
+telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="6a65c104e328d45818c933572ed58e2126d05880" }
+telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git", rev="6a65c104e328d45818c933572ed58e2126d05880" }
 thiserror = "2"
 log = { version = "0.4.33", features = ["std"] }
 built = "0.8.0"
+tokio = { version = "1.53.1", default-features = false }
 parking_lot = "0.12.5"
 
 

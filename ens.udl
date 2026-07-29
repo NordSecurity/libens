@@ -179,10 +179,12 @@ callback interface ProtectCallback {
 };
 
 namespace ens {
-    /// Initializes the library. Subsequent calls without a
-    /// matching `deinit()` return `AlreadyInitialized`.
+    /// Initializes the library. The `app_version` parameter should be a succinct
+    /// string that uniquely identifies the app that is calling the `init`
+    /// function - it likely it should contain the app name and app version.
+    /// Subsequent calls without a matching `deinit()` return `AlreadyInitialized`.
     [Throws=EnsError]
-    void init();
+    void init(string app_version);
 
     /// Tears down library-global state. After this returns, all other
     /// entry points fail with `NotInitialized` until `init()` is called

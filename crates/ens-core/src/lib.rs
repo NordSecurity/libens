@@ -10,11 +10,8 @@ mod logging;
 mod memory;
 mod panics;
 
-use std::{
-    net::SocketAddr,
-    panic::AssertUnwindSafe,
-    sync::{atomic::AtomicBool, Arc},
-};
+use parking_lot::Mutex;
+use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc};
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use thiserror::Error;
 
@@ -29,6 +26,8 @@ mod built_info {
     // The file has been placed there by the build script.
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
+
+static APP_VERSION: Mutex<Option<String>> = Mutex::new(None);
 
 type Result<T> = std::result::Result<T, EnsError>;
 
@@ -55,8 +54,6 @@ pub enum LogLevel {
     Trace,
 }
 
-static IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
 pub trait LogCallback: Send + Sync {
     fn log(&self, log_level: LogLevel, message: String);
 }
@@ -77,18 +74,22 @@ pub fn get_version() -> String {
 }
 
 /// Initialize the library. Needs to be called before any other function is called.
-pub fn init() -> Result<()> {
+pub fn init(app_version: String) -> Result<()> {
     catch_panic_result(|| {
-        let was_initialized = IS_INITIALIZED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let mut ver = APP_VERSION.lock();
+        let was_initialized = ver.is_some();
         if was_initialized {
             return Err(EnsError::AlreadyInitialized);
         }
-        print_version_info();
+
+        print_version_info(&app_version);
+        *ver = Some(app_version);
+
         Ok(())
     })
 }
 
-fn print_version_info() {
+fn print_version_info(app_version: &str) {
     use built_info::{BUILT_TIME_UTC, GIT_DIRTY, GIT_VERSION, RUSTC_VERSION};
     let version = get_version();
     let git_version = GIT_VERSION.unwrap_or("unknown-git-version");
@@ -97,20 +98,24 @@ fn print_version_info() {
         _ => "",
     };
     // This results in a log like this:
-    // libens initialized, version v0.0.1 (73159b9-dirty) built on Wed, 22 Jul 2026 14:55:18 +0000 using compiler rustc 1.97.1 (8bab26f4f 2026-07-14)
-    log::info!("libens initialized, version {version} ({git_version}{dirty}) built on {BUILT_TIME_UTC} using compiler {RUSTC_VERSION}");
+    // libens initialized, app version ens-cli v0.1.0, libens version v0.0.1 (ea521fb-dirty) built on Wed, 29 Jul 2026 07:52:04 +0000 using compiler rustc 1.97.1 (8bab26f4f 2026-07-14)
+    log::info!("libens initialized, app version {app_version}, libens version {version} ({git_version}{dirty}) built on {BUILT_TIME_UTC} using compiler {RUSTC_VERSION}");
 }
 
 /// Deinitializes the library. After calling this, calls to other functions
 /// will fail.
 pub fn deinit() -> Result<()> {
     catch_panic_result(|| {
-        let was_initialized = IS_INITIALIZED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let mut ver = APP_VERSION.lock();
+
+        let was_initialized = ver.is_some();
         if !was_initialized {
             return Err(EnsError::NotInitialized {
                 reason: "deinit".to_owned(),
             });
         }
+
+        *ver = None;
         Ok(())
     })
 }

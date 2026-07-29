@@ -15,7 +15,9 @@ impl LogCallback for StdoutLogCallback {
 fn main() {
     let log_callback = Box::new(StdoutLogCallback);
     ens::set_log_callback(LogLevel::Info, log_callback).unwrap();
-    ens::init().unwrap();
+    let name = env!("CARGO_PKG_NAME");
+    let version = env!("CARGO_PKG_VERSION");
+    ens::init(format!("{name} v{version}")).unwrap();
     info!("version: {}", ens::get_version());
     info!("memory usage: {}", ens::get_memory_usage());
     ens::deinit().unwrap();

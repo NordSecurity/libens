@@ -504,6 +504,7 @@ version = "0.0.1"
 dependencies = [
  "built",
  "log",
+ "parking_lot",
  "telio-sockets",
  "telio-utils",
  "thiserror 2.0.19",

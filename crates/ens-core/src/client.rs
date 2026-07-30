@@ -247,6 +247,8 @@ async fn task(
             }
         };
 
+        debug!("Got the authentication challenge, will wait for the error notifications");
+
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
             authentication_interceptor(authenticated_challenge),

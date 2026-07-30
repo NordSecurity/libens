@@ -10,12 +10,14 @@ mod client;
 mod logging;
 mod memory;
 mod panics;
-mod runtime;
+pub mod runtime;
 
 use llt_proto::ens::ConnectionError;
 use log::{debug, warn};
 use parking_lot::Mutex;
-use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    fmt::Display, net::SocketAddr, panic::AssertUnwindSafe, str::FromStr, sync::Arc, time::Duration,
+};
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
 use thiserror::Error;
@@ -87,6 +89,29 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+impl Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = format!("{self:?}").to_ascii_lowercase();
+        f.write_str(&s)
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            "trace" => Ok(Self::Trace),
+            other => Err(other.to_owned()),
+        }
+    }
 }
 
 pub trait LogCallback: Send + Sync {
@@ -162,6 +187,7 @@ pub fn deinit() -> Result<()> {
     })
 }
 
+#[derive(Debug)]
 pub enum ConnectionErrorNotificationKind {
     Unknown { kind: i32 },
     ConnectionLimitReached,
@@ -170,6 +196,7 @@ pub enum ConnectionErrorNotificationKind {
     Superseded,
 }
 
+#[derive(Debug)]
 pub struct ConnectionErrorNotification {
     pub kind: ConnectionErrorNotificationKind,
     pub additional_info: Option<String>,
@@ -305,7 +332,11 @@ pub fn connect(
     catch_panic_result(|| {
         let config = config.state.lock().clone();
 
-        connect_impl(vpn, protect_cb, authentication, callback, config)
+        // It might look like the runtime and async block are not needed here, but
+        // this is not the case. Inside of connect_impl we use tokio::spawn and that
+        // requires to be called on a thread in which tokio runtime has been entered.
+        get_runtime()?
+            .block_on(async { connect_impl(vpn, protect_cb, authentication, callback, config) })
     })
 }
 
@@ -372,6 +403,7 @@ fn connect_impl(
 
             callback.notify(connection_error.into());
         }
+        callback.disconnected(None);
 
         debug!("Stopping ENS worker thread for {vpn:?}");
     });

@@ -44,6 +44,7 @@ use crate::{Authentication, Keys};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
+const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
@@ -269,7 +270,7 @@ async fn task(
             backoff
         );
 
-        let authenticated_challenge = match &authentication {
+        let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
             Authentication::Credentials { .. } => todo!(),
             Authentication::Keys { keys } => {
                 let keys = convert_keys(keys)?;
@@ -283,7 +284,10 @@ async fn task(
                     .await,
                     backoff
                 );
-                authenticated_challenge
+                (
+                    authenticated_challenge,
+                    AsciiMetadataValue::from_static("nordlynx"),
+                )
             }
         };
 
@@ -291,7 +295,7 @@ async fn task(
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
-            authentication_interceptor(authenticated_challenge),
+            authentication_interceptor(authenticated_challenge, nord_vpn_protocol),
         );
 
         let connection = handle_error!(
@@ -362,10 +366,13 @@ async fn get_login_challenge(
 
 fn authentication_interceptor(
     authentication_value: AsciiMetadataValue,
+    nord_vpn_protocol: AsciiMetadataValue,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> {
     move |mut req: Request<()>| {
         req.metadata_mut()
             .insert(AUTHENTICATION_KEY, authentication_value.clone());
+        req.metadata_mut()
+            .insert(NORD_VPN_PROTOCOL_KEY, nord_vpn_protocol.clone());
         Ok(req)
     }
 }
@@ -783,18 +790,31 @@ pub mod tests {
                     {
                         let secret = self.0.vpn_server_private_key.ecdh(&client_public_key);
                         if received_authentication_code
-                            == authentication_tag(&secret, &decoded[..48])
+                            != authentication_tag(&secret, &decoded[..48])
                         {
-                            Ok(req)
-                        } else {
-                            Err(Status::unauthenticated("Challenge not authenticated"))
+                            return Err(Status::unauthenticated("Challenge not authenticated"));
                         }
                     } else {
-                        Err(Status::unauthenticated("Unknown auth token"))
+                        return Err(Status::unauthenticated("Unknown auth token"));
                     }
                 }
-                _ => Err(Status::unauthenticated("No valid auth token")),
+                _ => return Err(Status::unauthenticated("No valid auth token")),
             }
+            match req.metadata().get(NORD_VPN_PROTOCOL_KEY) {
+                Some(val) => {
+                    if val != "nordlynx" {
+                        return Err(Status::unavailable(format!(
+                            "Incorrect {NORD_VPN_PROTOCOL_KEY} in metadata: {val:?}"
+                        )));
+                    }
+                }
+                None => {
+                    return Err(Status::unavailable(format!(
+                        "Missing {NORD_VPN_PROTOCOL_KEY} in metadata"
+                    )))
+                }
+            }
+            Ok(req)
         }
     }
 

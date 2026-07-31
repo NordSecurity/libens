@@ -12,8 +12,9 @@ mod memory;
 mod panics;
 pub mod runtime;
 
+use http::{header::InvalidHeaderValue, HeaderValue};
 use llt_proto::ens::ConnectionError;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use std::{
     fmt::Display, net::SocketAddr, panic::AssertUnwindSafe, str::FromStr, sync::Arc, time::Duration,
@@ -41,7 +42,12 @@ mod built_info {
 }
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-static APP_VERSION: Mutex<Option<String>> = Mutex::new(None);
+
+static STATE: Mutex<Option<GlobalState>> = Mutex::new(None);
+
+struct GlobalState {
+    user_agent: HeaderValue,
+}
 
 type Result<T> = std::result::Result<T, EnsError>;
 
@@ -83,6 +89,7 @@ impl From<client::Error> for EnsError {
                 reason: format!("Invalid grpc metadata value: {invalid_metadata_value}"),
             },
             client::Error::InvalidKey { reason } => Self::UnknownError { reason },
+            client::Error::Internal { reason } => Self::InternalError { reason },
         }
     }
 }
@@ -139,46 +146,63 @@ pub fn get_version() -> String {
 }
 
 /// Initialize the library. Needs to be called before any other function is called.
+#[allow(clippy::needless_pass_by_value)]
 pub fn init(app_version: String) -> Result<()> {
     catch_panic_result(|| {
-        let mut ver = APP_VERSION.lock();
-        let was_initialized = ver.is_some();
+        let mut state = STATE.lock();
+        let was_initialized = state.is_some();
 
         if was_initialized {
             return Err(EnsError::AlreadyInitialized);
         }
 
+        let user_agent = build_user_agent(&app_version).map_err(|e| EnsError::UnknownError {
+            reason: format!("incorrect user-agent: {e}"),
+        })?;
+
         init_runtime()?;
 
-        *ver = Some(app_version);
-        if let Some(app_version) = ver.as_ref() {
-            print_version_info(app_version);
+        *state = Some(GlobalState { user_agent });
+        if let Some(state) = state.as_ref() {
+            info!(
+                "libens initialized ({:?}) built on {} using {}",
+                state.user_agent,
+                built_info::BUILT_TIME_UTC,
+                built_info::RUSTC_VERSION
+            );
         }
 
         Ok(())
     })
 }
 
-fn print_version_info(app_version: &str) {
-    use built_info::{BUILT_TIME_UTC, GIT_DIRTY, GIT_VERSION, RUSTC_VERSION};
+fn build_user_agent(app_version: &str) -> std::result::Result<HeaderValue, InvalidHeaderValue> {
+    // As specified in:
+    // https://www.rfc-editor.org/rfc/rfc9110.html#comments
+    use built_info::{GIT_DIRTY, GIT_VERSION};
     let version = get_version();
     let git_version = GIT_VERSION.unwrap_or("unknown-git-version");
     let dirty = match GIT_DIRTY {
         Some(true) => "-dirty",
         _ => "",
     };
-    // This results in a log like this:
-    // libens initialized, app version ens-cli v0.1.0, libens version v0.0.1 (ea521fb-dirty) built on Wed, 29 Jul 2026 07:52:04 +0000 using compiler rustc 1.97.1 (8bab26f4f 2026-07-14)
-    log::info!("libens initialized, app version {app_version}, libens version {version} ({git_version}{dirty}) built on {BUILT_TIME_UTC} using compiler {RUSTC_VERSION}");
+
+    // Example return value:
+    // ens-cli/v0.1.0 libens/v0.0.1 macos (4bb26d4-dirty)
+    format!(
+        "{app_version} libens/{version} {} ({git_version}{dirty})",
+        built_info::CFG_OS
+    )
+    .try_into()
 }
 
 /// Deinitializes the library. After calling this, calls to other functions
 /// will fail.
 pub fn deinit() -> Result<()> {
     catch_panic_result(|| {
-        let mut ver = APP_VERSION.lock();
+        let mut state = STATE.lock();
 
-        let was_initialized = ver.is_some();
+        let was_initialized = state.is_some();
         if !was_initialized {
             return Err(EnsError::NotInitialized {
                 reason: "deinit".to_owned(),
@@ -186,7 +210,7 @@ pub fn deinit() -> Result<()> {
         }
 
         deinit_runtime();
-        *ver = None;
+        *state = None;
 
         Ok(())
     })

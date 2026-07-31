@@ -40,7 +40,7 @@ use llt_proto::ens::{
     ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
 };
 
-use crate::{Authentication, Keys};
+use crate::{Authentication, Keys, STATE};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
@@ -71,6 +71,8 @@ pub enum Error {
     InvalidMetadata(#[from] InvalidMetadataValue),
     #[error("Invalid key: {reason}")]
     InvalidKey { reason: String },
+    #[error("Internal error: {reason}")]
+    Internal { reason: String },
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -418,7 +420,15 @@ async fn create_external_channel(
         }
     };
 
-    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?;
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| Error::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?.user_agent(user_agent)?;
 
     let endpoint = if let Some(interval) = keepalive.interval {
         endpoint.http2_keep_alive_interval(interval)
@@ -771,6 +781,26 @@ pub mod tests {
 
     impl Interceptor for CheckAuthenticationInterceptor {
         fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+            let expected_user_agent = STATE
+                .lock()
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    reason: "global state not initialized".to_owned(),
+                })
+                .unwrap()
+                .user_agent
+                .to_str()
+                .unwrap()
+                .to_owned();
+
+            // tonic appends its own version to the user-agent sent over wire
+            assert!(req
+                .metadata()
+                .get("user-agent")
+                .and_then(|s| s.to_str().ok())
+                .unwrap()
+                .starts_with(&expected_user_agent));
+
             match req.metadata().get(AUTHENTICATION_KEY) {
                 Some(t) => {
                     let decoded = BASE64_STANDARD.decode(t).unwrap();
@@ -800,6 +830,7 @@ pub mod tests {
                 }
                 _ => return Err(Status::unauthenticated("No valid auth token")),
             }
+
             match req.metadata().get(NORD_VPN_PROTOCOL_KEY) {
                 Some(val) => {
                     if val != "nordlynx" {
@@ -814,6 +845,7 @@ pub mod tests {
                     )))
                 }
             }
+
             Ok(req)
         }
     }

@@ -523,7 +523,7 @@ fn convert_keys(keys: &Keys) -> Result<ConvertedKeys, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::{
         collections::HashSet,
         net::Ipv4Addr,
@@ -560,12 +560,12 @@ mod tests {
 
     static INIT: Once = Once::new();
 
-    fn run_init() {
+    pub fn run_init() {
         INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
     }
 
     #[derive(Debug)]
-    enum Command {
+    pub enum Command {
         Send(ConnectionError),
         Error(tonic::Status),
         End,
@@ -589,8 +589,8 @@ mod tests {
 
     // Root CA and a leaf cert issued by it
     #[derive(Debug)]
-    struct TlsConfig {
-        ca_cert: Certificate,
+    pub struct TlsConfig {
+        pub ca_cert: Certificate,
         leaf_cert: Certificate,
         leaf_key_pem: String,
     }
@@ -714,14 +714,14 @@ mod tests {
         }
     }
 
-    struct ServerConfig {
-        port: u16,
-        public_key: PublicKey,
-        command_tx: AsyncSender<Command>,
-        tls_config: TlsConfig,
+    pub struct ServerConfig {
+        pub port: u16,
+        pub public_key: PublicKey,
+        pub command_tx: AsyncSender<Command>,
+        pub tls_config: TlsConfig,
     }
 
-    async fn spawn_server() -> ServerConfig {
+    pub async fn spawn_server() -> ServerConfig {
         let server_private_key = SecretKey::gen();
 
         let (command_tx, command_rx) = unbounded();
@@ -767,7 +767,7 @@ mod tests {
         }
     }
 
-    async fn send_errors(errors_to_emit: &[ConnectionError], errors_tx: AsyncSender<Command>) {
+    pub async fn send_errors(errors_to_emit: &[ConnectionError], errors_tx: AsyncSender<Command>) {
         let errors_to_emit = errors_to_emit.to_vec();
         for e in errors_to_emit {
             errors_tx.send(Command::Send(e)).await.unwrap();

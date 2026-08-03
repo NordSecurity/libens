@@ -187,7 +187,7 @@ pub fn deinit() -> Result<()> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionErrorNotificationKind {
     Unknown { kind: i32 },
     ConnectionLimitReached,
@@ -196,7 +196,7 @@ pub enum ConnectionErrorNotificationKind {
     Superseded,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ConnectionErrorNotification {
     pub kind: ConnectionErrorNotificationKind,
     pub additional_info: Option<String>,
@@ -457,5 +457,181 @@ impl Drop for Connection {
         if matches!(&*state, ConnectionState::Active(_)) {
             *state = ConnectionState::ShutDown(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::tests::{run_init, Command, ServerConfig};
+    use assert_matches::assert_matches;
+    use llt_proto::ens::Error as EnsProtoError;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use telio_crypto::SecretKey;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordedCallback {
+        notifications: Mutex<Vec<ConnectionErrorNotification>>,
+        // Outer Option: whether `disconnected` was called at all.
+        // Inner Option<String>: the reason passed in.
+        disconnected: Mutex<Option<Option<String>>>,
+    }
+
+    impl ErrorNotificationCallback for Arc<RecordedCallback> {
+        fn notify(&self, notification: ConnectionErrorNotification) {
+            self.notifications.lock().push(notification);
+        }
+
+        fn disconnected(&self, reason: Option<String>) {
+            *self.disconnected.lock() = Some(reason);
+        }
+    }
+
+    #[track_caller]
+    fn wait_for(mut predicate: impl FnMut() -> bool) {
+        let max_wait_time = Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + max_wait_time;
+        loop {
+            if predicate() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("Timed out in wait_for");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn connect_to_test_server(
+        server_config: &ServerConfig,
+        callback: Arc<RecordedCallback>,
+    ) -> Arc<Connection> {
+        let client_private_key = SecretKey::gen();
+
+        let config = Config::new();
+        config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
+
+        connect(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_config.port)),
+            None,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: client_private_key.to_vec(),
+                    vpn_public_key: server_config.public_key.to_vec(),
+                    kind: crate::KeyKind::NordLynx,
+                },
+            },
+            Box::new(callback),
+            Arc::new(config),
+        )
+        .unwrap()
+    }
+
+    #[test_log::test]
+    fn test_explicit_shutdown() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let callback = Arc::new(RecordedCallback::default());
+        let connection = connect_to_test_server(&server_config, callback.clone());
+
+        let errors_to_emit = [
+            ConnectionError {
+                code: EnsProtoError::Unknown as i32,
+                additional_info: None,
+            },
+            ConnectionError {
+                code: EnsProtoError::ConnectionLimitReached as i32,
+                additional_info: Some("additional info".to_owned()),
+            },
+            ConnectionError {
+                code: EnsProtoError::ServerMaintenance as i32,
+                additional_info: Some("planned maintenance".to_owned()),
+            },
+        ];
+
+        runtime.block_on(async {
+            for e in &errors_to_emit {
+                server_config
+                    .command_tx
+                    .send(Command::Send(e.clone()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        wait_for(|| callback.notifications.lock().len() == errors_to_emit.len());
+
+        connection.shutdown().unwrap();
+
+        wait_for(|| callback.disconnected.lock().is_some());
+
+        let notifications = callback.notifications.lock();
+        assert_eq!(
+            *notifications,
+            vec![
+                ConnectionErrorNotification {
+                    kind: ConnectionErrorNotificationKind::Unknown { kind: 0 },
+                    additional_info: None,
+                },
+                ConnectionErrorNotification {
+                    kind: ConnectionErrorNotificationKind::ConnectionLimitReached,
+                    additional_info: Some("additional info".to_owned()),
+                },
+                ConnectionErrorNotification {
+                    kind: ConnectionErrorNotificationKind::ServerMaintenance,
+                    additional_info: Some("planned maintenance".to_owned()),
+                }
+            ]
+        );
+
+        assert_eq!(
+            *callback.disconnected.lock(),
+            Some(Some("shutdown".to_owned()))
+        );
+
+        assert_matches!(connection.shutdown(), Ok(()));
+    }
+
+    #[test_log::test]
+    fn test_implicit_shutdown() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let callback = Arc::new(RecordedCallback::default());
+        let connection = connect_to_test_server(&server_config, callback.clone());
+
+        let error = ConnectionError {
+            code: EnsProtoError::Unauthenticated as i32,
+            additional_info: None,
+        };
+
+        runtime.block_on(async {
+            server_config
+                .command_tx
+                .send(Command::Send(error.clone()))
+                .await
+                .unwrap();
+        });
+
+        wait_for(|| callback.notifications.lock().len() == 1);
+
+        drop(connection);
+
+        wait_for(|| callback.disconnected.lock().is_some());
+
+        let notifications = callback.notifications.lock();
+        assert_eq!(
+            *notifications,
+            vec![ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::Unauthenticated,
+                additional_info: None,
+            }]
+        );
+
+        assert_eq!(*callback.disconnected.lock(), Some(None));
     }
 }

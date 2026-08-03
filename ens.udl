@@ -200,7 +200,8 @@ namespace ens {
 
     /// Registers a callback to receive log messages. Only messages at or
     /// below `max_level` are forwarded. Sensitive data in log messages is
-    /// replaced with dots in release builds.
+    /// replaced with dots in release builds. Can be called before `init` to
+    /// enable logging output during initialisation.
     ///
     /// Replaces any previously registered log callback. Passing a new
     /// callback drops the previous one.

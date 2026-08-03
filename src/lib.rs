@@ -1,6 +1,6 @@
-//! Thin cdylib wrapper around `nordtls-core`.
+//! Thin cdylib wrapper around `ens-core`.
 //!
-//! All API is implemented in the `nordtls-core` sibling crate; this crate
+//! All API is implemented in the `ens-core` sibling crate; this crate
 //! exists solely to produce the FFI-exposed dynamic library (`cdylib`) with
 //! the UniFFI scaffolding and the Android JNI entry point compiled in.
 
@@ -27,12 +27,12 @@ impl UniffiCustomTypeConverter for SocketAddr {
 #[cfg(target_os = "android")]
 #[no_mangle]
 /// Initialize OS certificate store, should be called only once. Without call to
-/// `Java_com_nordsec_nordtls_NordtlsCert_initCertStore()` quench will not be
+/// `Java_com_nordsec_ens_EnsCert_initCertStore()` ens will not be
 /// able to verify https certificates in the system certificate store.
 /// # Params
 /// - `env`:    see https://developer.android.com/training/articles/perf-jni#javavm-and-jnienv
 /// - `ctx`:    see https://developer.android.com/reference/android/content/Context
-pub extern "C" fn Java_com_nordsec_nordtls_NordtlsCert_initCertStore(
+pub extern "C" fn Java_com_nordsec_ens_EnsCert_initCertStore(
     mut env: jni::JNIEnv,
     _class: jni::objects::JClass,
     ctx: jni::objects::JObject,

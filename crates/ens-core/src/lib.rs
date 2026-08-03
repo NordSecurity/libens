@@ -397,35 +397,65 @@ fn connect_impl(
 
     client.start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff);
 
+    let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
+    let state_for_task = state.clone();
+
     tokio::task::spawn(async move {
         while let Some((connection_error, vpn)) = receiver.recv().await {
             debug!("Received new connection error: {connection_error:?} from {vpn:?}");
 
             callback.notify(connection_error.into());
         }
-        callback.disconnected(None);
+        let reason = match &*state_for_task.lock() {
+            ConnectionState::ShutDown(reason) => reason.clone(),
+            ConnectionState::Active(_) => {
+                Some("active services closed the notification stream".to_owned())
+            }
+        };
+        callback.disconnected(reason);
 
         debug!("Stopping ENS worker thread for {vpn:?}");
     });
 
-    Ok(Arc::new(Connection {
-        client: tokio::sync::Mutex::new(client),
-    }))
+    Ok(Arc::new(Connection { state }))
+}
+
+enum ConnectionState {
+    Active(ErrorNotificationService),
+    ShutDown(Option<String>),
 }
 
 pub struct Connection {
-    client: tokio::sync::Mutex<ErrorNotificationService>,
+    state: Arc<Mutex<ConnectionState>>,
 }
 
 impl Connection {
     pub fn shutdown(&self) -> Result<()> {
-        let handle = get_runtime()?;
+        catch_panic_result(|| {
+            let mut service = {
+                let mut state = self.state.lock();
+                match std::mem::replace(
+                    &mut *state,
+                    ConnectionState::ShutDown(Some("shutdown".to_owned())),
+                ) {
+                    ConnectionState::Active(s) => s,
+                    already_shut @ ConnectionState::ShutDown(_) => {
+                        *state = already_shut;
+                        return Ok(());
+                    }
+                }
+            };
+            service.stop();
+            Ok(())
+        })
+    }
+}
 
-        handle.block_on(async {
-            let mut client = self.client.lock().await;
-            client.stop();
-        });
-
-        Ok(())
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if matches!(&*state, ConnectionState::Active(_)) {
+            *state = ConnectionState::ShutDown(None);
+        }
     }
 }

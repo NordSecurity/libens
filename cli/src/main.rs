@@ -16,7 +16,7 @@ use ens::{
     Authentication, Config, ErrorNotificationCallback, LogCallback, LogLevel, connect,
     runtime::get_runtime,
 };
-use log::info;
+use log::{debug, info};
 
 use crate::api::{ApiClient, Server, Technology};
 
@@ -245,6 +245,9 @@ fn main() {
 
             let disconnected = Arc::new(Notify::new());
             let callback = Box::new(NotificationLoggingCallback(disconnected.clone()));
+
+            drop(api_client);
+            debug!("api client destroyed");
 
             let connection = connect(vpn, None, auth, callback, Arc::new(Config::new())).unwrap();
 

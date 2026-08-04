@@ -81,7 +81,11 @@ pub struct ErrorNotificationService {
 
 impl Drop for ErrorNotificationService {
     fn drop(&mut self) {
-        let _ = self.stop_old_monitor(); // Can't wait on the handle in the Drop
+        if let Some(join_handle) = self.stop_old_monitor() {
+            // Can't wait on the handle in the Drop
+            // but we can abort it
+            join_handle.abort();
+        }
     }
 }
 
@@ -115,7 +119,7 @@ impl ErrorNotificationService {
         )
     }
 
-    pub fn start_monitor_on_port(
+    pub async fn start_monitor_on_port(
         &mut self,
         vpn_ip: IpAddr,
         ens_port: u16,
@@ -123,7 +127,7 @@ impl ErrorNotificationService {
         backoff: impl Backoff,
     ) {
         info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
-        self.stop();
+        self.stop().await;
 
         let (quit_tx, quit_rx): (watch::Sender<bool>, watch::Receiver<bool>) =
             watch::channel(false);
@@ -159,12 +163,17 @@ impl ErrorNotificationService {
     }
 
     /// Stop ENS
-    pub fn stop(&mut self) {
+    pub async fn stop(&mut self) {
         if let Some(join_handle) = self.stop_old_monitor() {
             debug!("Will wait for the old ENS task to end");
             join_handle.abort(); // Since the task might be in the grpc connection establishment, it might not be able
                                  // to receive and react to te quit signal. Which is why we need to cancel it here, so
                                  // that we are not stuck for a long time in the await.
+            if let Err(e) = join_handle.await {
+                if !e.is_cancelled() {
+                    warn!("Previous ENS task failed to stop: {e}");
+                }
+            }
         }
     }
 
@@ -655,9 +664,10 @@ pub mod tests {
 
             let command_rx = self.command_rx.clone();
             tokio::spawn(async move {
-                loop {
-                    println!("next loop iteration...");
-                    match command_rx.recv().await.unwrap() {
+                // Ends on `Command::End` or when the test drops the sender,
+                // whichever comes first - not every test sends `End`.
+                while let Ok(command) = command_rx.recv().await {
+                    match command {
                         Command::Send(e) => tx.send(Ok(e)).await.unwrap(),
                         Command::Error(status) => tx.send(Err(status)).await.unwrap(),
                         Command::End => break,
@@ -817,7 +827,8 @@ pub mod tests {
                 },
             },
             backoff.clone(),
-        );
+        )
+        .await;
 
         send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
         let _collected_errors = collect_errors(2, &mut rx).await;
@@ -833,7 +844,8 @@ pub mod tests {
                 },
             },
             backoff,
-        );
+        )
+        .await;
 
         send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
         let collected_errors = collect_errors(2, &mut rx).await;
@@ -849,7 +861,7 @@ pub mod tests {
             collected_errors
         );
 
-        ens.stop();
+        ens.stop().await;
     }
 
     async fn collect_errors(
@@ -910,7 +922,8 @@ pub mod tests {
                 },
             },
             backoff,
-        );
+        )
+        .await;
 
         for e in errors_to_emit.clone() {
             server_config
@@ -1020,7 +1033,8 @@ pub mod tests {
                 },
             },
             ExponentialBackoff::new(Default::default()).unwrap(),
-        );
+        )
+        .await;
 
         // Wait a bit for the background task to attempt TLS handshake and fail
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1033,7 +1047,7 @@ pub mod tests {
         // and never reach the point where it can send error notifications
         assert!(timeout_result.is_err());
 
-        ens.stop();
+        ens.stop().await;
 
         assert_eq!(expected_errors.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

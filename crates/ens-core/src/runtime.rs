@@ -16,6 +16,7 @@ pub(crate) fn init_runtime() -> Result<()> {
         });
     }
     *rt = Some(
+        // Must be multithreaded because of `task::block_in_place`
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("libens-rt-worker")

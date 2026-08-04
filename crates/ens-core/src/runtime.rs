@@ -18,7 +18,7 @@ pub(crate) fn init_runtime() -> Result<()> {
     *rt = Some(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_name("nordtls-rt-worker")
+            .thread_name("libens-rt-worker")
             .worker_threads(2)
             .build()
             .map_err(|e| EnsError::InternalError {
@@ -35,6 +35,7 @@ pub(crate) fn deinit_runtime() {
     }
 }
 
+#[expect(dead_code)]
 pub fn get_runtime() -> Result<tokio::runtime::Handle> {
     if let Some(rt) = &*RUNTIME.read() {
         Ok(rt.handle().clone())

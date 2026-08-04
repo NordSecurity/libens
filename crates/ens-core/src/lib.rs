@@ -87,8 +87,10 @@ pub fn init(app_version: String) -> Result<()> {
 
         init_runtime()?;
 
-        print_version_info(&app_version);
         *ver = Some(app_version);
+        if let Some(app_version) = ver.as_ref() {
+            print_version_info(app_version);
+        }
 
         Ok(())
     })

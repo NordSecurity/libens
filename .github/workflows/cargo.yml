@@ -39,6 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: clippy-linux
       - run: cargo clippy --all-targets --all-features --color always -- --deny warnings
 
   cargo-deny:
@@ -51,6 +54,9 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: deny-linux
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny check
 
@@ -65,6 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: rustup toolchain add ${{ env.NIGHTLY_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: udeps-linux-${{ env.NIGHTLY_VERSION }}
       - run: cargo +${{ env.NIGHTLY_VERSION }} install cargo-udeps@0.1.61 --locked
       - run: cargo +${{ env.NIGHTLY_VERSION }} udeps --workspace --locked --output human --backend depinfo
 
@@ -78,6 +87,9 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-linux
       - run: cargo build --all
       - run: cargo test --all --all-features -- --nocapture
 
@@ -91,5 +103,8 @@ jobs:
         with:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-windows
       - run: cargo build --all
       - run: cargo test --all --all-features -- --nocapture

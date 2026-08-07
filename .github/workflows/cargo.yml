@@ -3,7 +3,9 @@ name: cargo
 on: [push, pull_request]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+  # This prevents cancelation in case of two merges to main that are close to
+  # each other and will have jobs running at the same time
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,6 +19,7 @@ permissions:
 jobs:
   cargo-fmt:
     name: cargo fmt
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     container:
       image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
@@ -30,6 +33,7 @@ jobs:
 
   cargo-clippy:
     name: cargo clippy
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     container:
       image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
@@ -46,6 +50,7 @@ jobs:
 
   cargo-deny:
     name: cargo deny
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     container:
       image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
@@ -62,6 +67,7 @@ jobs:
 
   cargo-udeps:
     name: cargo udeps
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     container:
       image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
@@ -79,6 +85,7 @@ jobs:
 
   cargo-test-linux:
     name: cargo test (linux)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-26.04
     container:
       image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
@@ -95,6 +102,7 @@ jobs:
 
   cargo-test-windows:
     name: cargo test (windows)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

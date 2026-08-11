@@ -2,7 +2,9 @@ name: Build
 on: [push, pull_request]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+  # This prevents cancelation in case of two merges to main that are close to
+  # each other and will have jobs running at the same time
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -13,6 +15,7 @@ env:
 
 jobs:
   build-native:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +60,7 @@ jobs:
         with:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.linking }}
       - name: Setup MSVC
@@ -86,6 +89,7 @@ jobs:
           if-no-files-found: error
 
   build-cli:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +120,7 @@ jobs:
         with:
           version: "35.1"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: cli-${{ matrix.target_os }}-${{ matrix.arch }}
       - name: Setup MSVC

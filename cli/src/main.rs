@@ -158,9 +158,9 @@ enum VpnKind {
     OpenVPN,
 }
 
-struct StdoutLogCallback;
+struct StderrLogCallback;
 
-impl LogCallback for StdoutLogCallback {
+impl LogCallback for StderrLogCallback {
     fn log(&self, log_level: LogLevel, message: String) {
         let date = Utc::now();
         let level = format!("{log_level:?}").to_ascii_uppercase();
@@ -184,7 +184,7 @@ impl ErrorNotificationCallback for NotificationLoggingCallback {
 fn main() {
     let args = Args::parse();
 
-    let log_callback = Box::new(StdoutLogCallback);
+    let log_callback = Box::new(StderrLogCallback);
     ens::set_log_callback(args.log_level, log_callback).unwrap();
     let name = env!("CARGO_PKG_NAME");
     let version = env!("CARGO_PKG_VERSION");

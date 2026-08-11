@@ -1,4 +1,5 @@
 use std::{
+    error::Error as _,
     net::{IpAddr, ToSocketAddrs},
     str::FromStr,
     sync::Arc,
@@ -207,7 +208,7 @@ async fn task(
                 match $value {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("ENS task transient failure: {e}");
+                        warn!("ENS task transient failure: {e} source: {:?}", e.source());
                         if *quit_rx.borrow() == true {
                             break 'outer;
                         }

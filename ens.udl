@@ -190,6 +190,24 @@ interface Config {
 
     void set_backoff_initial(u32 seconds);
     void set_backoff_maximal(u32? seconds);
+
+    /// Interval between the keep alive messages sent over the ENS connection, in
+    /// seconds. When the underlying tcp connection stops working, the dead
+    /// connection will be detected after at most keepalive interval + keepalive
+    /// timeout seconds and a new connection will be created after the ENS backoff
+    /// elapses.
+    /// When set to null, the keep alives are disabled. Setting it to 0 resets it
+    /// back to the default.
+    /// [default 120s]
+    void set_keepalive_interval(u32? seconds);
+
+    /// How long to wait for a response to a keep alive message before considering
+    /// the ENS connection dead, in seconds. Only used when the keepalive interval
+    /// is set.
+    /// When set to null, the underlying http client default is used. Setting it to
+    /// 0 resets it back to the default.
+    /// [default 20s]
+    void set_keepalive_timeout(u32? seconds);
 };
 
 namespace ens {

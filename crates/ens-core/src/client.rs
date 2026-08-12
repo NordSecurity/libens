@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
@@ -45,6 +46,8 @@ const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// ENS errors
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +72,16 @@ pub enum Error {
     InvalidKey { reason: String },
 }
 
+/// Configuration of the keep alive messages sent over the ENS connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeepaliveConfig {
+    /// Interval between the keep alive messages, `None` disables the keep alives
+    pub interval: Option<Duration>,
+    /// How long to wait for a keep alive response before considering the connection dead,
+    /// `None` leaves the default of the underlying http client in place
+    pub timeout: Option<Duration>,
+}
+
 /// `ErrorNotificationService` manages tasks started and stopped to consume the ENS grpc error streams
 pub struct ErrorNotificationService {
     quit: Option<(watch::Sender<bool>, JoinHandle<()>)>,
@@ -77,6 +90,8 @@ pub struct ErrorNotificationService {
     allow_only_mlkem: bool,
     // DER encoded root certificate to be use for verification of TLS
     root_certificate: Vec<u8>,
+    // Configuration of the keep alive messages sent over the ENS connection
+    keepalive: KeepaliveConfig,
 }
 
 impl Drop for ErrorNotificationService {
@@ -96,6 +111,7 @@ impl ErrorNotificationService {
         socket_pool: Arc<SocketPool>,
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
+        mut keepalive: KeepaliveConfig,
     ) -> (Self, Receiver<(ConnectionError, String)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
@@ -106,6 +122,15 @@ impl ErrorNotificationService {
             );
         }
 
+        if keepalive.interval == Some(Duration::ZERO) {
+            warn!("Keepalive interval set to 0, resetting to default");
+            keepalive.interval = Some(DEFAULT_KEEPALIVE_INTERVAL);
+        }
+        if keepalive.timeout == Some(Duration::ZERO) {
+            warn!("Keepalive timeout set to 0, resetting to default");
+            keepalive.timeout = Some(DEFAULT_KEEPALIVE_TIMEOUT);
+        }
+
         (
             Self {
                 quit: None,
@@ -114,6 +139,7 @@ impl ErrorNotificationService {
                 allow_only_mlkem,
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
+                keepalive,
             },
             rx,
         )
@@ -814,6 +840,7 @@ pub mod tests {
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig::default(),
         );
 
         ens.start_monitor_on_port(
@@ -900,6 +927,7 @@ pub mod tests {
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig::default(),
         );
 
         let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
@@ -1019,8 +1047,13 @@ pub mod tests {
         });
 
         let allow_only_mlkem = true;
-        let (mut ens, mut rx) =
-            ErrorNotificationService::new(10, make_socket_pool(), allow_only_mlkem, None);
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            None,
+            KeepaliveConfig::default(),
+        );
 
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),

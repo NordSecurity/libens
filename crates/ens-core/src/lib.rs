@@ -26,7 +26,10 @@ use tokio::task::block_in_place;
 pub use memory::get_memory_usage;
 
 use crate::{
-    client::ErrorNotificationService,
+    client::{
+        ErrorNotificationService, KeepaliveConfig, DEFAULT_KEEPALIVE_INTERVAL,
+        DEFAULT_KEEPALIVE_TIMEOUT,
+    },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_result},
     runtime::{deinit_runtime, get_runtime, init_runtime},
@@ -272,6 +275,7 @@ struct ConfigState {
     allow_only_pq: bool,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
+    keepalive: KeepaliveConfig,
 }
 
 pub struct Config {
@@ -294,6 +298,10 @@ impl Config {
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
                 maximal: Some(Duration::from_secs(120)),
+            },
+            keepalive: KeepaliveConfig {
+                interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
+                timeout: Some(DEFAULT_KEEPALIVE_TIMEOUT),
             },
         };
 
@@ -320,6 +328,14 @@ impl Config {
 
     pub fn set_backoff_maximal(&self, seconds: Option<u32>) {
         self.state.lock().backoff.maximal = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_keepalive_interval(&self, seconds: Option<u32>) {
+        self.state.lock().keepalive.interval = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_keepalive_timeout(&self, seconds: Option<u32>) {
+        self.state.lock().keepalive.timeout = seconds.map(|s| Duration::from_secs(s.into()));
     }
 }
 
@@ -395,6 +411,7 @@ async fn connect_impl(
         socket_pool,
         config.allow_only_pq,
         config.root_certificate_override,
+        config.keepalive,
     );
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {

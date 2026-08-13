@@ -234,15 +234,15 @@ impl ErrorNotificationService {
     }
 
     fn stop_old_monitor(&mut self) -> Option<JoinHandle<()>> {
-        if let Some((quit_channel, join_handle)) = self.quit.take() {
-            debug!("Previous ENS task will be stopped");
-            if let Err(e) = quit_channel.send(true) {
-                warn!("Failed to send stop request to previous ENS monitor: {e}");
-            } else {
-                return Some(join_handle);
-            }
+        let (quit_channel, join_handle) = self.quit.take()?;
+        debug!("Previous ENS task will be stopped");
+        if let Err(e) = quit_channel.send(true) {
+            // The only way to lose the receiver is the monitor task ending on
+            // its own, so there is nothing left to stop.
+            debug!("ENS monitor had already stopped: {e}");
+            return None;
         }
-        None
+        Some(join_handle)
     }
 }
 

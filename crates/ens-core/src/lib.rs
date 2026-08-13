@@ -27,7 +27,7 @@ use std::{
     net::SocketAddr,
     panic::AssertUnwindSafe,
     str::FromStr,
-    sync::{Arc, Weak},
+    sync::{atomic::AtomicBool, Arc, Weak},
     time::Duration,
 };
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
@@ -57,6 +57,10 @@ mod built_info {
 }
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Reason reported to `ErrorNotificationCallback::disconnected` when the
+// session was ended by `Connection::shutdown`.
+pub const SHUTDOWN_REASON: &str = "shutdown";
 
 static STATE: Mutex<Option<GlobalState>> = Mutex::new(None);
 
@@ -466,6 +470,7 @@ async fn connect_impl(
 ) -> Result<Arc<Connection>> {
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
+    let callback = GuardedCallback::new(callback);
     let protect = make_socket_protector(protect_cb);
     let socket_pool = make_socket_pool(protect)?;
 
@@ -518,7 +523,7 @@ async fn connect_impl(
                     vpn_uri,
                 }) => {
                     // This is behaviour documented in the udl
-                    if state_clone.lock().is_shut_down() {
+                    if state_clone.lock().is_finished() {
                         debug!(
                             "Dropping notification received after shutdown: {connection_error:?}"
                         );
@@ -533,15 +538,18 @@ async fn connect_impl(
                 }
                 Some(client::Event::Disconnect(reason)) => {
                     warn!("Got a disconnect with a reason: {reason:?}");
-                    let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-                    callback.disconnected(reason);
+                    let mut state = state_clone.lock();
+                    if !state.is_finished() {
+                        *state = ConnectionState::Ended(reason);
+                    }
+                    break;
                 }
                 None => break,
             }
         }
 
         let reason = match &*state_clone.lock() {
-            ConnectionState::ShutDown(reason) => reason.clone(),
+            ConnectionState::Ended(reason) | ConnectionState::ShutDown(reason) => reason.clone(),
             ConnectionState::Active(_) => {
                 Some("active service closed the notification stream".to_owned())
             }
@@ -608,15 +616,48 @@ fn make_socket_pool(protect: Option<telio_sockets::Protect>) -> Result<Arc<Socke
 
     Ok(socket_pool)
 }
+
+struct GuardedCallback {
+    closed: AtomicBool,
+    inner: Box<dyn ErrorNotificationCallback>,
+}
+
+impl GuardedCallback {
+    pub fn new(inner: Box<dyn ErrorNotificationCallback>) -> Self {
+        Self {
+            inner,
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ErrorNotificationCallback for GuardedCallback {
+    fn notify(&self, notification: ConnectionErrorNotification) {
+        if !self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.notify(notification);
+        }
+    }
+
+    fn disconnected(&self, reason: Option<String>) {
+        let was_closed = self.closed.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if !was_closed {
+            self.inner.disconnected(reason);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ConnectionState {
     Active(ErrorNotificationService),
+    // The session ended on its own with stored reason
+    Ended(Option<String>),
+    // The session was torn down by the library caller.
     ShutDown(Option<String>),
 }
 
 impl ConnectionState {
-    fn is_shut_down(&self) -> bool {
-        matches!(self, ConnectionState::ShutDown(_))
+    fn is_finished(&self) -> bool {
+        !matches!(self, ConnectionState::Active(_))
     }
 }
 
@@ -656,11 +697,11 @@ impl Connection {
                 let mut state = self.state.lock();
                 match std::mem::replace(
                     &mut *state,
-                    ConnectionState::ShutDown(Some("shutdown".to_owned())),
+                    ConnectionState::ShutDown(Some(SHUTDOWN_REASON.to_owned())),
                 ) {
                     ConnectionState::Active(s) => s,
-                    already_shut @ ConnectionState::ShutDown(_) => {
-                        *state = already_shut;
+                    already_finished => {
+                        *state = already_finished;
                         return Ok(());
                     }
                 }
@@ -782,6 +823,25 @@ mod tests {
     }
 
     #[test_log::test]
+    fn test_guarded_callback_reports_a_disconnect_at_most_once() {
+        let recording = RecordedCallback::default();
+        let callback = GuardedCallback::new(Box::new(recording.clone()));
+
+        callback.disconnected(Some(SHUTDOWN_REASON.to_owned()));
+        callback.disconnected(None);
+        callback.notify(ConnectionErrorNotification {
+            kind: ConnectionErrorNotificationKind::ServerMaintenance,
+            additional_info: None,
+        });
+
+        assert_eq!(
+            *recording.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+        assert_eq!(*recording.notifications.lock(), vec![]);
+    }
+
+    #[test_log::test]
     fn test_explicit_shutdown() {
         run_init();
 
@@ -818,7 +878,7 @@ mod tests {
         // until the end of the event processing task which calls `disconnected`
         // on the callback.
         assert!(
-            callback.disconnected.lock().is_some(),
+            !callback.disconnects.lock().is_empty(),
             "shutdown() returned before the pump delivered `disconnected`"
         );
 
@@ -842,8 +902,8 @@ mod tests {
         );
 
         assert_eq!(
-            *callback.disconnected.lock(),
-            Some(Some(SHUTDOWN_REASON.to_owned()))
+            *callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
         );
 
         // `shutdown` should be idempotent
@@ -871,7 +931,7 @@ mod tests {
         drop(connection);
 
         // `drop` doesn't wait so we need to
-        wait_for(|| callback.disconnected.lock().is_some());
+        wait_for(|| !callback.disconnects.lock().is_empty());
 
         let notifications = callback.notifications.lock();
         assert_eq!(
@@ -882,7 +942,7 @@ mod tests {
             }]
         );
 
-        assert_eq!(*callback.disconnected.lock(), Some(None));
+        assert_eq!(*callback.disconnects.lock(), vec![None]);
     }
 
     #[test_log::test]
@@ -967,7 +1027,7 @@ mod tests {
         let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
         let vpn_port = server_config.port;
         let callback = RecordedCallback::default();
-        let _connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server(&server_config, callback.clone());
 
         let error = ConnectionError {
             code: EnsProtoError::ServerMaintenance as i32,
@@ -993,6 +1053,43 @@ mod tests {
                 additional_info: Some("planned maintenance".to_owned()),
             }]
         );
+
+        // Safe to call multiple times; subsequent calls are no-ops.
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_matches!(connection.shutdown(), Ok(()));
+
+        let disconnects = callback.disconnects.lock().clone();
+        assert_eq!(
+            disconnects,
+            vec![Some(format!(
+                "'http://127.0.0.1:{vpn_port}' closed the grpc stream"
+            ))],
+        );
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_once_when_a_finished_connection_is_dropped() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let vpn_port = server_config.port;
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server(&server_config, callback.clone());
+        let id = connection.id;
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
+        );
+        assert_eq!(0, tracked_connections(&[id]));
+
+        drop(connection);
+
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
     }
 
     #[test_log::test]

@@ -28,6 +28,7 @@ use telio_sockets::{protector::make_external_protector, NativeProtector, SocketP
 use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
 use thiserror::Error;
 use tokio::task::block_in_place;
+use tonic::metadata::AsciiMetadataValue;
 
 pub use memory::get_memory_usage;
 
@@ -285,6 +286,15 @@ pub enum KeyKind {
     NordLynx,
 }
 
+impl KeyKind {
+    #[must_use]
+    pub fn protocol_name(&self) -> AsciiMetadataValue {
+        match self {
+            KeyKind::NordLynx => AsciiMetadataValue::from_static("nordlynx"),
+        }
+    }
+}
+
 pub struct Keys {
     pub local_private_key: HiddenBytes,
     pub vpn_public_key: HiddenBytes,
@@ -447,17 +457,32 @@ async fn connect_impl(
     let callback_thread_id_clone = callback_thread_id.clone();
 
     let event_processing_task = tokio::task::spawn(async move {
-        while let Some((connection_error, vpn)) = receiver.recv().await {
-            // This is behaviour documented in the udl
-            if state_clone.lock().is_shut_down() {
-                debug!("Dropping notification received after shutdown: {connection_error:?}");
-                break;
-            }
+        loop {
+            match receiver.recv().await {
+                Some(client::Event::Notification {
+                    connection_error,
+                    vpn_uri,
+                }) => {
+                    // This is behaviour documented in the udl
+                    if state_clone.lock().is_shut_down() {
+                        debug!(
+                            "Dropping notification received after shutdown: {connection_error:?}"
+                        );
+                        break;
+                    }
 
-            debug!("Received new connection error: {connection_error:?} from {vpn:?}");
-            {
-                let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-                callback.notify(connection_error.into());
+                    debug!("Received new connection error: {connection_error:?} from {vpn_uri:?}");
+                    {
+                        let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
+                        callback.notify(connection_error.into());
+                    }
+                }
+                Some(client::Event::Disconnect(reason)) => {
+                    warn!("Got a disconnect with a reason: {reason:?}");
+                    let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
+                    callback.disconnected(reason);
+                }
+                None => break,
             }
         }
 
@@ -634,8 +659,8 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server, connect_to_test_server_with_keys, wait_for, Command,
-            RecordedCallback,
+            connect_to_test_server, connect_to_test_server_with_keys, wait_for,
+            wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
         },
     };
 
@@ -747,7 +772,7 @@ mod tests {
 
         assert_eq!(
             *callback.disconnected.lock(),
-            Some(Some("shutdown".to_owned()))
+            Some(Some(SHUTDOWN_REASON.to_owned()))
         );
 
         // `shutdown` should be idempotent
@@ -839,7 +864,7 @@ mod tests {
 
         assert_eq!(
             *callback.disconnected.lock(),
-            Some(Some("shutdown".to_owned()))
+            Some(Some(SHUTDOWN_REASON.to_owned()))
         );
     }
 
@@ -861,5 +886,41 @@ mod tests {
         );
 
         assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_server_gracefully_closes_the_stream() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let vpn_port = server_config.port;
+        let callback = RecordedCallback::default();
+        let _connection = connect_to_test_server(&server_config, callback.clone());
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: Some("planned maintenance".to_owned()),
+        };
+
+        server_config.send_blocking(Command::Send(error));
+
+        wait_for(|| callback.notifications.lock().len() == 1);
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
+        );
+        assert_eq!(
+            *callback.notifications.lock(),
+            vec![ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::ServerMaintenance,
+                additional_info: Some("planned maintenance".to_owned()),
+            }]
+        );
     }
 }

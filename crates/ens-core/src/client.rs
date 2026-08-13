@@ -82,10 +82,19 @@ pub struct KeepaliveConfig {
     pub timeout: Option<Duration>,
 }
 
+#[derive(Debug)]
+pub enum Event {
+    Notification {
+        connection_error: ConnectionError,
+        vpn_uri: String,
+    },
+    Disconnect(Option<String>),
+}
+
 /// `ErrorNotificationService` manages tasks started and stopped to consume the ENS grpc error streams
 pub struct ErrorNotificationService {
     quit: Option<(watch::Sender<bool>, JoinHandle<()>)>,
-    tx: Sender<(ConnectionError, String)>,
+    tx: Sender<Event>,
     socket_pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     // DER encoded root certificate to be use for verification of TLS
@@ -128,7 +137,7 @@ impl ErrorNotificationService {
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
         user_agent: HeaderValue,
-    ) -> (Self, Receiver<(ConnectionError, String)>) {
+    ) -> (Self, Receiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size.get());
 
         if let Some(cert) = &root_certificate_override {
@@ -240,7 +249,6 @@ impl ErrorNotificationService {
 pub struct ClientKeys {
     pub local_private_key: SecretKey,
     pub vpn_public_key: PublicKey,
-    #[expect(unused)]
     pub kind: KeyKind,
 }
 
@@ -295,7 +303,7 @@ async fn task(
     vpn_uri: &str,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
-    tx: Sender<(ConnectionError, String)>,
+    tx: Sender<Event>,
     mut quit_rx: watch::Receiver<bool>,
     allow_only_mlkem: bool,
     mut backoff: impl Backoff,
@@ -355,10 +363,7 @@ async fn task(
                     .await,
                     backoff
                 );
-                (
-                    authenticated_challenge,
-                    AsciiMetadataValue::from_static("nordlynx"),
-                )
+                (authenticated_challenge, keys.kind.protocol_name())
             }
         };
 
@@ -375,24 +380,28 @@ async fn task(
                 .await,
             backoff
         );
-        let mut stream = connection.into_inner();
+        let mut connection_error_stream = connection.into_inner();
         loop {
             select! {
                 _ = quit_rx.wait_for(|b| *b) => {
                     info!("ENS monitor for '{vpn_uri}' ends");
                     break 'outer;
                 }
-                error_notification = stream.message() => {
-                    warn!("Received error notification for '{vpn_uri}': {error_notification:?}");
-                    match error_notification {
-                        Ok(Some(error_notification)) => {
+                connection_error = connection_error_stream.message() => {
+                    warn!("Received error notification for '{vpn_uri}': {connection_error:?}");
+                    match connection_error {
+                        Ok(Some(connection_error)) => {
                             backoff.reset();
-                            if let Err(e) = tx.try_send((error_notification, vpn_uri.to_owned())) {
+                            if let Err(e) = tx.try_send(Event::Notification{connection_error, vpn_uri: vpn_uri.to_owned()}) {
                                 warn!("Failed to publish newly received error notification: {e}");
                             }
                         }
                         Ok(None) => {
-                            debug!("'{vpn_uri}' closed the grpc stream");
+                            let msg = format!("'{vpn_uri}' closed the grpc stream");
+                            debug!("{msg}");
+                            if let Err(e) = tx.try_send(Event::Disconnect(Some(msg))) {
+                                warn!("Failed to publish disconnect: {e}");
+                            }
                             break 'outer;
                         }
                         Err(e) => {
@@ -697,6 +706,15 @@ pub mod tests {
         .await
     }
 
+    async fn recv_connection_error(rx: &mut Receiver<Event>) -> ConnectionError {
+        match rx.recv().await {
+            Some(Event::Notification {
+                connection_error, ..
+            }) => connection_error,
+            other => panic!("Instead of connection error, received: {other:?}"),
+        }
+    }
+
     #[derive(Clone)]
     struct CheckAuthenticationInterceptor {
         stub: GrpcStub,
@@ -895,7 +913,8 @@ pub mod tests {
                 additional_info: Some("before the silence".to_owned()),
             }))
             .await;
-        let (before_the_silence, _) = rx.recv().await.unwrap();
+        let before_the_silence = recv_connection_error(&mut rx).await;
+
         let before_timestamp = Instant::now();
         assert_eq!(
             before_the_silence.additional_info.as_deref(),
@@ -909,7 +928,7 @@ pub mod tests {
         // we need to keep resending the event until it is delivered to a new connection.
         let safety_margin = Duration::from_secs(5);
         let deadline = interval + timeout + safety_margin;
-        let ((after_the_silence, _), after_timestamp) = tokio::time::timeout(deadline, async {
+        let (Event::Notification { connection_error: after_the_silence, .. }, after_timestamp) = tokio::time::timeout(deadline, async {
             loop {
                 server_config
                     .send(Command::Send(ConnectionError {
@@ -925,7 +944,7 @@ pub mod tests {
             }
         })
         .await
-        .expect("nothing was received after the server went silent - the client stayed parked on the dead connection");
+        .expect("nothing was received after the server went silent - the client stayed parked on the dead connection") else { panic!()};
 
         assert_eq!(
             after_the_silence.additional_info.as_deref(),
@@ -976,7 +995,8 @@ pub mod tests {
                 additional_info: Some("before the silence".to_owned()),
             }))
             .await;
-        let (before_the_silence, _) = rx.recv().await.unwrap();
+        let before_the_silence = recv_connection_error(&mut rx).await;
+
         assert_eq!(
             before_the_silence.additional_info.as_deref(),
             Some("before the silence")
@@ -1071,13 +1091,17 @@ pub mod tests {
         ens.stop().await;
     }
 
-    async fn collect_errors(
-        n: usize,
-        rx: &mut Receiver<(ConnectionError, String)>,
-    ) -> Vec<(ConnectionError, String)> {
+    async fn collect_errors(n: usize, rx: &mut Receiver<Event>) -> Vec<(ConnectionError, String)> {
         let mut ret = vec![];
-        for _ in 0..n {
-            ret.push(rx.recv().await.unwrap());
+        while ret.len() < n {
+            let Event::Notification {
+                connection_error,
+                vpn_uri,
+            } = rx.recv().await.unwrap()
+            else {
+                continue;
+            };
+            ret.push((connection_error, vpn_uri));
         }
         ret
     }

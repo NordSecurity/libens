@@ -6,7 +6,7 @@ pub fn catch_panic_result<T, F>(operation: F) -> Result<T, EnsError>
 where
     F: FnOnce() -> Result<T, EnsError>,
 {
-    catch_unwind(AssertUnwindSafe(operation)).map_err(|e| panic_to_error(&e))?
+    catch_unwind(AssertUnwindSafe(operation)).map_err(|e| panic_to_error(&*e))?
 }
 
 pub fn catch_panic<T, F>(operation: F, fallback: T) -> T
@@ -18,7 +18,7 @@ where
         Err(payload) => {
             log::error!(
                 "caught panic across FFI boundary: {}",
-                panic_payload_to_string(&payload)
+                panic_payload_to_string(&*payload)
             );
             fallback
         }
@@ -38,5 +38,17 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
         message.clone()
     } else {
         "panic without message".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_catch_panic_result() {
+        let err =
+            catch_panic_result(|| -> std::result::Result<u32, _> { panic!("foo") }).unwrap_err();
+        assert!(format!("{err:?}").contains("foo"));
     }
 }

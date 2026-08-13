@@ -91,8 +91,9 @@ callback interface ErrorNotificationCallback {
 
     /// Signals that the ENS session has ended and no further `notify`
     /// calls will be made on this callback. Called at most once per
-    /// `Connection`. Calling `shutdown()` will trigger 
-    /// `disconnected("shutdown")`.
+    /// `Connection`. Calling `shutdown()` triggers disconnected("shutdown")
+    /// unless the session has already ended, in which case the original reason
+    /// is reported and no further call is made.
     void disconnected(string? reason);
 };
 

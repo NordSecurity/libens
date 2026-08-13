@@ -32,11 +32,11 @@ fn deinit_shuts_down_active_connections() {
 
     deinit().unwrap();
 
-    wait_for(|| callback.disconnected.lock().is_some());
+    wait_for(|| !callback.disconnects.lock().is_empty());
 
     assert_eq!(
-        *callback.disconnected.lock(),
-        Some(Some(SHUTDOWN_REASON.to_owned()))
+        *callback.disconnects.lock(),
+        vec![Some(SHUTDOWN_REASON.to_owned())]
     );
     assert_eq!(
         *callback.notifications.lock(),

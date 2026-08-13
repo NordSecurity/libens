@@ -12,6 +12,11 @@ mod memory;
 pub mod panics;
 pub mod runtime;
 
+#[cfg(test)]
+extern crate self as ens_core;
+#[cfg(test)]
+mod test_support;
+
 use http::{header::InvalidHeaderValue, HeaderValue};
 use llt_proto::ens::ConnectionError;
 use log::{debug, info, warn};
@@ -613,46 +618,25 @@ impl Drop for Connection {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::tests::{global_user_agent, Command, ServerConfig};
+
+    use crate::{
+        client::tests::{global_user_agent, spawn_authenticating_server},
+        test_support::{
+            connect_to_test_server, connect_to_test_server_with_keys, wait_for, Command,
+            RecordedCallback,
+        },
+    };
+
     use assert_matches::assert_matches;
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
-    use std::{
-        net::{Ipv4Addr, SocketAddrV4},
-        sync::Once,
-    };
-    use telio_crypto::SecretKey;
+    use std::sync::Once;
 
     use super::*;
 
     static INIT: Once = Once::new();
     pub fn run_init() {
         INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
-    }
-
-    #[derive(Default)]
-    struct RecordedCallback {
-        notifications: Mutex<Vec<ConnectionErrorNotification>>,
-
-        // Outer Option: whether `disconnected` was called at all.
-        // Inner Option<String>: the reason passed in.
-        #[allow(clippy::option_option)]
-        disconnected: Mutex<Option<Option<String>>>,
-
-        /// Simulate `disconnected` being slow
-        disconnect_delay: Mutex<Duration>,
-    }
-
-    impl ErrorNotificationCallback for Arc<RecordedCallback> {
-        fn notify(&self, notification: ConnectionErrorNotification) {
-            self.notifications.lock().push(notification);
-        }
-
-        fn disconnected(&self, reason: Option<String>) {
-            let delay = *self.disconnect_delay.lock();
-            std::thread::sleep(delay);
-            *self.disconnected.lock() = Some(reason);
-        }
     }
 
     #[derive(Default)]
@@ -689,65 +673,13 @@ mod tests {
 
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
 
-    #[track_caller]
-    fn wait_for(mut predicate: impl FnMut() -> bool) {
-        let max_wait_time = Duration::from_secs(5);
-        let deadline = std::time::Instant::now() + max_wait_time;
-        loop {
-            if predicate() {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Timed out in wait_for"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn connect_to_test_server(
-        server_config: &ServerConfig,
-        callback: impl ErrorNotificationCallback + 'static,
-    ) -> Arc<Connection> {
-        let client_private_key = SecretKey::gen();
-
-        connect_to_test_server_with_keys(
-            server_config,
-            Keys {
-                local_private_key: Hidden(client_private_key.to_vec()),
-                vpn_public_key: Hidden(server_config.public_key.to_vec()),
-                kind: crate::KeyKind::NordLynx,
-            },
-            callback,
-        )
-        .unwrap()
-    }
-
-    fn connect_to_test_server_with_keys(
-        server_config: &ServerConfig,
-        keys: Keys,
-        callback: impl ErrorNotificationCallback + 'static,
-    ) -> Result<Arc<Connection>> {
-        let config = Config::new();
-        config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
-
-        connect(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_config.port)),
-            None,
-            Authentication::Keys { keys },
-            Box::new(callback),
-            Arc::new(config),
-        )
-    }
-
     #[test_log::test]
     fn test_explicit_shutdown() {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config =
-            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
-        let callback = Arc::new(RecordedCallback::default());
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let callback = RecordedCallback::default();
         let connection = connect_to_test_server(&server_config, callback.clone());
 
         let errors_to_emit = [
@@ -765,15 +697,9 @@ mod tests {
             },
         ];
 
-        runtime.block_on(async {
-            for e in &errors_to_emit {
-                server_config
-                    .command_tx
-                    .send(Command::Send(e.clone()))
-                    .await
-                    .unwrap();
-            }
-        });
+        for e in &errors_to_emit {
+            server_config.send_blocking(Command::Send(e.clone()));
+        }
 
         wait_for(|| callback.notifications.lock().len() == errors_to_emit.len());
 
@@ -821,9 +747,8 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config =
-            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
-        let callback = Arc::new(RecordedCallback::default());
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let callback = RecordedCallback::default();
         let connection = connect_to_test_server(&server_config, callback.clone());
 
         let error = ConnectionError {
@@ -831,13 +756,7 @@ mod tests {
             additional_info: None,
         };
 
-        runtime.block_on(async {
-            server_config
-                .command_tx
-                .send(Command::Send(error.clone()))
-                .await
-                .unwrap();
-        });
+        server_config.send_blocking(Command::Send(error));
 
         wait_for(|| callback.notifications.lock().len() == 1);
 
@@ -863,8 +782,7 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config =
-            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
         let callback = Arc::new(RecursiveCallback::default());
         let connection = connect_to_test_server(&server_config, callback.clone());
         *callback.connection.lock() = Some(connection.clone());
@@ -884,15 +802,9 @@ mod tests {
             },
         ];
 
-        runtime.block_on(async {
-            for e in &errors_to_emit {
-                server_config
-                    .command_tx
-                    .send(Command::Send(e.clone()))
-                    .await
-                    .unwrap();
-            }
-        });
+        for e in &errors_to_emit {
+            server_config.send_blocking(Command::Send(e.clone()));
+        }
 
         wait_for(|| callback.disconnected.lock().is_some());
 
@@ -924,9 +836,8 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config =
-            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
-        let callback = Arc::new(RecordedCallback::default());
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let callback = RecordedCallback::default();
         let connection = connect_to_test_server_with_keys(
             &server_config,
             Keys {

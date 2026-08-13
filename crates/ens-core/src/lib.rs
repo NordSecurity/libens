@@ -403,40 +403,8 @@ async fn connect_impl(
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
     let authentication = authentication.try_into()?;
-    let protect: Option<telio_sockets::Protect> = match protect_cb {
-        Some(protect) => {
-            let protect = AssertUnwindSafe(protect);
-            #[allow(clippy::useless_conversion)]
-            Some(Arc::new(move |fd| match fd.try_into() {
-                Ok(fd) => {
-                    let protect_res = protect.protect(fd);
-                    if let Err(err) = protect_res {
-                        warn!("Could not call protect callback due to {err:?}");
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to convert file descriptor: {e}");
-                }
-            }))
-        }
-        _ => None,
-    };
-
-    let socket_pool = Arc::new({
-        if let Some(protect) = protect {
-            let external_protect = make_external_protector(protect);
-            SocketPool::new(external_protect)
-        } else {
-            #[cfg(target_os = "macos")]
-            let np = NativeProtector::new(false);
-            #[cfg(not(target_os = "macos"))]
-            let np = NativeProtector::new();
-
-            SocketPool::new(np.map_err(|e| EnsError::InternalError {
-                reason: format!("Native protector creation failed: {e}"),
-            })?)
-        }
-    });
+    let protect = make_socket_protector(protect_cb);
+    let socket_pool = make_socket_pool(protect)?;
 
     let user_agent = STATE
         .lock()
@@ -514,6 +482,50 @@ async fn connect_impl(
     }))
 }
 
+fn make_socket_protector(
+    protect_cb: Option<Box<dyn ProtectCallback>>,
+) -> Option<telio_sockets::Protect> {
+    let protect: Option<telio_sockets::Protect> = match protect_cb {
+        Some(protect) => {
+            let protect = AssertUnwindSafe(protect);
+            #[allow(clippy::useless_conversion)]
+            Some(Arc::new(move |fd| match fd.try_into() {
+                Ok(fd) => {
+                    let protect_res = protect.protect(fd);
+                    if let Err(err) = protect_res {
+                        warn!("Could not call protect callback due to {err:?}");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to convert file descriptor: {e}");
+                }
+            }))
+        }
+        _ => None,
+    };
+
+    protect
+}
+
+fn make_socket_pool(protect: Option<telio_sockets::Protect>) -> Result<Arc<SocketPool>> {
+    let socket_pool = Arc::new({
+        if let Some(protect) = protect {
+            let external_protect = make_external_protector(protect);
+            SocketPool::new(external_protect)
+        } else {
+            #[cfg(target_os = "macos")]
+            let np = NativeProtector::new(false);
+            #[cfg(not(target_os = "macos"))]
+            let np = NativeProtector::new();
+
+            SocketPool::new(np.map_err(|e| EnsError::InternalError {
+                reason: format!("Native protector creation failed: {e}"),
+            })?)
+        }
+    });
+
+    Ok(socket_pool)
+}
 #[derive(Debug)]
 enum ConnectionState {
     Active(ErrorNotificationService),

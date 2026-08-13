@@ -7,6 +7,12 @@ enum LogLevel {
     "Trace",
 };
 
+[Custom]
+typedef string HiddenString;
+
+[Custom]
+typedef bytes HiddenBytes;
+
 /// Callback for receiving log messages from the library.
 callback interface LogCallback {
     /// Called when the library produces a log message at or below the
@@ -112,10 +118,10 @@ enum CredentialsKind {
 dictionary Credentials {
     /// Service username (`Credentials.OpenVPNUsername` on the client
     /// side).
-    string username;
+    HiddenString username;
     /// Service password (`Credentials.OpenVPNPassword` on the client
     /// side). Treat as secret; do not log.
-    string password;
+    HiddenString password;
     /// Which VPN protocol this credential pair authenticates.
     CredentialsKind kind;
 };
@@ -136,10 +142,10 @@ enum KeyKind {
 /// are required.
 dictionary Keys {
     /// Client's private key.
-    bytes local_private_key;
+    HiddenBytes local_private_key;
     /// VPN server's public key - the same public key used to establish
     /// the WireGuard tunnel.
-    bytes vpn_public_key;
+    HiddenBytes vpn_public_key;
     /// Which VPN protocol this key material authenticates.
     KeyKind kind;
 };

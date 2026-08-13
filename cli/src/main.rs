@@ -13,7 +13,7 @@ use tokio::{sync::Notify, time::timeout};
 use chrono::Utc;
 use clap::Parser;
 use ens::{
-    Authentication, Config, ErrorNotificationCallback, LogCallback, LogLevel, connect,
+    Authentication, Config, ErrorNotificationCallback, Hidden, LogCallback, LogLevel, connect,
     runtime::get_runtime,
 };
 use log::{debug, info};
@@ -234,8 +234,8 @@ fn main() {
 
                     let auth = Authentication::Keys {
                         keys: ens::Keys {
-                            local_private_key,
-                            vpn_public_key,
+                            local_private_key: Hidden(local_private_key),
+                            vpn_public_key: Hidden(vpn_public_key),
                             kind: ens::KeyKind::NordLynx,
                         },
                     };

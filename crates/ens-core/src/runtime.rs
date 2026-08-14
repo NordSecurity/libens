@@ -45,7 +45,7 @@ pub fn get_runtime() -> Result<tokio::runtime::Handle> {
     if let Some(rt) = &*RUNTIME.read() {
         Ok(rt.handle().clone())
     } else {
-        Err(EnsError::InternalError {
+        Err(EnsError::NotInitialized {
             reason: "tokio runtime is not created".to_owned(),
         })
     }

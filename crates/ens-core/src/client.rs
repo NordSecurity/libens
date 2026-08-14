@@ -37,7 +37,7 @@ use llt_proto::ens::{
     ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
 };
 
-use crate::{Authentication, Credentials, EnsError, KeyKind};
+use crate::{runtime::is_unexpected_task_failure, Authentication, Credentials, EnsError, KeyKind};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
@@ -217,7 +217,7 @@ impl ErrorNotificationService {
                                  // to receive and react to te quit signal. Which is why we need to cancel it here, so
                                  // that we are not stuck for a long time in the await.
             if let Err(e) = join_handle.await {
-                if !e.is_cancelled() {
+                if is_unexpected_task_failure(&e) {
                     warn!("Previous ENS task failed to stop: {e}");
                 }
             }

@@ -40,7 +40,7 @@ use crate::{
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_result},
-    runtime::{deinit_runtime, get_runtime, init_runtime},
+    runtime::{deinit_runtime, get_runtime, init_runtime, is_unexpected_task_failure},
 };
 
 mod built_info {
@@ -601,7 +601,7 @@ impl Connection {
 
                 if let Some(task) = event_processing_task {
                     if let Err(e) = task.await {
-                        if !e.is_cancelled() {
+                        if is_unexpected_task_failure(&e) {
                             warn!("ENS notification pump failed to stop: {e}");
                         }
                     }

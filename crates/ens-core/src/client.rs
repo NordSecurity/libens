@@ -625,7 +625,7 @@ pub mod tests {
 
     use llt_proto::ens::Error as EnsProtoError;
 
-    const SUBJECT_ALT_NAMES: LazyLock<Vec<String>> =
+    static SUBJECT_ALT_NAMES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
 
     static INIT: Once = Once::new();
@@ -695,8 +695,8 @@ pub mod tests {
 
             TlsConfig {
                 ca_cert,
-                leaf_key_pem,
                 leaf_cert,
+                leaf_key_pem,
             }
         }
     }
@@ -766,14 +766,21 @@ pub mod tests {
         fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
             match req.metadata().get(AUTHENTICATION_KEY) {
                 Some(t) => {
-                    let decoded = BASE64_STANDARD.decode(&t).unwrap();
+                    let decoded = BASE64_STANDARD.decode(t).unwrap();
                     let (client_public_key, challenge_uuid, received_authentication_code) = (
                         PublicKey::new(decoded[..32].try_into().unwrap()),
                         Uuid::from_slice(&decoded[32..48]).unwrap(),
                         &decoded[48..],
                     );
 
-                    if let Some(_) = self.0.challenges.lock().unwrap().take(&challenge_uuid) {
+                    if self
+                        .0
+                        .challenges
+                        .lock()
+                        .unwrap()
+                        .take(&challenge_uuid)
+                        .is_some()
+                    {
                         let secret = self.0.vpn_server_private_key.ecdh(&client_public_key);
                         if received_authentication_code
                             == authentication_tag(&secret, &decoded[..48])
@@ -816,11 +823,11 @@ pub mod tests {
         tokio::spawn({
             let cert_pem = cert_pem.clone();
             async move {
+                use tonic::transport::ServerTlsConfig;
+
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let actual_addr = listener.local_addr().unwrap();
                 port_tx.send(actual_addr.port()).unwrap();
-
-                use tonic::transport::ServerTlsConfig;
 
                 let tonic_tls_config = ServerTlsConfig::new()
                     .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
@@ -968,7 +975,7 @@ pub mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
             client_authentication(&client_private_key, server_config.public_key),
-            ExponentialBackoff::new(Default::default()).unwrap(),
+            ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
         .await;
 
@@ -1052,7 +1059,7 @@ pub mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
             client_authentication(&client_private_key, server_config.public_key),
-            ExponentialBackoff::new(Default::default()).unwrap(),
+            ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
         .await;
 
@@ -1356,7 +1363,7 @@ pub mod tests {
                     kind: crate::KeyKind::NordLynx,
                 },
             },
-            ExponentialBackoff::new(Default::default()).unwrap(),
+            ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
         .await;
 
@@ -1396,8 +1403,7 @@ pub mod tests {
 
         let tls = TlsConfig::new();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
-                .unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
         let leaf_cert = tls.leaf_cert.der();
 
         // DigitallySignedStruct with incorrect signature bytes
@@ -1406,7 +1412,11 @@ pub mod tests {
         let garbage_signature = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
         let mut wire_bytes = Vec::new();
         wire_bytes.extend_from_slice(&scheme_u16.to_be_bytes());
-        wire_bytes.extend_from_slice(&(garbage_signature.len() as u16).to_be_bytes());
+        wire_bytes.extend_from_slice(
+            &u16::try_from(garbage_signature.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
         wire_bytes.extend_from_slice(&garbage_signature);
 
         let mut reader = Reader::init(&wire_bytes);
@@ -1415,7 +1425,7 @@ pub mod tests {
 
         let message = b"this is a TLS handshake message that was NOT signed by the cert's key";
 
-        let tls12_result = verifier.verify_tls12_signature(message, &leaf_cert, &dss);
+        let tls12_result = verifier.verify_tls12_signature(message, leaf_cert, &dss);
         assert_matches!(
             tls12_result,
             Err(rustls::Error::InvalidCertificate(
@@ -1423,7 +1433,7 @@ pub mod tests {
             ))
         );
 
-        let tls13_result = verifier.verify_tls13_signature(message, &leaf_cert, &dss);
+        let tls13_result = verifier.verify_tls13_signature(message, leaf_cert, &dss);
         assert_matches!(
             tls13_result,
             Err(rustls::Error::InvalidCertificate(
@@ -1441,8 +1451,7 @@ pub mod tests {
 
         let tls = TlsConfig::new();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
-                .unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
 
         assert_matches!(
             verifier.verify_server_cert(
@@ -1462,8 +1471,7 @@ pub mod tests {
 
         let tls = TlsConfig::new();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), &tls.ca_cert.der())
-                .unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
 
         assert_matches!(
             verifier.verify_server_cert(

@@ -584,6 +584,7 @@ mod tests {
 
         // Outer Option: whether `disconnected` was called at all.
         // Inner Option<String>: the reason passed in.
+        #[allow(clippy::option_option)]
         disconnected: Mutex<Option<Option<String>>>,
 
         /// Simulate `disconnected` being slow
@@ -608,6 +609,7 @@ mod tests {
         notifications: Mutex<Vec<ConnectionErrorNotification>>,
 
         shutdown_results: Mutex<Vec<Result<()>>>,
+        #[allow(clippy::option_option)]
         disconnected: Mutex<Option<Option<String>>>,
     }
 
@@ -641,9 +643,10 @@ mod tests {
             if predicate() {
                 return;
             }
-            if std::time::Instant::now() >= deadline {
-                panic!("Timed out in wait_for");
-            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out in wait_for"
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     }

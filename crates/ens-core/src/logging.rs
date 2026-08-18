@@ -44,10 +44,13 @@ impl Log for CallbackLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        self.callback.log(
-            record.level().into(),
-            LOG_CENSOR.censor_logs(record.args().to_string()),
+        let path = record.module_path().unwrap_or("unknown");
+        let msg = format!(
+            "{path} {}",
+            LOG_CENSOR.censor_logs(record.args().to_string())
         );
+
+        self.callback.log(record.level().into(), msg);
     }
 
     fn flush(&self) {

@@ -21,6 +21,7 @@ use std::{
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
 use thiserror::Error;
+use tokio::task::block_in_place;
 
 pub use memory::get_memory_usage;
 
@@ -36,6 +37,7 @@ mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 static APP_VERSION: Mutex<Option<String>> = Mutex::new(None);
 
 type Result<T> = std::result::Result<T, EnsError>;
@@ -332,15 +334,21 @@ pub fn connect(
     catch_panic_result(|| {
         let config = config.state.lock().clone();
 
-        // It might look like the runtime and async block are not needed here, but
-        // this is not the case. Inside of connect_impl we use tokio::spawn and that
-        // requires to be called on a thread in which tokio runtime has been entered.
-        get_runtime()?
-            .block_on(async { connect_impl(vpn, protect_cb, authentication, callback, config) })
+        let handle = get_runtime()?;
+
+        block_in_place(|| {
+            handle.block_on(connect_impl(
+                vpn,
+                protect_cb,
+                authentication,
+                callback,
+                config,
+            ))
+        })
     })
 }
 
-fn connect_impl(
+async fn connect_impl(
     vpn: SocketAddr,
     protect_cb: Option<Box<dyn ProtectCallback>>,
     authentication: Authentication,
@@ -395,29 +403,51 @@ fn connect_impl(
         ret
     });
 
-    client.start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff);
+    client
+        .start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff)
+        .await;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
-    let state_for_task = state.clone();
 
-    tokio::task::spawn(async move {
+    let state_clone = state.clone();
+
+    let callback_thread_id = Arc::new(Mutex::new(None));
+    let callback_thread_id_clone = callback_thread_id.clone();
+
+    let event_processing_task = tokio::task::spawn(async move {
         while let Some((connection_error, vpn)) = receiver.recv().await {
-            debug!("Received new connection error: {connection_error:?} from {vpn:?}");
+            // This is behaviour documented in the udl
+            if state_clone.lock().is_shut_down() {
+                debug!("Dropping notification received after shutdown: {connection_error:?}");
+                break;
+            }
 
-            callback.notify(connection_error.into());
+            debug!("Received new connection error: {connection_error:?} from {vpn:?}");
+            {
+                let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
+                callback.notify(connection_error.into());
+            }
         }
-        let reason = match &*state_for_task.lock() {
+
+        let reason = match &*state_clone.lock() {
             ConnectionState::ShutDown(reason) => reason.clone(),
             ConnectionState::Active(_) => {
-                Some("active services closed the notification stream".to_owned())
+                Some("active service closed the notification stream".to_owned())
             }
         };
-        callback.disconnected(reason);
+        {
+            let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
+            callback.disconnected(reason);
+        }
 
-        debug!("Stopping ENS worker thread for {vpn:?}");
+        debug!("Stopping ENS notification pump");
     });
 
-    Ok(Arc::new(Connection { state }))
+    Ok(Arc::new(Connection {
+        state,
+        callback_thread_id,
+        event_processing_task: Mutex::new(Some(event_processing_task)),
+    }))
 }
 
 enum ConnectionState {
@@ -425,8 +455,36 @@ enum ConnectionState {
     ShutDown(Option<String>),
 }
 
+impl ConnectionState {
+    fn is_shut_down(&self) -> bool {
+        matches!(self, ConnectionState::ShutDown(_))
+    }
+}
+
+type CallbackThreadId = Mutex<Option<std::thread::ThreadId>>;
+struct CallbackThreadGuard<'a>(&'a CallbackThreadId);
+
+impl<'a> CallbackThreadGuard<'a> {
+    fn enter(thread_id: &'a CallbackThreadId) -> Self {
+        *thread_id.lock() = Some(std::thread::current().id());
+        Self(thread_id)
+    }
+}
+
+impl Drop for CallbackThreadGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock() = None;
+    }
+}
+
 pub struct Connection {
     state: Arc<Mutex<ConnectionState>>,
+    // Set to Some(_) when the event processing task is about to call one of
+    // the user provided callbacks. Which means that it's None when called from
+    // other threads.
+    callback_thread_id: Arc<CallbackThreadId>,
+
+    event_processing_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Connection {
@@ -445,8 +503,40 @@ impl Connection {
                     }
                 }
             };
-            service.stop();
-            Ok(())
+
+            let event_processing_task = self.event_processing_task.lock().take();
+            let called_from_own_callback =
+                *self.callback_thread_id.lock() == Some(std::thread::current().id());
+            let event_processing_task = if called_from_own_callback {
+                debug!("`shutdown` called from `notify` a callback, not awaiting the end of event processing task");
+                None
+            } else {
+                event_processing_task
+            };
+
+            let handle = get_runtime()?;
+            let stop_service = async move {
+                service.stop().await;
+                // We need to drop it to trigger closing of the channel, otherwise
+                // the await below would deadlock.
+                drop(service);
+
+                if let Some(task) = event_processing_task {
+                    if let Err(e) = task.await {
+                        if !e.is_cancelled() {
+                            warn!("ENS notification pump failed to stop: {e}");
+                        }
+                    }
+                }
+            };
+            block_in_place(|| {
+                handle.block_on(async move {
+                    tokio::time::timeout(SHUTDOWN_TIMEOUT, stop_service).await
+                })
+            })
+            .map_err(|e| EnsError::InternalError {
+                reason: format!("Failed while waiting for the ENS task to stop: {e}"),
+            })
         })
     }
 }
@@ -465,6 +555,7 @@ mod tests {
     use crate::client::tests::{run_init, Command, ServerConfig};
     use assert_matches::assert_matches;
     use llt_proto::ens::Error as EnsProtoError;
+    use log::info;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use telio_crypto::SecretKey;
 
@@ -473,9 +564,13 @@ mod tests {
     #[derive(Default)]
     struct RecordedCallback {
         notifications: Mutex<Vec<ConnectionErrorNotification>>,
+
         // Outer Option: whether `disconnected` was called at all.
         // Inner Option<String>: the reason passed in.
         disconnected: Mutex<Option<Option<String>>>,
+
+        /// Simulate `disconnected` being slow
+        disconnect_delay: Mutex<Duration>,
     }
 
     impl ErrorNotificationCallback for Arc<RecordedCallback> {
@@ -484,6 +579,39 @@ mod tests {
         }
 
         fn disconnected(&self, reason: Option<String>) {
+            let delay = *self.disconnect_delay.lock();
+            std::thread::sleep(delay);
+            *self.disconnected.lock() = Some(reason);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecursiveCallback {
+        connection: Mutex<Option<Arc<Connection>>>,
+        notifications: Mutex<Vec<ConnectionErrorNotification>>,
+
+        shutdown_results: Mutex<Vec<Result<()>>>,
+        disconnected: Mutex<Option<Option<String>>>,
+    }
+
+    impl ErrorNotificationCallback for Arc<RecursiveCallback> {
+        fn notify(&self, notification: ConnectionErrorNotification) {
+            info!("Got {notification:?}");
+            self.notifications.lock().push(notification);
+
+            // Clone the handle out and release the lock before shutting down:
+            // `shutdown` blocks, and holding a lock across it would make the
+            // callback itself a source of deadlocks.
+            let connection = self.connection.lock().clone();
+
+            if let Some(c) = connection {
+                info!("connection present, shutting down");
+                self.shutdown_results.lock().push(c.shutdown());
+            }
+        }
+
+        fn disconnected(&self, reason: Option<String>) {
+            info!("disconnect: {reason:?}");
             *self.disconnected.lock() = Some(reason);
         }
     }
@@ -505,7 +633,7 @@ mod tests {
 
     fn connect_to_test_server(
         server_config: &ServerConfig,
-        callback: Arc<RecordedCallback>,
+        callback: impl ErrorNotificationCallback + 'static,
     ) -> Arc<Connection> {
         let client_private_key = SecretKey::gen();
 
@@ -564,9 +692,16 @@ mod tests {
 
         wait_for(|| callback.notifications.lock().len() == errors_to_emit.len());
 
+        *callback.disconnect_delay.lock() = Duration::from_millis(500);
         connection.shutdown().unwrap();
 
-        wait_for(|| callback.disconnected.lock().is_some());
+        // No need for `wait_for` because `shutdown` should have already waited
+        // until the end of the event processing task which calls `disconnected`
+        // on the callback.
+        assert!(
+            callback.disconnected.lock().is_some(),
+            "shutdown() returned before the pump delivered `disconnected`"
+        );
 
         let notifications = callback.notifications.lock();
         assert_eq!(
@@ -592,6 +727,7 @@ mod tests {
             Some(Some("shutdown".to_owned()))
         );
 
+        // `shutdown` should be idempotent
         assert_matches!(connection.shutdown(), Ok(()));
     }
 
@@ -621,6 +757,7 @@ mod tests {
 
         drop(connection);
 
+        // `drop` doesn't wait so we need to
         wait_for(|| callback.disconnected.lock().is_some());
 
         let notifications = callback.notifications.lock();
@@ -633,5 +770,65 @@ mod tests {
         );
 
         assert_eq!(*callback.disconnected.lock(), Some(None));
+    }
+
+    #[test_log::test]
+    fn test_shutdown_called_by_callback() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let callback = Arc::new(RecursiveCallback::default());
+        let connection = connect_to_test_server(&server_config, callback.clone());
+        *callback.connection.lock() = Some(connection.clone());
+
+        let errors_to_emit = [
+            ConnectionError {
+                code: EnsProtoError::Unknown as i32,
+                additional_info: None,
+            },
+            ConnectionError {
+                code: EnsProtoError::ConnectionLimitReached as i32,
+                additional_info: Some("additional info".to_owned()),
+            },
+            ConnectionError {
+                code: EnsProtoError::ServerMaintenance as i32,
+                additional_info: Some("planned maintenance".to_owned()),
+            },
+        ];
+
+        runtime.block_on(async {
+            for e in &errors_to_emit {
+                server_config
+                    .command_tx
+                    .send(Command::Send(e.clone()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        wait_for(|| callback.disconnected.lock().is_some());
+
+        // callback will call `shutdown` when receiving first notification, so
+        // the other two should not be delivered.
+        let notifications = std::mem::take(&mut *callback.notifications.lock());
+        assert_eq!(
+            notifications,
+            vec![ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::Unknown { kind: 0 },
+                additional_info: None,
+            }],
+            "no notification may be delivered once shutdown() was called"
+        );
+
+        assert_matches!(
+            std::mem::take(&mut *callback.shutdown_results.lock()).as_slice(),
+            [Ok(())]
+        );
+
+        assert_eq!(
+            *callback.disconnected.lock(),
+            Some(Some("shutdown".to_owned()))
+        );
     }
 }

@@ -35,7 +35,6 @@ pub(crate) fn deinit_runtime() {
     }
 }
 
-#[expect(dead_code)]
 pub fn get_runtime() -> Result<tokio::runtime::Handle> {
     if let Some(rt) = &*RUNTIME.read() {
         Ok(rt.handle().clone())

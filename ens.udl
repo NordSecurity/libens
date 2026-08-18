@@ -37,6 +37,9 @@ interface EnsError {
 
     /// `init()` called after previous `init()` without `deinit()` in between.
     AlreadyInitialized();
+
+    /// Other, unspecified error
+    UnknownError(string reason);
 };
 
 /// Classification of a connection-level error notification received from
@@ -178,6 +181,17 @@ callback interface ProtectCallback {
     void protect(i32 socket_fd);
 };
 
+interface Config {
+    constructor();  
+    
+    void set_buffer_size(u32 size);
+    void set_allow_only_pq(boolean allow_only_pq);
+    void set_root_certificate_override(bytes? override);
+
+    void set_backoff_initial(u32 seconds);
+    void set_backoff_maximal(u32? seconds);
+};
+
 namespace ens {
     /// Initializes the library. The `app_version` parameter should be a succinct
     /// string that uniquely identifies the app that is calling the `init`
@@ -225,6 +239,7 @@ namespace ens {
         SocketAddr socket_addr,
         ProtectCallback? protect_callback,
         Authentication authentication,
-        ErrorNotificationCallback notification_callback
+        ErrorNotificationCallback notification_callback,
+        Config config
     );
 };

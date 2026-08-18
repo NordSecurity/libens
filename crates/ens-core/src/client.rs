@@ -3,6 +3,7 @@ use std::{
     net::{IpAddr, ToSocketAddrs},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
@@ -45,6 +46,8 @@ const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// ENS errors
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +72,16 @@ pub enum Error {
     InvalidKey { reason: String },
 }
 
+/// Configuration of the keep alive messages sent over the ENS connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeepaliveConfig {
+    /// Interval between the keep alive messages, `None` disables the keep alives
+    pub interval: Option<Duration>,
+    /// How long to wait for a keep alive response before considering the connection dead,
+    /// `None` leaves the default of the underlying http client in place
+    pub timeout: Option<Duration>,
+}
+
 /// `ErrorNotificationService` manages tasks started and stopped to consume the ENS grpc error streams
 pub struct ErrorNotificationService {
     quit: Option<(watch::Sender<bool>, JoinHandle<()>)>,
@@ -77,6 +90,8 @@ pub struct ErrorNotificationService {
     allow_only_mlkem: bool,
     // DER encoded root certificate to be use for verification of TLS
     root_certificate: Vec<u8>,
+    // Configuration of the keep alive messages sent over the ENS connection
+    keepalive: KeepaliveConfig,
 }
 
 impl Drop for ErrorNotificationService {
@@ -96,6 +111,7 @@ impl ErrorNotificationService {
         socket_pool: Arc<SocketPool>,
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
+        mut keepalive: KeepaliveConfig,
     ) -> (Self, Receiver<(ConnectionError, String)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
@@ -106,6 +122,15 @@ impl ErrorNotificationService {
             );
         }
 
+        if keepalive.interval == Some(Duration::ZERO) {
+            warn!("Keepalive interval set to 0, resetting to default");
+            keepalive.interval = Some(DEFAULT_KEEPALIVE_INTERVAL);
+        }
+        if keepalive.timeout == Some(Duration::ZERO) {
+            warn!("Keepalive timeout set to 0, resetting to default");
+            keepalive.timeout = Some(DEFAULT_KEEPALIVE_TIMEOUT);
+        }
+
         (
             Self {
                 quit: None,
@@ -114,6 +139,7 @@ impl ErrorNotificationService {
                 allow_only_mlkem,
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
+                keepalive,
             },
             rx,
         )
@@ -140,6 +166,7 @@ impl ErrorNotificationService {
         let tx = self.tx.clone();
         let allow_only_mlkem = self.allow_only_mlkem;
         let root_certificate = self.root_certificate.clone();
+        let keepalive = self.keepalive;
 
         let join_handle = tokio::spawn(async move {
             // This future is too big for keeping it on the stack
@@ -152,6 +179,7 @@ impl ErrorNotificationService {
                 allow_only_mlkem,
                 backoff,
                 root_certificate,
+                keepalive,
             ))
             .await
             {
@@ -200,6 +228,7 @@ async fn task(
     allow_only_mlkem: bool,
     mut backoff: impl Backoff,
     root_certificate: Vec<u8>,
+    keepalive: KeepaliveConfig,
 ) -> Result<(), Error> {
     'outer: loop {
         macro_rules! restart {
@@ -233,7 +262,8 @@ async fn task(
                 vpn_uri,
                 pool,
                 allow_only_mlkem,
-                root_certificate.clone()
+                root_certificate.clone(),
+                keepalive
             ))
             .await,
             backoff
@@ -345,6 +375,7 @@ async fn create_external_channel(
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
+    keepalive: KeepaliveConfig,
 ) -> Result<Channel, Error> {
     let socket_factory = move |uri: Uri| {
         let pool = pool.clone();
@@ -380,7 +411,29 @@ async fn create_external_channel(
         }
     };
 
-    Ok(Endpoint::try_from(vpn_uri.to_owned())?
+    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?;
+
+    let endpoint = if let Some(interval) = keepalive.interval {
+        endpoint.http2_keep_alive_interval(interval)
+    } else {
+        endpoint
+    };
+    let endpoint = if let Some(timeout) = keepalive.timeout {
+        endpoint.keep_alive_timeout(timeout)
+    } else {
+        endpoint
+    };
+
+    // Strictly this is not needed in our case since we have a long lived connection
+    // that we want to keep alive. This setting helps in the case where there is
+    // **no** active rpc connection and we want to make a new rpc call after a while.
+    let endpoint = if keepalive.interval.is_some() {
+        endpoint.keep_alive_while_idle(true)
+    } else {
+        endpoint
+    };
+
+    Ok(endpoint
         .connect_with_connector(service_fn(socket_factory))
         .await?)
 }
@@ -537,8 +590,11 @@ pub mod tests {
     use std::{
         collections::HashSet,
         net::Ipv4Addr,
-        sync::{atomic::AtomicUsize, LazyLock, Mutex, Once},
-        time::Duration,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            LazyLock, Mutex, Once,
+        },
+        time::{Duration, Instant},
     };
 
     use assert_matches::assert_matches;
@@ -552,10 +608,14 @@ pub mod tests {
         generate_simple_self_signed, BasicConstraints, Certificate, CertificateParams,
         CertifiedKey, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     };
+    use rstest::rstest;
     use telio_crypto::SecretKey;
     use telio_sockets::NativeProtector;
     use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
-    use tokio::sync::oneshot;
+    use tokio::{
+        sync::oneshot,
+        time::{error::Elapsed, timeout},
+    };
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{service::Interceptor, transport::Server};
 
@@ -667,10 +727,16 @@ pub mod tests {
                 // Ends on `Command::End` or when the test drops the sender,
                 // whichever comes first - not every test sends `End`.
                 while let Ok(command) = command_rx.recv().await {
-                    match command {
-                        Command::Send(e) => tx.send(Ok(e)).await.unwrap(),
-                        Command::Error(status) => tx.send(Err(status)).await.unwrap(),
+                    let sent = match command {
+                        Command::Send(e) => tx.send(Ok(e)).await,
+                        Command::Error(status) => tx.send(Err(status)).await,
                         Command::End => break,
+                    };
+
+                    // The client might have dropped this stream already, e.g. after
+                    // reconnecting because of a keepalive timeout.
+                    if sent.is_err() {
+                        break;
                     }
                 }
             });
@@ -778,6 +844,257 @@ pub mod tests {
         }
     }
 
+    struct TcpRelay {
+        port: u16,
+
+        // After setting to true, all **existing** connections become silent (sockets stay open,
+        // but no traffic is forwarded).
+        silent: Arc<AtomicBool>,
+    }
+
+    impl TcpRelay {
+        async fn spawn(server_port: u16) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let silent = Arc::new(AtomicBool::new(false));
+
+            tokio::spawn({
+                let silent = silent.clone();
+                async move {
+                    while let Ok((client, _)) = listener.accept().await {
+                        let connected_before_silent = !silent.load(Ordering::Relaxed);
+                        let server = tokio::net::TcpStream::connect(("127.0.0.1", server_port))
+                            .await
+                            .unwrap();
+                        let (mut client_rx, mut client_tx) = client.into_split();
+                        let (mut server_rx, mut server_tx) = server.into_split();
+
+                        // server -> client
+                        tokio::spawn({
+                            let silent = silent.clone();
+                            async move {
+                                let mut buf = [0u8; 4096];
+                                loop {
+                                    match server_rx.read(&mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            if connected_before_silent
+                                                && silent.load(Ordering::Relaxed)
+                                            {
+                                                continue;
+                                            }
+                                            if client_tx.write_all(&buf[..n]).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        // client -> server
+                        tokio::spawn({
+                            let silent = silent.clone();
+                            async move {
+                                let mut buf = [0u8; 4096];
+                                loop {
+                                    match client_rx.read(&mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            // Keep draining the client, just never let anything
+                                            // through - a silent server still reads its socket.
+                                            if connected_before_silent
+                                                && silent.load(Ordering::Relaxed)
+                                            {
+                                                continue;
+                                            }
+                                            if server_tx.write_all(&buf[..n]).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+
+            Self { port, silent }
+        }
+    }
+
+    fn client_authentication(
+        client_private_key: &SecretKey,
+        vpn_public_key: PublicKey,
+    ) -> Authentication {
+        Authentication::Keys {
+            keys: Keys {
+                local_private_key: client_private_key.to_vec(),
+                vpn_public_key: vpn_public_key.to_vec(),
+                kind: crate::KeyKind::NordLynx,
+            },
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn keepalives_trigger_reconnect_for_connections_that_become_silent(
+        #[values(1, 5, 10)] interval: u64,
+        #[values(1, 5, 10)] timeout: u64,
+    ) {
+        let client_private_key = SecretKey::gen();
+        let server_config = spawn_server().await;
+        let relay = TcpRelay::spawn(server_config.port).await;
+        let interval = Duration::from_secs(interval);
+        let timeout = Duration::from_secs(timeout);
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig {
+                interval: Some(interval),
+                timeout: Some(timeout),
+            },
+        );
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            relay.port,
+            client_authentication(&client_private_key, server_config.public_key),
+            ExponentialBackoff::new(Default::default()).unwrap(),
+        )
+        .await;
+
+        server_config
+            .command_tx
+            .send(Command::Send(ConnectionError {
+                code: EnsProtoError::Unauthenticated as i32,
+                additional_info: Some("before the silence".to_owned()),
+            }))
+            .await
+            .unwrap();
+        let (before_the_silence, _) = rx.recv().await.unwrap();
+        let before_timestamp = Instant::now();
+        assert_eq!(
+            before_the_silence.additional_info.as_deref(),
+            Some("before the silence")
+        );
+
+        relay.silent.store(true, Ordering::Relaxed);
+        info!("server has gone silent, the client should give up on the connection and reconnect");
+
+        // We have no way to know when exactly the tonic/hyper reconnects. Which means
+        // we need to keep resending the event until it is delivered to a new connection.
+        let safety_margin = Duration::from_secs(5);
+        let deadline = interval + timeout + safety_margin;
+        let ((after_the_silence, _), after_timestamp) = tokio::time::timeout(deadline, async {
+            loop {
+                server_config
+                    .command_tx
+                    .send(Command::Send(ConnectionError {
+                        code: EnsProtoError::ServerMaintenance as i32,
+                        additional_info: Some("after the silence".to_owned()),
+                    }))
+                    .await
+                    .unwrap();
+                if let Ok(notification) =
+                    tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+                {
+                    break (notification.unwrap(), Instant::now());
+                }
+            }
+        })
+        .await
+        .expect("nothing was received after the server went silent - the client stayed parked on the dead connection");
+
+        assert_eq!(
+            after_the_silence.additional_info.as_deref(),
+            Some("after the silence")
+        );
+
+        let reconnect_time = after_timestamp - before_timestamp;
+        assert!(reconnect_time >= (interval + timeout));
+        assert!(reconnect_time < (interval + timeout + safety_margin));
+
+        ens.stop().await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn ens_will_not_detect_silent_connections_if_keepalive_interval_is_none(
+        #[values(None, Some(1), Some(5), Some(10), Some(20))] keepalive_timeout: Option<u64>,
+    ) {
+        let client_private_key = SecretKey::gen();
+        let server_config = spawn_server().await;
+        let relay = TcpRelay::spawn(server_config.port).await;
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig {
+                interval: None,
+                timeout: keepalive_timeout.map(Duration::from_secs),
+            },
+        );
+
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            relay.port,
+            client_authentication(&client_private_key, server_config.public_key),
+            ExponentialBackoff::new(Default::default()).unwrap(),
+        )
+        .await;
+
+        server_config
+            .command_tx
+            .send(Command::Send(ConnectionError {
+                code: EnsProtoError::Unauthenticated as i32,
+                additional_info: Some("before the silence".to_owned()),
+            }))
+            .await
+            .unwrap();
+        let (before_the_silence, _) = rx.recv().await.unwrap();
+        assert_eq!(
+            before_the_silence.additional_info.as_deref(),
+            Some("before the silence")
+        );
+
+        relay.silent.store(true, Ordering::Relaxed);
+        info!("server has gone silent, but without the keepalives the client will not notice");
+
+        let next_notification = timeout(Duration::from_secs(30), async {
+            loop {
+                server_config
+                    .command_tx
+                    .send(Command::Send(ConnectionError {
+                        code: EnsProtoError::ServerMaintenance as i32,
+                        additional_info: Some("after the silence".to_owned()),
+                    }))
+                    .await
+                    .unwrap();
+                if let Ok(notification) = timeout(Duration::from_millis(500), rx.recv()).await {
+                    break (notification.unwrap(), Instant::now());
+                }
+            }
+        })
+        .await;
+
+        assert_matches!(next_notification, Err(Elapsed { .. }));
+
+        ens.stop().await;
+    }
+
     pub async fn send_errors(errors_to_emit: &[ConnectionError], errors_tx: AsyncSender<Command>) {
         let errors_to_emit = errors_to_emit.to_vec();
         for e in errors_to_emit {
@@ -814,6 +1131,7 @@ pub mod tests {
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig::default(),
         );
 
         ens.start_monitor_on_port(
@@ -900,6 +1218,7 @@ pub mod tests {
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
+            KeepaliveConfig::default(),
         );
 
         let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
@@ -1019,8 +1338,13 @@ pub mod tests {
         });
 
         let allow_only_mlkem = true;
-        let (mut ens, mut rx) =
-            ErrorNotificationService::new(10, make_socket_pool(), allow_only_mlkem, None);
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            10,
+            make_socket_pool(),
+            allow_only_mlkem,
+            None,
+            KeepaliveConfig::default(),
+        );
 
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),

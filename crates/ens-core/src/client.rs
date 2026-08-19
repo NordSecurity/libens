@@ -12,7 +12,7 @@ use telio_utils::exponential_backoff::{self, Backoff};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use blake3::{derive_key, keyed_hash};
-use http::Uri;
+use http::{HeaderValue, Uri};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use rustls::{
@@ -40,7 +40,7 @@ use llt_proto::ens::{
     ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
 };
 
-use crate::{Authentication, Keys, STATE};
+use crate::{Authentication, Keys};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
@@ -95,6 +95,7 @@ pub struct ErrorNotificationService {
     root_certificate: Vec<u8>,
     // Configuration of the keep alive messages sent over the ENS connection
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 }
 
 impl Drop for ErrorNotificationService {
@@ -115,6 +116,7 @@ impl ErrorNotificationService {
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
+        user_agent: HeaderValue,
     ) -> (Self, Receiver<(ConnectionError, String)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
@@ -143,6 +145,7 @@ impl ErrorNotificationService {
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
                 keepalive,
+                user_agent,
             },
             rx,
         )
@@ -170,6 +173,7 @@ impl ErrorNotificationService {
         let allow_only_mlkem = self.allow_only_mlkem;
         let root_certificate = self.root_certificate.clone();
         let keepalive = self.keepalive;
+        let user_agent = self.user_agent.clone();
 
         let join_handle = tokio::spawn(async move {
             // This future is too big for keeping it on the stack
@@ -183,6 +187,7 @@ impl ErrorNotificationService {
                 backoff,
                 root_certificate,
                 keepalive,
+                user_agent,
             ))
             .await
             {
@@ -232,6 +237,7 @@ async fn task(
     mut backoff: impl Backoff,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 ) -> Result<(), Error> {
     'outer: loop {
         macro_rules! restart {
@@ -266,7 +272,8 @@ async fn task(
                 pool,
                 allow_only_mlkem,
                 root_certificate.clone(),
-                keepalive
+                keepalive,
+                user_agent.clone()
             ))
             .await,
             backoff
@@ -385,6 +392,7 @@ async fn create_external_channel(
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
     let socket_factory = move |uri: Uri| {
         let pool = pool.clone();
@@ -420,14 +428,6 @@ async fn create_external_channel(
         }
     };
 
-    let user_agent = STATE
-        .lock()
-        .as_ref()
-        .ok_or_else(|| Error::NotInitialized {
-            reason: "global state not initialized".to_owned(),
-        })?
-        .user_agent
-        .clone();
     let endpoint = Endpoint::try_from(vpn_uri.to_owned())?.user_agent(user_agent)?;
 
     let endpoint = if let Some(interval) = keepalive.interval {
@@ -609,7 +609,7 @@ pub mod tests {
         net::Ipv4Addr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            LazyLock, Mutex, Once,
+            LazyLock, Mutex,
         },
         time::{Duration, Instant},
     };
@@ -636,7 +636,7 @@ pub mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{service::Interceptor, transport::Server};
 
-    use crate::{init, Keys};
+    use crate::{Keys, STATE};
 
     use super::*;
 
@@ -645,10 +645,17 @@ pub mod tests {
     static SUBJECT_ALT_NAMES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
 
-    static INIT: Once = Once::new();
+    const TEST_USER_AGENT: HeaderValue = HeaderValue::from_static("foo bar baz");
 
-    pub fn run_init() {
-        INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
+    /// The user agent that `init` installed. Tests going through the public
+    /// `connect` API send this one, not `TEST_USER_AGENT`.
+    pub fn global_user_agent() -> HeaderValue {
+        STATE
+            .lock()
+            .as_ref()
+            .expect("global state not initialized")
+            .user_agent
+            .clone()
     }
 
     #[derive(Debug)]
@@ -777,29 +784,25 @@ pub mod tests {
     }
 
     #[derive(Clone)]
-    struct CheckAuthenticationInterceptor(GrpcStub);
+    struct CheckAuthenticationInterceptor {
+        stub: GrpcStub,
+        expected_user_agent: HeaderValue,
+    }
 
     impl Interceptor for CheckAuthenticationInterceptor {
         fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-            let expected_user_agent = STATE
-                .lock()
-                .as_ref()
-                .ok_or_else(|| Error::Internal {
-                    reason: "global state not initialized".to_owned(),
-                })
-                .unwrap()
-                .user_agent
-                .to_str()
-                .unwrap()
-                .to_owned();
-
-            // tonic appends its own version to the user-agent sent over wire
-            assert!(req
+            let expected_user_agent = self.expected_user_agent.to_str().unwrap();
+            let received_user_agent = req
                 .metadata()
                 .get("user-agent")
                 .and_then(|s| s.to_str().ok())
-                .unwrap()
-                .starts_with(&expected_user_agent));
+                .unwrap();
+
+            // tonic appends its own version to the user-agent sent over wire
+            assert!(
+                received_user_agent.starts_with(expected_user_agent),
+                "expected user-agent: {expected_user_agent:?}, got {received_user_agent:?}"
+            );
 
             match req.metadata().get(AUTHENTICATION_KEY) {
                 Some(t) => {
@@ -811,14 +814,14 @@ pub mod tests {
                     );
 
                     if self
-                        .0
+                        .stub
                         .challenges
                         .lock()
                         .unwrap()
                         .take(&challenge_uuid)
                         .is_some()
                     {
-                        let secret = self.0.vpn_server_private_key.ecdh(&client_public_key);
+                        let secret = self.stub.vpn_server_private_key.ecdh(&client_public_key);
                         if received_authentication_code
                             != authentication_tag(&secret, &decoded[..48])
                         {
@@ -857,14 +860,17 @@ pub mod tests {
         pub tls_config: TlsConfig,
     }
 
-    pub async fn spawn_server() -> ServerConfig {
+    pub async fn spawn_server(expected_user_agent: HeaderValue) -> ServerConfig {
         let server_private_key = SecretKey::gen();
 
         let (command_tx, command_rx) = unbounded();
         let grpc_stub = GrpcStub(Arc::new(State::new(command_rx, server_private_key.clone())));
         let ens_srv = EnsServer::with_interceptor(
             grpc_stub.clone(),
-            CheckAuthenticationInterceptor(grpc_stub.clone()),
+            CheckAuthenticationInterceptor {
+                stub: grpc_stub.clone(),
+                expected_user_agent,
+            },
         );
         let login_srv = LoginServer::new(grpc_stub.clone());
         let (port_tx, port_rx) = oneshot::channel();
@@ -1006,7 +1012,7 @@ pub mod tests {
         #[values(1, 5, 10)] timeout: u64,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
         let interval = Duration::from_secs(interval);
         let timeout = Duration::from_secs(timeout);
@@ -1021,6 +1027,7 @@ pub mod tests {
                 interval: Some(interval),
                 timeout: Some(timeout),
             },
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1092,7 +1099,7 @@ pub mod tests {
         #[values(None, Some(1), Some(5), Some(10), Some(20))] keepalive_timeout: Option<u64>,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
 
         let allow_only_mlkem = true;
@@ -1105,6 +1112,7 @@ pub mod tests {
                 interval: None,
                 timeout: keepalive_timeout.map(Duration::from_secs),
             },
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1165,8 +1173,6 @@ pub mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_ens() {
-        run_init();
-
         let bounds = ExponentialBackoffBounds::default();
         let backoff = ExponentialBackoff::new(bounds).unwrap();
         let client_private_key = SecretKey::gen();
@@ -1182,7 +1188,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
@@ -1191,6 +1197,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1268,7 +1275,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
 
@@ -1278,6 +1285,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
@@ -1329,8 +1337,6 @@ pub mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_ens_fails_without_x25519mlkem768_support() {
-        run_init();
-
         let server_private_key = SecretKey::gen();
         let server_public_key = server_private_key.public();
         let client_private_key = SecretKey::gen();
@@ -1403,6 +1409,7 @@ pub mod tests {
             allow_only_mlkem,
             None,
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(

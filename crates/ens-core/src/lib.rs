@@ -430,12 +430,22 @@ async fn connect_impl(
         }
     });
 
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| EnsError::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+
     let (mut client, mut receiver) = ErrorNotificationService::new(
         config.buffer_size,
         socket_pool,
         config.allow_only_pq,
         config.root_certificate_override,
         config.keepalive,
+        user_agent,
     );
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
@@ -593,14 +603,22 @@ impl Drop for Connection {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::tests::{run_init, Command, ServerConfig};
+    use crate::client::tests::{global_user_agent, Command, ServerConfig};
     use assert_matches::assert_matches;
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::Once,
+    };
     use telio_crypto::SecretKey;
 
     use super::*;
+
+    static INIT: Once = Once::new();
+    pub fn run_init() {
+        INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
+    }
 
     #[derive(Default)]
     struct RecordedCallback {
@@ -705,7 +723,8 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let server_config =
+            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
         let callback = Arc::new(RecordedCallback::default());
         let connection = connect_to_test_server(&server_config, callback.clone());
 
@@ -780,7 +799,8 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let server_config =
+            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
         let callback = Arc::new(RecordedCallback::default());
         let connection = connect_to_test_server(&server_config, callback.clone());
 
@@ -821,7 +841,8 @@ mod tests {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(crate::client::tests::spawn_server());
+        let server_config =
+            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
         let callback = Arc::new(RecursiveCallback::default());
         let connection = connect_to_test_server(&server_config, callback.clone());
         *callback.connection.lock() = Some(connection.clone());

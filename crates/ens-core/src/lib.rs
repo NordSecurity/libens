@@ -443,7 +443,12 @@ async fn connect_impl(
         .clone();
 
     let (mut client, mut receiver) = ErrorNotificationService::new(
-        config.buffer_size,
+        config
+            .buffer_size
+            .try_into()
+            .map_err(|e| EnsError::UnknownError {
+                reason: format!("buffer_size has to be non zero: {e}"),
+            })?,
         socket_pool,
         config.allow_only_pq,
         config.root_certificate_override,

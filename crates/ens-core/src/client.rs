@@ -1,10 +1,4 @@
-use std::{
-    error::Error as _,
-    net::{IpAddr, ToSocketAddrs},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{error::Error as _, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
 use telio_sockets::SocketPool;
@@ -20,6 +14,7 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{
+    net::lookup_host,
     select,
     sync::{
         mpsc::{Receiver, Sender},
@@ -415,7 +410,7 @@ async fn create_external_channel(
             let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-            if let Some(resolved) = ((host, port).to_socket_addrs()?).next() {
+            if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
                 let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate)?;
                 let tls_stream = tls_connector.connect(domain, tcp_stream).await?;

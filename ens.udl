@@ -190,11 +190,31 @@ callback interface ProtectCallback {
 interface Config {
     constructor();  
     
+    /// Capacity of the internal queue holding error notifications before they
+    /// are passed to the `ErrorNotificationCallback`. Must be non zero.
+    /// [default 5]
     void set_buffer_size(u32 size);
+
+    /// When enabled, the TLS handshake with the ENS server offers only the
+    /// post quantum X25519MLKEM768 key exchange.
+    /// [default true]
     void set_allow_only_pq(boolean allow_only_pq);
+
+    /// DER encoded root certificate used to verify the ENS server instead of
+    /// the one built into the library. Intended for testing.
+    /// When set to null, the built in certificate is used.
+    /// [default null]
     void set_root_certificate_override(bytes? override);
 
+    /// Delay before the first reconnection attempt, in seconds. It doubles
+    /// with every failed attempt, up to the maximal backoff. Must be non zero.
+    /// [default 2s]
     void set_backoff_initial(u32 seconds);
+
+    /// Upper limit for the reconnection delay, in seconds. Must not be smaller
+    /// than the initial backoff.
+    /// When set to null, the delay keeps growing without a limit.
+    /// [default 120s]
     void set_backoff_maximal(u32? seconds);
 
     /// Interval between the keep alive messages sent over the ENS connection, in

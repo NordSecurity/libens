@@ -1,4 +1,6 @@
-use std::{error::Error as _, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    error::Error as _, net::IpAddr, num::NonZeroUsize, str::FromStr, sync::Arc, time::Duration,
+};
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
 use telio_sockets::SocketPool;
@@ -120,14 +122,14 @@ impl Drop for ErrorNotificationService {
 impl ErrorNotificationService {
     /// Create new instance with `buffer_size` used for the error notifications channel
     pub fn new(
-        buffer_size: usize,
+        buffer_size: NonZeroUsize,
         socket_pool: Arc<SocketPool>,
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
         user_agent: HeaderValue,
     ) -> (Self, Receiver<(ConnectionError, String)>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size.get());
 
         if let Some(cert) = &root_certificate_override {
             info!(
@@ -1056,7 +1058,7 @@ pub mod tests {
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
-            10,
+            NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
@@ -1141,7 +1143,7 @@ pub mod tests {
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
-            10,
+            NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
@@ -1229,7 +1231,7 @@ pub mod tests {
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
-            10,
+            NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
@@ -1305,7 +1307,7 @@ pub mod tests {
         let allow_only_mlkem = true;
 
         let (mut ens, mut rx) = ErrorNotificationService::new(
-            10,
+            NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
@@ -1423,7 +1425,7 @@ pub mod tests {
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
-            10,
+            NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
             allow_only_mlkem,
             None,

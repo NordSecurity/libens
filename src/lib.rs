@@ -24,6 +24,30 @@ impl UniffiCustomTypeConverter for SocketAddr {
     }
 }
 
+impl UniffiCustomTypeConverter for HiddenString {
+    type Builtin = String;
+
+    fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+        Ok(Hidden(val))
+    }
+
+    fn from_custom(obj: Self) -> Self::Builtin {
+        obj.0.clone()
+    }
+}
+
+impl UniffiCustomTypeConverter for HiddenBytes {
+    type Builtin = Vec<u8>;
+
+    fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+        Ok(Hidden(val))
+    }
+
+    fn from_custom(obj: Self) -> Self::Builtin {
+        obj.0.clone()
+    }
+}
+
 #[cfg(target_os = "android")]
 #[no_mangle]
 /// Initialize OS certificate store, should be called only once. Without call to

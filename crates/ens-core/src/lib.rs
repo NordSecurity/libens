@@ -26,6 +26,8 @@ use tokio::task::block_in_place;
 
 pub use memory::get_memory_usage;
 
+pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
+
 use crate::{
     client::{
         ErrorNotificationService, KeepaliveConfig, DEFAULT_KEEPALIVE_INTERVAL,
@@ -269,8 +271,8 @@ pub enum CredentialsKind {
 }
 
 pub struct Credentials {
-    pub username: String,
-    pub password: String,
+    pub username: HiddenString,
+    pub password: HiddenString,
     pub kind: CredentialsKind,
 }
 
@@ -279,8 +281,8 @@ pub enum KeyKind {
 }
 
 pub struct Keys {
-    pub local_private_key: Vec<u8>,
-    pub vpn_public_key: Vec<u8>,
+    pub local_private_key: HiddenBytes,
+    pub vpn_public_key: HiddenBytes,
     pub kind: KeyKind,
 }
 
@@ -395,6 +397,7 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
+    let authentication = authentication.try_into()?;
     let protect: Option<telio_sockets::Protect> = match protect_cb {
         Some(protect) => {
             let protect = AssertUnwindSafe(protect);
@@ -501,6 +504,7 @@ async fn connect_impl(
     }))
 }
 
+#[derive(Debug)]
 enum ConnectionState {
     Active(ErrorNotificationService),
     ShutDown(Option<String>),
@@ -528,6 +532,7 @@ impl Drop for CallbackThreadGuard<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct Connection {
     state: Arc<Mutex<ConnectionState>>,
     // Set to Some(_) when the event processing task is about to call one of
@@ -677,6 +682,8 @@ mod tests {
         }
     }
 
+    const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
+
     #[track_caller]
     fn wait_for(mut predicate: impl FnMut() -> bool) {
         let max_wait_time = Duration::from_secs(5);
@@ -699,23 +706,33 @@ mod tests {
     ) -> Arc<Connection> {
         let client_private_key = SecretKey::gen();
 
+        connect_to_test_server_with_keys(
+            server_config,
+            Keys {
+                local_private_key: Hidden(client_private_key.to_vec()),
+                vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                kind: crate::KeyKind::NordLynx,
+            },
+            callback,
+        )
+        .unwrap()
+    }
+
+    fn connect_to_test_server_with_keys(
+        server_config: &ServerConfig,
+        keys: Keys,
+        callback: impl ErrorNotificationCallback + 'static,
+    ) -> Result<Arc<Connection>> {
         let config = Config::new();
         config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
 
         connect(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_config.port)),
             None,
-            Authentication::Keys {
-                keys: Keys {
-                    local_private_key: client_private_key.to_vec(),
-                    vpn_public_key: server_config.public_key.to_vec(),
-                    kind: crate::KeyKind::NordLynx,
-                },
-            },
+            Authentication::Keys { keys },
             Box::new(callback),
             Arc::new(config),
         )
-        .unwrap()
     }
 
     #[test_log::test]
@@ -895,5 +912,26 @@ mod tests {
             *callback.disconnected.lock(),
             Some(Some("shutdown".to_owned()))
         );
+    }
+
+    #[test_log::test]
+    fn test_connect_fails_when_key_material_is_incorrect() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config =
+            runtime.block_on(crate::client::tests::spawn_server(global_user_agent()));
+        let callback = Arc::new(RecordedCallback::default());
+        let connection = connect_to_test_server_with_keys(
+            &server_config,
+            Keys {
+                local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
+                vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                kind: crate::KeyKind::NordLynx,
+            },
+            callback.clone(),
+        );
+
+        assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
     }
 }

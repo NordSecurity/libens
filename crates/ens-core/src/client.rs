@@ -35,7 +35,7 @@ use llt_proto::ens::{
     ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
 };
 
-use crate::{Authentication, Keys};
+use crate::{Authentication, Credentials, EnsError, KeyKind};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
@@ -91,6 +91,20 @@ pub struct ErrorNotificationService {
     // Configuration of the keep alive messages sent over the ENS connection
     keepalive: KeepaliveConfig,
     user_agent: HeaderValue,
+}
+
+impl std::fmt::Debug for ErrorNotificationService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorNotificationService")
+            .field("quit", &self.quit)
+            .field("tx", &self.tx)
+            .field("socket_pool", &"<unknown>")
+            .field("allow_only_mlkem", &self.allow_only_mlkem)
+            .field("root_certificate", &self.root_certificate)
+            .field("keepalive", &self.keepalive)
+            .field("user_agent", &self.user_agent)
+            .finish()
+    }
 }
 
 impl Drop for ErrorNotificationService {
@@ -150,7 +164,7 @@ impl ErrorNotificationService {
         &mut self,
         vpn_ip: IpAddr,
         ens_port: u16,
-        authentication: Authentication,
+        authentication: ClientAuthentication,
         backoff: impl Backoff,
     ) {
         info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
@@ -221,10 +235,63 @@ impl ErrorNotificationService {
     }
 }
 
+pub struct ClientKeys {
+    pub local_private_key: SecretKey,
+    pub vpn_public_key: PublicKey,
+    #[expect(unused)]
+    pub kind: KeyKind,
+}
+
+pub enum ClientAuthentication {
+    Credentials {
+        #[expect(unused)]
+        credentials: Credentials,
+    },
+    Keys {
+        keys: ClientKeys,
+    },
+}
+
+impl TryFrom<Authentication> for ClientAuthentication {
+    type Error = EnsError;
+
+    fn try_from(value: Authentication) -> Result<Self, Self::Error> {
+        match value {
+            Authentication::Credentials { credentials } => Ok(Self::Credentials { credentials }),
+            Authentication::Keys { keys } => {
+                let vpn_public_key =
+                    keys.vpn_public_key
+                        .0
+                        .clone()
+                        .try_into()
+                        .map_err(|_e| Error::InvalidKey {
+                            // error here is just a Vec<u8> so no point in adding it to the reason below
+                            reason: "vpn public key conversion failed".to_owned(),
+                        })?;
+                let local_private_key: SecretKey =
+                    keys.local_private_key.0.clone().try_into().map_err(|_e| {
+                        Error::InvalidKey {
+                            // error here is just a Vec<u8> so no point in adding it to the reason below
+                            reason: "local private key conversion failed".to_owned(),
+                        }
+                    })?;
+
+                Ok(Self::Keys {
+                    keys: ClientKeys {
+                        local_private_key,
+                        vpn_public_key,
+                        kind: keys.kind,
+                    },
+                })
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &str,
-    authentication: Authentication,
+    authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
     tx: Sender<(ConnectionError, String)>,
     mut quit_rx: watch::Receiver<bool>,
@@ -275,10 +342,8 @@ async fn task(
         );
 
         let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
-            Authentication::Credentials { .. } => todo!(),
-            Authentication::Keys { keys } => {
-                let keys = convert_keys(keys)?;
-
+            ClientAuthentication::Credentials { .. } => todo!(),
+            ClientAuthentication::Keys { keys } => {
                 let authenticated_challenge = handle_error!(
                     get_login_challenge(
                         external_channel.clone(),
@@ -569,34 +634,6 @@ fn authentication_tag(secret: &SharedSecret, message: &[u8]) -> [u8; 32] {
     *keyed_hash(&key, message).as_bytes()
 }
 
-struct ConvertedKeys {
-    vpn_public_key: PublicKey,
-    local_private_key: SecretKey,
-}
-fn convert_keys(keys: &Keys) -> Result<ConvertedKeys, Error> {
-    let vpn_public_key =
-        keys.vpn_public_key
-            .clone()
-            .try_into()
-            .map_err(|_e| Error::InvalidKey {
-                // error here is just a Vec<u8> so no point in adding it to the reason below
-                reason: "vpn public key conversion failed".to_owned(),
-            })?;
-    let local_private_key: SecretKey =
-        keys.local_private_key
-            .clone()
-            .try_into()
-            .map_err(|_e| Error::InvalidKey {
-                // error here is just a Vec<u8> so no point in adding it to the reason below
-                reason: "local private key conversion failed".to_owned(),
-            })?;
-
-    Ok(ConvertedKeys {
-        vpn_public_key,
-        local_private_key,
-    })
-}
-
 #[cfg(test)]
 pub mod tests {
     use std::{
@@ -623,7 +660,10 @@ pub mod tests {
     use rstest::rstest;
     use telio_crypto::SecretKey;
     use telio_sockets::NativeProtector;
-    use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
+    use telio_utils::{
+        exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds},
+        Hidden,
+    };
     use tokio::{
         sync::oneshot,
         time::{error::Elapsed, timeout},
@@ -989,14 +1029,16 @@ pub mod tests {
     fn client_authentication(
         client_private_key: &SecretKey,
         vpn_public_key: PublicKey,
-    ) -> Authentication {
+    ) -> ClientAuthentication {
         Authentication::Keys {
             keys: Keys {
-                local_private_key: client_private_key.to_vec(),
-                vpn_public_key: vpn_public_key.to_vec(),
+                local_private_key: Hidden(client_private_key.to_vec()),
+                vpn_public_key: Hidden(vpn_public_key.to_vec()),
                 kind: crate::KeyKind::NordLynx,
             },
         }
+        .try_into()
+        .unwrap()
     }
 
     #[rstest]
@@ -1198,13 +1240,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
-            Authentication::Keys {
-                keys: Keys {
-                    local_private_key: client_private_key.to_vec(),
-                    vpn_public_key: server_config.public_key.to_vec(),
-                    kind: crate::KeyKind::NordLynx,
-                },
-            },
+            client_authentication(&client_private_key, server_config.public_key),
             backoff.clone(),
         )
         .await;
@@ -1215,13 +1251,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
-            Authentication::Keys {
-                keys: Keys {
-                    local_private_key: client_private_key.to_vec(),
-                    vpn_public_key: server_config.public_key.to_vec(),
-                    kind: crate::KeyKind::NordLynx,
-                },
-            },
+            client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
         .await;
@@ -1295,13 +1325,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
-            Authentication::Keys {
-                keys: Keys {
-                    local_private_key: client_private_key.to_vec(),
-                    vpn_public_key: server_config.public_key.to_vec(),
-                    kind: crate::KeyKind::NordLynx,
-                },
-            },
+            client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
         .await;
@@ -1410,13 +1434,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             port_rx.await.unwrap(),
-            Authentication::Keys {
-                keys: Keys {
-                    local_private_key: client_private_key.to_vec(),
-                    vpn_public_key: server_public_key.to_vec(),
-                    kind: crate::KeyKind::NordLynx,
-                },
-            },
+            client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
         .await;

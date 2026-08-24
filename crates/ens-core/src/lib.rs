@@ -9,7 +9,7 @@
 mod client;
 mod logging;
 mod memory;
-mod panics;
+pub mod panics;
 pub mod runtime;
 
 use http::{header::InvalidHeaderValue, HeaderValue};
@@ -94,7 +94,7 @@ impl From<client::Error> for EnsError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Error,
     Warning,

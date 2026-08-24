@@ -188,12 +188,12 @@ fn main() {
     ens::set_log_callback(args.log_level, log_callback).unwrap();
     let name = env!("CARGO_PKG_NAME");
     let version = env!("CARGO_PKG_VERSION");
-    let user_agent = format!("{name} v{version}");
-    ens::init(user_agent.clone()).unwrap();
+    let app_version = format!("{name}/v{version}");
+    ens::init(app_version.clone()).unwrap();
     info!("version: {}", ens::get_version());
     info!("memory usage: {}", ens::get_memory_usage());
 
-    let api_client = ApiClient::new(&user_agent).unwrap();
+    let api_client = ApiClient::new(&app_version).unwrap();
 
     match args.commands {
         Command::Connect {

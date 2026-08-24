@@ -1,10 +1,4 @@
-use std::{
-    error::Error as _,
-    net::{IpAddr, ToSocketAddrs},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{error::Error as _, net::IpAddr, str::FromStr, sync::Arc, time::Duration};
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
 use telio_sockets::SocketPool;
@@ -12,7 +6,7 @@ use telio_utils::exponential_backoff::{self, Backoff};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use blake3::{derive_key, keyed_hash};
-use http::Uri;
+use http::{HeaderValue, Uri};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use rustls::{
@@ -20,6 +14,7 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{
+    net::lookup_host,
     select,
     sync::{
         mpsc::{Receiver, Sender},
@@ -44,6 +39,7 @@ use crate::{Authentication, Keys};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
+const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
@@ -70,6 +66,8 @@ pub enum Error {
     InvalidMetadata(#[from] InvalidMetadataValue),
     #[error("Invalid key: {reason}")]
     InvalidKey { reason: String },
+    #[error("Internal error: {reason}")]
+    Internal { reason: String },
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -92,6 +90,7 @@ pub struct ErrorNotificationService {
     root_certificate: Vec<u8>,
     // Configuration of the keep alive messages sent over the ENS connection
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 }
 
 impl Drop for ErrorNotificationService {
@@ -112,6 +111,7 @@ impl ErrorNotificationService {
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
+        user_agent: HeaderValue,
     ) -> (Self, Receiver<(ConnectionError, String)>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
@@ -140,6 +140,7 @@ impl ErrorNotificationService {
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
                 keepalive,
+                user_agent,
             },
             rx,
         )
@@ -167,6 +168,7 @@ impl ErrorNotificationService {
         let allow_only_mlkem = self.allow_only_mlkem;
         let root_certificate = self.root_certificate.clone();
         let keepalive = self.keepalive;
+        let user_agent = self.user_agent.clone();
 
         let join_handle = tokio::spawn(async move {
             // This future is too big for keeping it on the stack
@@ -180,6 +182,7 @@ impl ErrorNotificationService {
                 backoff,
                 root_certificate,
                 keepalive,
+                user_agent,
             ))
             .await
             {
@@ -229,6 +232,7 @@ async fn task(
     mut backoff: impl Backoff,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 ) -> Result<(), Error> {
     'outer: loop {
         macro_rules! restart {
@@ -263,13 +267,14 @@ async fn task(
                 pool,
                 allow_only_mlkem,
                 root_certificate.clone(),
-                keepalive
+                keepalive,
+                user_agent.clone()
             ))
             .await,
             backoff
         );
 
-        let authenticated_challenge = match &authentication {
+        let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
             Authentication::Credentials { .. } => todo!(),
             Authentication::Keys { keys } => {
                 let keys = convert_keys(keys)?;
@@ -283,7 +288,10 @@ async fn task(
                     .await,
                     backoff
                 );
-                authenticated_challenge
+                (
+                    authenticated_challenge,
+                    AsciiMetadataValue::from_static("nordlynx"),
+                )
             }
         };
 
@@ -291,7 +299,7 @@ async fn task(
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
-            authentication_interceptor(authenticated_challenge),
+            authentication_interceptor(authenticated_challenge, nord_vpn_protocol),
         );
 
         let connection = handle_error!(
@@ -362,10 +370,13 @@ async fn get_login_challenge(
 
 fn authentication_interceptor(
     authentication_value: AsciiMetadataValue,
+    nord_vpn_protocol: AsciiMetadataValue,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> {
     move |mut req: Request<()>| {
         req.metadata_mut()
             .insert(AUTHENTICATION_KEY, authentication_value.clone());
+        req.metadata_mut()
+            .insert(NORD_VPN_PROTOCOL_KEY, nord_vpn_protocol.clone());
         Ok(req)
     }
 }
@@ -376,6 +387,7 @@ async fn create_external_channel(
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
     let socket_factory = move |uri: Uri| {
         let pool = pool.clone();
@@ -398,7 +410,7 @@ async fn create_external_channel(
             let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-            if let Some(resolved) = ((host, port).to_socket_addrs()?).next() {
+            if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
                 let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate)?;
                 let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
@@ -411,7 +423,7 @@ async fn create_external_channel(
         }
     };
 
-    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?;
+    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?.user_agent(user_agent)?;
 
     let endpoint = if let Some(interval) = keepalive.interval {
         endpoint.http2_keep_alive_interval(interval)
@@ -592,7 +604,7 @@ pub mod tests {
         net::Ipv4Addr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            LazyLock, Mutex, Once,
+            LazyLock, Mutex,
         },
         time::{Duration, Instant},
     };
@@ -619,7 +631,7 @@ pub mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{service::Interceptor, transport::Server};
 
-    use crate::{init, Keys};
+    use crate::{Keys, STATE};
 
     use super::*;
 
@@ -628,10 +640,17 @@ pub mod tests {
     static SUBJECT_ALT_NAMES: LazyLock<Vec<String>> =
         LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
 
-    static INIT: Once = Once::new();
+    const TEST_USER_AGENT: HeaderValue = HeaderValue::from_static("foo bar baz");
 
-    pub fn run_init() {
-        INIT.call_once(|| init("unit-tests".to_owned()).unwrap());
+    /// The user agent that `init` installed. Tests going through the public
+    /// `connect` API send this one, not `TEST_USER_AGENT`.
+    pub fn global_user_agent() -> HeaderValue {
+        STATE
+            .lock()
+            .as_ref()
+            .expect("global state not initialized")
+            .user_agent
+            .clone()
     }
 
     #[derive(Debug)]
@@ -760,10 +779,26 @@ pub mod tests {
     }
 
     #[derive(Clone)]
-    struct CheckAuthenticationInterceptor(GrpcStub);
+    struct CheckAuthenticationInterceptor {
+        stub: GrpcStub,
+        expected_user_agent: HeaderValue,
+    }
 
     impl Interceptor for CheckAuthenticationInterceptor {
         fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+            let expected_user_agent = self.expected_user_agent.to_str().unwrap();
+            let received_user_agent = req
+                .metadata()
+                .get("user-agent")
+                .and_then(|s| s.to_str().ok())
+                .unwrap();
+
+            // tonic appends its own version to the user-agent sent over wire
+            assert!(
+                received_user_agent.starts_with(expected_user_agent),
+                "expected user-agent: {expected_user_agent:?}, got {received_user_agent:?}"
+            );
+
             match req.metadata().get(AUTHENTICATION_KEY) {
                 Some(t) => {
                     let decoded = BASE64_STANDARD.decode(t).unwrap();
@@ -774,27 +809,42 @@ pub mod tests {
                     );
 
                     if self
-                        .0
+                        .stub
                         .challenges
                         .lock()
                         .unwrap()
                         .take(&challenge_uuid)
                         .is_some()
                     {
-                        let secret = self.0.vpn_server_private_key.ecdh(&client_public_key);
+                        let secret = self.stub.vpn_server_private_key.ecdh(&client_public_key);
                         if received_authentication_code
-                            == authentication_tag(&secret, &decoded[..48])
+                            != authentication_tag(&secret, &decoded[..48])
                         {
-                            Ok(req)
-                        } else {
-                            Err(Status::unauthenticated("Challenge not authenticated"))
+                            return Err(Status::unauthenticated("Challenge not authenticated"));
                         }
                     } else {
-                        Err(Status::unauthenticated("Unknown auth token"))
+                        return Err(Status::unauthenticated("Unknown auth token"));
                     }
                 }
-                _ => Err(Status::unauthenticated("No valid auth token")),
+                _ => return Err(Status::unauthenticated("No valid auth token")),
             }
+
+            match req.metadata().get(NORD_VPN_PROTOCOL_KEY) {
+                Some(val) => {
+                    if val != "nordlynx" {
+                        return Err(Status::unavailable(format!(
+                            "Incorrect {NORD_VPN_PROTOCOL_KEY} in metadata: {val:?}"
+                        )));
+                    }
+                }
+                None => {
+                    return Err(Status::unavailable(format!(
+                        "Missing {NORD_VPN_PROTOCOL_KEY} in metadata"
+                    )))
+                }
+            }
+
+            Ok(req)
         }
     }
 
@@ -805,14 +855,17 @@ pub mod tests {
         pub tls_config: TlsConfig,
     }
 
-    pub async fn spawn_server() -> ServerConfig {
+    pub async fn spawn_server(expected_user_agent: HeaderValue) -> ServerConfig {
         let server_private_key = SecretKey::gen();
 
         let (command_tx, command_rx) = unbounded();
         let grpc_stub = GrpcStub(Arc::new(State::new(command_rx, server_private_key.clone())));
         let ens_srv = EnsServer::with_interceptor(
             grpc_stub.clone(),
-            CheckAuthenticationInterceptor(grpc_stub.clone()),
+            CheckAuthenticationInterceptor {
+                stub: grpc_stub.clone(),
+                expected_user_agent,
+            },
         );
         let login_srv = LoginServer::new(grpc_stub.clone());
         let (port_tx, port_rx) = oneshot::channel();
@@ -954,7 +1007,7 @@ pub mod tests {
         #[values(1, 5, 10)] timeout: u64,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
         let interval = Duration::from_secs(interval);
         let timeout = Duration::from_secs(timeout);
@@ -969,6 +1022,7 @@ pub mod tests {
                 interval: Some(interval),
                 timeout: Some(timeout),
             },
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1040,7 +1094,7 @@ pub mod tests {
         #[values(None, Some(1), Some(5), Some(10), Some(20))] keepalive_timeout: Option<u64>,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
 
         let allow_only_mlkem = true;
@@ -1053,6 +1107,7 @@ pub mod tests {
                 interval: None,
                 timeout: keepalive_timeout.map(Duration::from_secs),
             },
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1113,8 +1168,6 @@ pub mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_ens() {
-        run_init();
-
         let bounds = ExponentialBackoffBounds::default();
         let backoff = ExponentialBackoff::new(bounds).unwrap();
         let client_private_key = SecretKey::gen();
@@ -1130,7 +1183,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
@@ -1139,6 +1192,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(
@@ -1216,7 +1270,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server().await;
+        let server_config = spawn_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
 
@@ -1226,6 +1280,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
@@ -1277,8 +1332,6 @@ pub mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_ens_fails_without_x25519mlkem768_support() {
-        run_init();
-
         let server_private_key = SecretKey::gen();
         let server_public_key = server_private_key.public();
         let client_private_key = SecretKey::gen();
@@ -1351,6 +1404,7 @@ pub mod tests {
             allow_only_mlkem,
             None,
             KeepaliveConfig::default(),
+            TEST_USER_AGENT,
         );
 
         ens.start_monitor_on_port(

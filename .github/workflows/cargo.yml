@@ -98,7 +98,7 @@ jobs:
         with:
           key: test-linux
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture
+      - run: cargo test --all --all-features -- --nocapture --test-threads 30
 
   cargo-test-windows:
     name: cargo test (windows)
@@ -115,4 +115,4 @@ jobs:
         with:
           key: test-windows
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture
+      - run: cargo test --all --all-features -- --nocapture --test-threads 30

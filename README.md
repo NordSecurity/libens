@@ -3,4 +3,69 @@
 Client-side library for accessing Error Notification Service on the VPN servers.
 Supports servers using NordLynx, NordWhisper and OpenVPN.
 
-The protobuf definition of the wire format is located [here](https://github.com/NordSecurity/llt-proto/blob/main/ens/ens.proto).
+## Wire format
+
+The protobuf definition is in [llt-proto](https://github.com/NordSecurity/llt-proto/blob/main/ens/ens.proto).
+The version in use is pinned in `crates/ens-core/Cargo.toml`.
+
+## Layout
+
+- `crates/ens-core` - the implementation
+- `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
+- `cli` (`ens-cli`) - tool for manual testing
+
+## Building
+
+Needs the `protoc` compiler, used by `llt-proto` to compile the wire format.
+
+```sh
+cargo build --all
+cargo build --release --lib   # only the shared library
+```
+
+## Testing
+
+```sh
+cargo test --all --all-features
+```
+
+To run lints:
+
+```sh
+cargo fmt -- --check
+cargo clippy --all-targets --all-features --package libens --package ens-core -- --deny warnings
+cargo deny check
+```
+
+## CLI
+
+`ens-cli` resolves servers and credentials through the NordVPN API, then opens
+an ENS session with this library. Log level is set with `-l`, default `debug`.
+
+```sh
+cargo run -p ens-cli -- --help
+```
+
+### Finding a server
+
+`list` prints online servers. The optional filter is an id, an IP, a technology
+(`wireguard`, `nordwhisper`, `openvpnudp`, `openvpntcp`, `openvpnudpobfuscated`,
+`openvpntcpobfuscated`) or a hostname:
+
+```sh
+cargo run -p ens-cli -- list wireguard
+cargo run -p ens-cli -- show hostname uk2040.nordvpn.com
+cargo run -p ens-cli -- show ip 185.16.207.58
+```
+
+### Connecting
+
+`connect` takes the server IP with the ENS port, and an access token via `--token` or `NORD_TOKEN`:
+
+```sh
+export NORD_TOKEN=...
+cargo run -p ens-cli -- connect 185.16.207.58:993 --kind nord-lynx --duration 60
+```
+
+Notifications and disconnects are logged to stderr. The process exits once the
+server disconnects, or after `--duration` seconds, default 15.

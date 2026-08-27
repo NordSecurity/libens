@@ -29,6 +29,13 @@ cargo build --release --lib   # only the shared library
 cargo test --all --all-features
 ```
 
+To collect merged coverage from unit and integration tests into
+`target/llvm-cov/html/index.html`:
+
+```sh
+cargo llvm-cov --all --all-features --exclude ens-cli --html
+```
+
 To run lints:
 
 ```sh

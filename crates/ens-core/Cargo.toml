@@ -49,4 +49,5 @@ tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
 telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b", features = ["mockall"]  }
 rand = "0.9.5"
+http-auth-basic = "0.3.7"
 

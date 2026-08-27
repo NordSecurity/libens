@@ -253,13 +253,8 @@ pub struct ClientKeys {
 }
 
 pub enum ClientAuthentication {
-    Credentials {
-        #[expect(unused)]
-        credentials: Credentials,
-    },
-    Keys {
-        keys: ClientKeys,
-    },
+    Credentials { credentials: Credentials },
+    Keys { keys: ClientKeys },
 }
 
 impl TryFrom<Authentication> for ClientAuthentication {
@@ -352,14 +347,13 @@ async fn task(
         );
 
         let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
-            ClientAuthentication::Credentials {
-                credentials:
-                    Credentials {
-                        username,
-                        password,
-                        kind,
-                    },
-            } => todo!(),
+            ClientAuthentication::Credentials { credentials } => (
+                (
+                    http::header::AUTHORIZATION.as_str(),
+                    credentials.basic_auth()?,
+                ),
+                credentials.kind.protocol_name(),
+            ),
             ClientAuthentication::Keys { keys } => {
                 let authenticated_challenge = handle_error!(
                     get_login_challenge(
@@ -370,11 +364,16 @@ async fn task(
                     .await,
                     backoff
                 );
-                (authenticated_challenge, keys.kind.protocol_name())
+                (
+                    (AUTHENTICATION_KEY, authenticated_challenge),
+                    keys.kind.protocol_name(),
+                )
             }
         };
 
-        debug!("Got the authentication challenge, will wait for the error notifications");
+        debug!(
+            "Prepared authentication headers, subscribing to error notifications for '{vpn_uri}'"
+        );
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
@@ -452,12 +451,12 @@ async fn get_login_challenge(
 }
 
 fn authentication_interceptor(
-    authentication_value: AsciiMetadataValue,
+    (authentication_header_name, authentication_value): (&'static str, AsciiMetadataValue),
     nord_vpn_protocol: AsciiMetadataValue,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> {
     move |mut req: Request<()>| {
         req.metadata_mut()
-            .insert(AUTHENTICATION_KEY, authentication_value.clone());
+            .insert(authentication_header_name, authentication_value.clone());
         req.metadata_mut()
             .insert(NORD_VPN_PROTOCOL_KEY, nord_vpn_protocol.clone());
         Ok(req)
@@ -664,6 +663,7 @@ pub mod tests {
     };
 
     use assert_matches::assert_matches;
+    use http::header::AUTHORIZATION;
     use llt_proto::ens::ConnectionError;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rstest::rstest;
@@ -671,7 +671,7 @@ pub mod tests {
     use telio_sockets::NativeProtector;
     use telio_utils::{
         exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds},
-        Hidden,
+        Hidden, HiddenBytes, HiddenString,
     };
     use tokio::{
         sync::oneshot,
@@ -682,7 +682,7 @@ pub mod tests {
 
     use crate::{
         test_support::{spawn_server_with_interceptor, Command, GrpcStub, ServerConfig, TlsConfig},
-        Keys, STATE,
+        CredentialsKind, Keys, STATE,
     };
 
     use super::*;
@@ -693,6 +693,84 @@ pub mod tests {
         LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
 
     const TEST_USER_AGENT: HeaderValue = HeaderValue::from_static("foo bar baz");
+
+    #[derive(Clone)]
+    pub enum TestAuthConfig {
+        NordLynx {
+            local_private_key: HiddenBytes,
+        },
+        NordWhisper {
+            username: HiddenString,
+            password: HiddenString,
+        },
+        OpenVpn {
+            username: HiddenString,
+            password: HiddenString,
+        },
+    }
+
+    impl TestAuthConfig {
+        pub fn new_nordlynx() -> Self {
+            Self::NordLynx {
+                local_private_key: Hidden(SecretKey::gen().to_vec()),
+            }
+        }
+
+        pub fn new_nordwhisper() -> Self {
+            const LEN: usize = 10;
+            Self::NordWhisper {
+                username: Hidden(Self::random_string(LEN)),
+                password: Hidden(Self::random_string(LEN)),
+            }
+        }
+
+        pub fn new_openvpn() -> Self {
+            const LEN: usize = 10;
+            Self::OpenVpn {
+                username: Hidden(Self::random_string(LEN)),
+                password: Hidden(Self::random_string(LEN)),
+            }
+        }
+
+        fn random_string(len: usize) -> String {
+            use rand::distr::{Alphanumeric, SampleString};
+            Alphanumeric.sample_string(&mut rand::rng(), len)
+        }
+
+        pub fn protocol_name(&self) -> &'static str {
+            match self {
+                TestAuthConfig::NordLynx { .. } => "nordlynx",
+                TestAuthConfig::NordWhisper { .. } => "nordwhisper",
+                TestAuthConfig::OpenVpn { .. } => "openvpn",
+            }
+        }
+
+        pub fn to_authentication(&self, vpn_public_key: &[u8]) -> Authentication {
+            match self.clone() {
+                TestAuthConfig::NordLynx { local_private_key } => Authentication::Keys {
+                    keys: Keys {
+                        local_private_key,
+                        vpn_public_key: Hidden(vpn_public_key.to_vec()),
+                        kind: KeyKind::NordLynx,
+                    },
+                },
+                TestAuthConfig::NordWhisper { username, password } => Authentication::Credentials {
+                    credentials: Credentials {
+                        username,
+                        password,
+                        kind: CredentialsKind::NordWhisper,
+                    },
+                },
+                TestAuthConfig::OpenVpn { username, password } => Authentication::Credentials {
+                    credentials: Credentials {
+                        username,
+                        password,
+                        kind: CredentialsKind::OpenVPN,
+                    },
+                },
+            }
+        }
+    }
 
     /// The user agent that `init` installed. Tests going through the public
     /// `connect` API send this one, not `TEST_USER_AGENT`.
@@ -705,10 +783,14 @@ pub mod tests {
             .clone()
     }
 
-    pub async fn spawn_authenticating_server(expected_user_agent: HeaderValue) -> ServerConfig {
+    pub async fn spawn_authenticating_server(
+        expected_user_agent: HeaderValue,
+        auth: TestAuthConfig,
+    ) -> ServerConfig {
         spawn_server_with_interceptor(|stub| CheckAuthenticationInterceptor {
             stub,
             expected_user_agent,
+            auth,
         })
         .await
     }
@@ -726,6 +808,7 @@ pub mod tests {
     struct CheckAuthenticationInterceptor {
         stub: GrpcStub,
         expected_user_agent: HeaderValue,
+        auth: TestAuthConfig,
     }
 
     impl Interceptor for CheckAuthenticationInterceptor {
@@ -743,32 +826,82 @@ pub mod tests {
                 "expected user-agent: {expected_user_agent:?}, got {received_user_agent:?}"
             );
 
-            match req.metadata().get(AUTHENTICATION_KEY) {
-                Some(t) => {
-                    let decoded = BASE64_STANDARD.decode(t).unwrap();
-                    let (client_public_key, challenge_uuid, received_authentication_code) = (
-                        PublicKey::new(decoded[..32].try_into().unwrap()),
-                        Uuid::from_slice(&decoded[32..48]).unwrap(),
-                        &decoded[48..],
-                    );
+            match &self.auth {
+                TestAuthConfig::NordLynx { local_private_key } => {
+                    match req.metadata().get(AUTHENTICATION_KEY) {
+                        Some(t) => {
+                            let decoded = BASE64_STANDARD.decode(t).unwrap();
+                            let (
+                                received_client_public_key,
+                                challenge_uuid,
+                                received_authentication_code,
+                            ) = (
+                                PublicKey::new(decoded[..32].try_into().unwrap()),
+                                Uuid::from_slice(&decoded[32..48]).unwrap(),
+                                &decoded[48..],
+                            );
 
-                    if !self.stub.take_challenge(&challenge_uuid) {
-                        return Err(Status::unauthenticated("Unknown auth token"));
-                    }
+                            if !self.stub.take_challenge(&challenge_uuid) {
+                                return Err(Status::unauthenticated("Unknown auth token"));
+                            }
 
-                    let secret = self.stub.shared_secret(&client_public_key);
-                    if received_authentication_code != authentication_tag(&secret, &decoded[..48]) {
-                        return Err(Status::unauthenticated("Challenge not authenticated"));
+                            let secret = self.stub.shared_secret(&received_client_public_key);
+                            if received_authentication_code
+                                != authentication_tag(&secret, &decoded[..48])
+                            {
+                                return Err(Status::unauthenticated("Challenge not authenticated"));
+                            }
+                            let client_private_key: SecretKey =
+                                SecretKey::new(local_private_key.as_slice().try_into().unwrap());
+                            let expected_client_public_key = client_private_key.public();
+                            if expected_client_public_key != received_client_public_key {
+                                return Err(Status::unauthenticated(
+                                    "Client with unknown nordlynx key",
+                                ));
+                            }
+                        }
+                        None => {
+                            return Err(Status::unauthenticated("No valid auth token"));
+                        }
                     }
                 }
-                _ => return Err(Status::unauthenticated("No valid auth token")),
+                TestAuthConfig::NordWhisper { username, password }
+                | TestAuthConfig::OpenVpn { username, password } => {
+                    match req.metadata().get(AUTHORIZATION.as_str()) {
+                        Some(authorization) => {
+                            let creds = http_auth_basic::Credentials::from_header(
+                                authorization.to_str().unwrap().to_owned(),
+                            )
+                            .unwrap();
+                            debug!("{username}:{password} vs {creds:?}");
+                            if username.0 != creds.user_id {
+                                return Err(Status::unauthenticated(format!(
+                                    "Incorrect username, expected {username}, got {}",
+                                    creds.user_id
+                                )));
+                            }
+                            if password.0 != creds.password {
+                                return Err(Status::unauthenticated(format!(
+                                    "Incorrect password, expected {password}, got {}",
+                                    creds.password
+                                )));
+                            }
+                        }
+                        None => {
+                            return Err(Status::unauthenticated(format!(
+                                "Missing {AUTHORIZATION} metadata key"
+                            )));
+                        }
+                    }
+                }
             }
 
             match req.metadata().get(NORD_VPN_PROTOCOL_KEY) {
                 Some(val) => {
-                    if val != "nordlynx" {
+                    if val != self.auth.protocol_name() {
                         return Err(Status::unavailable(format!(
-                            "Incorrect {NORD_VPN_PROTOCOL_KEY} in metadata: {val:?}"
+                            "Incorrect {NORD_VPN_PROTOCOL_KEY} in metadata: {val:?}, expected {}",
+                            self.auth.protocol_name()
                         )));
                     }
                 }
@@ -888,7 +1021,13 @@ pub mod tests {
         #[values(1, 5, 10)] timeout: u64,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(
+            TEST_USER_AGENT,
+            TestAuthConfig::NordLynx {
+                local_private_key: Hidden(client_private_key.to_vec()),
+            },
+        )
+        .await;
         let relay = TcpRelay::spawn(server_config.port).await;
         let interval = Duration::from_secs(interval);
         let timeout = Duration::from_secs(timeout);
@@ -972,7 +1111,13 @@ pub mod tests {
         #[values(None, Some(1), Some(5), Some(10), Some(20))] keepalive_timeout: Option<u64>,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(
+            TEST_USER_AGENT,
+            TestAuthConfig::NordLynx {
+                local_private_key: Hidden(client_private_key.to_vec()),
+            },
+        )
+        .await;
         let relay = TcpRelay::spawn(server_config.port).await;
 
         let allow_only_mlkem = true;
@@ -1063,7 +1208,13 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(
+            TEST_USER_AGENT,
+            TestAuthConfig::NordLynx {
+                local_private_key: Hidden(client_private_key.to_vec()),
+            },
+        )
+        .await;
 
         let allow_only_mlkem = true;
 

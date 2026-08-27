@@ -316,17 +316,20 @@ pub trait ErrorNotificationCallback: Send + Sync {
     fn disconnected(&self, reason: Option<String>);
 }
 
+#[derive(Clone)]
 pub enum CredentialsKind {
     OpenVPN,
     NordWhisper,
 }
 
+#[derive(Clone)]
 pub struct Credentials {
     pub username: HiddenString,
     pub password: HiddenString,
     pub kind: CredentialsKind,
 }
 
+#[derive(Clone, Copy)]
 pub enum KeyKind {
     NordLynx,
 }
@@ -340,12 +343,14 @@ impl KeyKind {
     }
 }
 
+#[derive(Clone)]
 pub struct Keys {
     pub local_private_key: HiddenBytes,
     pub vpn_public_key: HiddenBytes,
     pub kind: KeyKind,
 }
 
+#[derive(Clone)]
 pub enum Authentication {
     Credentials { credentials: Credentials },
     Keys { keys: Keys },
@@ -759,7 +764,7 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server, connect_to_test_server_with_keys, wait_for,
+            connect_to_test_server, connect_to_test_server_with_auth, wait_for,
             wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
         },
     };
@@ -767,7 +772,9 @@ mod tests {
     use assert_matches::assert_matches;
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
+    use rstest::rstest;
     use std::sync::Once;
+    use telio_crypto::SecretKey;
 
     use super::*;
 
@@ -1006,12 +1013,14 @@ mod tests {
         let runtime = get_runtime().unwrap();
         let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server_with_keys(
+        let connection = connect_to_test_server_with_auth(
             &server_config,
-            Keys {
-                local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
-                vpn_public_key: Hidden(server_config.public_key.to_vec()),
-                kind: crate::KeyKind::NordLynx,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
+                    vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                    kind: crate::KeyKind::NordLynx,
+                },
             },
             callback.clone(),
         );
@@ -1118,8 +1127,82 @@ mod tests {
         assert_eq!(tracked_connections(&ids), 0,);
     }
 
+    #[derive(Clone)]
+    enum TestAuthConfig {
+        NordLynx {
+            local_private_key: HiddenBytes,
+        },
+        NordWhisper {
+            username: HiddenString,
+            password: HiddenString,
+        },
+        OpenVpn {
+            username: HiddenString,
+            password: HiddenString,
+        },
+    }
+
+    impl TestAuthConfig {
+        fn new_nordlynx() -> Self {
+            Self::NordLynx {
+                local_private_key: Hidden(SecretKey::gen().to_vec()),
+            }
+        }
+
+        fn new_nordwhisper() -> Self {
+            const LEN: usize = 10;
+            Self::NordWhisper {
+                username: Hidden(Self::random_string(LEN)),
+                password: Hidden(Self::random_string(LEN)),
+            }
+        }
+
+        fn new_openvpn() -> Self {
+            const LEN: usize = 10;
+            Self::OpenVpn {
+                username: Hidden(Self::random_string(LEN)),
+                password: Hidden(Self::random_string(LEN)),
+            }
+        }
+
+        fn random_string(len: usize) -> String {
+            use rand::distr::{Alphanumeric, SampleString};
+            Alphanumeric.sample_string(&mut rand::rng(), len)
+        }
+
+        fn to_authentication(&self, vpn_public_key: &[u8]) -> Authentication {
+            match self.clone() {
+                TestAuthConfig::NordLynx { local_private_key } => Authentication::Keys {
+                    keys: Keys {
+                        local_private_key,
+                        vpn_public_key: Hidden(vpn_public_key.to_vec()),
+                        kind: KeyKind::NordLynx,
+                    },
+                },
+                TestAuthConfig::NordWhisper { username, password } => Authentication::Credentials {
+                    credentials: Credentials {
+                        username,
+                        password,
+                        kind: CredentialsKind::NordWhisper,
+                    },
+                },
+                TestAuthConfig::OpenVpn { username, password } => Authentication::Credentials {
+                    credentials: Credentials {
+                        username,
+                        password,
+                        kind: CredentialsKind::OpenVPN,
+                    },
+                },
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(TestAuthConfig::new_nordlynx())]
+    #[case(TestAuthConfig::new_nordwhisper())]
+    #[case(TestAuthConfig::new_openvpn())]
     #[test_log::test]
-    fn test_ens() {
+    fn test_ens(#[case] auth: TestAuthConfig) {
         run_init();
 
         let errors_to_emit = [
@@ -1146,8 +1229,12 @@ mod tests {
         let runtime = get_runtime().unwrap();
         let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
 
+        let auth = auth.to_authentication(&server_config.public_key);
+
         let first_callback = RecordedCallback::default();
-        let _first_connection = connect_to_test_server(&server_config, first_callback.clone());
+        let _first_connection =
+            connect_to_test_server_with_auth(&server_config, auth.clone(), first_callback.clone())
+                .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
         wait_for(|| first_callback.notifications.lock().len() == 2);
@@ -1157,7 +1244,9 @@ mod tests {
         );
 
         let second_callback = RecordedCallback::default();
-        let _second_connection = connect_to_test_server(&server_config, second_callback.clone());
+        let _second_connection =
+            connect_to_test_server_with_auth(&server_config, auth, second_callback.clone())
+                .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
         wait_for(|| second_callback.notifications.lock().len() == 2);

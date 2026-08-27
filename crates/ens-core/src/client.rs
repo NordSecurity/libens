@@ -352,7 +352,14 @@ async fn task(
         );
 
         let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
-            ClientAuthentication::Credentials { .. } => todo!(),
+            ClientAuthentication::Credentials {
+                credentials:
+                    Credentials {
+                        username,
+                        password,
+                        kind,
+                    },
+            } => todo!(),
             ClientAuthentication::Keys { keys } => {
                 let authenticated_challenge = handle_error!(
                     get_login_challenge(

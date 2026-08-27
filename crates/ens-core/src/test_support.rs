@@ -285,21 +285,23 @@ pub fn connect_to_test_server(
     server_config: &ServerConfig,
     callback: impl ErrorNotificationCallback + 'static,
 ) -> Arc<Connection> {
-    connect_to_test_server_with_keys(
+    connect_to_test_server_with_auth(
         server_config,
-        Keys {
-            local_private_key: Hidden(SecretKey::gen().to_vec()),
-            vpn_public_key: Hidden(server_config.public_key.to_vec()),
-            kind: KeyKind::NordLynx,
+        Authentication::Keys {
+            keys: Keys {
+                local_private_key: Hidden(SecretKey::gen().to_vec()),
+                vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                kind: KeyKind::NordLynx,
+            },
         },
         callback,
     )
     .unwrap()
 }
 
-pub fn connect_to_test_server_with_keys(
+pub fn connect_to_test_server_with_auth(
     server_config: &ServerConfig,
-    keys: Keys,
+    auth: Authentication,
     callback: impl ErrorNotificationCallback + 'static,
 ) -> Result<Arc<Connection>, EnsError> {
     let config = Config::new();
@@ -308,7 +310,7 @@ pub fn connect_to_test_server_with_keys(
     connect(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_config.port)),
         None,
-        Authentication::Keys { keys },
+        auth,
         Box::new(callback),
         Arc::new(config),
     )

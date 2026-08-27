@@ -15,5 +15,4 @@ target/
 # Added by cargo
 
 /target
-
-_nordtls.orig.udl
+/coverage

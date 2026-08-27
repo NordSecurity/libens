@@ -46,6 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: clippy-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets --all-features --color always --package libens --package ens-core -- --deny warnings
 
   cargo-deny:
@@ -62,6 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: deny-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install --locked cargo-deny@0.20.2
       - run: cargo deny check
 
@@ -80,6 +82,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: udeps-linux-${{ env.NIGHTLY_VERSION }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +${{ env.NIGHTLY_VERSION }} install cargo-udeps@0.1.61 --locked
       - run: cargo +${{ env.NIGHTLY_VERSION }} udeps --workspace --locked --output human --backend depinfo
 
@@ -97,6 +100,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
       - run: cargo test --all --all-features -- --nocapture --test-threads 30
 
@@ -114,5 +118,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
       - run: cargo test --all --all-features -- --nocapture --test-threads 30

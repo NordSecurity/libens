@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::Deserialize;
 
 const API_BASE: &str = "https://api.nordvpn.com";

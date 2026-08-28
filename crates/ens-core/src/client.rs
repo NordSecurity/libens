@@ -37,7 +37,7 @@ use llt_proto::ens::{
     ens_client, login_client, ChallengeRequest, ConnectionError, ConnectionErrorRequest,
 };
 
-use crate::{Authentication, Credentials, EnsError, KeyKind};
+use crate::{runtime::is_unexpected_task_failure, Authentication, Credentials, EnsError, KeyKind};
 
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
@@ -217,7 +217,7 @@ impl ErrorNotificationService {
                                  // to receive and react to te quit signal. Which is why we need to cancel it here, so
                                  // that we are not stuck for a long time in the await.
             if let Err(e) = join_handle.await {
-                if !e.is_cancelled() {
+                if is_unexpected_task_failure(&e) {
                     warn!("Previous ENS task failed to stop: {e}");
                 }
             }
@@ -639,26 +639,17 @@ fn authentication_tag(secret: &SharedSecret, message: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 pub mod tests {
     use std::{
-        collections::HashSet,
         net::Ipv4Addr,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            LazyLock, Mutex,
+            LazyLock,
         },
         time::{Duration, Instant},
     };
 
     use assert_matches::assert_matches;
-    use async_channel::{self, unbounded, Receiver as AsyncReceiver, Sender as AsyncSender};
-    use llt_proto::ens::{
-        ens_server::{self, EnsServer},
-        login_server::{self, LoginServer},
-        ChallengeResponse, ConnectionError,
-    };
-    use rcgen::{
-        generate_simple_self_signed, BasicConstraints, Certificate, CertificateParams,
-        CertifiedKey, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    };
+    use llt_proto::ens::ConnectionError;
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
     use rstest::rstest;
     use telio_crypto::SecretKey;
     use telio_sockets::NativeProtector;
@@ -670,10 +661,13 @@ pub mod tests {
         sync::oneshot,
         time::{error::Elapsed, timeout},
     };
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::{service::Interceptor, transport::Server};
 
-    use crate::{Keys, STATE};
+    use tonic::service::Interceptor;
+
+    use crate::{
+        test_support::{spawn_server_with_interceptor, Command, GrpcStub, ServerConfig, TlsConfig},
+        Keys, STATE,
+    };
 
     use super::*;
 
@@ -695,129 +689,12 @@ pub mod tests {
             .clone()
     }
 
-    #[derive(Debug)]
-    pub enum Command {
-        Send(ConnectionError),
-        Error(tonic::Status),
-        End,
-    }
-
-    struct State {
-        command_rx: AsyncReceiver<Command>,
-        challenges: Mutex<HashSet<Uuid>>,
-        vpn_server_private_key: SecretKey,
-    }
-
-    impl State {
-        fn new(command_rx: AsyncReceiver<Command>, vpn_server_private_key: SecretKey) -> Self {
-            Self {
-                challenges: Mutex::new(HashSet::default()),
-                vpn_server_private_key,
-                command_rx,
-            }
-        }
-    }
-
-    // Root CA and a leaf cert issued by it
-    #[derive(Debug)]
-    pub struct TlsConfig {
-        pub ca_cert: Certificate,
-        leaf_cert: Certificate,
-        leaf_key_pem: String,
-    }
-
-    impl TlsConfig {
-        fn new() -> Self {
-            let mut ca_params = CertificateParams::default();
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-
-            let mut ca_dn = DistinguishedName::new();
-            ca_dn.push(DnType::CommonName, "Test CA");
-            ca_dn.push(DnType::OrganizationName, "Test Org");
-            ca_params.distinguished_name = ca_dn;
-
-            let ca_key_pair = KeyPair::generate().unwrap();
-            let ca_cert = ca_params.self_signed(&ca_key_pair).unwrap();
-            let issuer = Issuer::new(ca_params, ca_key_pair);
-
-            let mut leaf_params = CertificateParams::default();
-            let mut leaf_dn = DistinguishedName::new();
-            leaf_dn.push(DnType::CommonName, "localhost");
-            leaf_params.distinguished_name = leaf_dn;
-            leaf_params.subject_alt_names = vec![
-                rcgen::SanType::DnsName("localhost".parse().unwrap()),
-                rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            ];
-
-            let leaf_key_pair = KeyPair::generate().unwrap();
-            let leaf_cert = leaf_params.signed_by(&leaf_key_pair, &issuer).unwrap();
-
-            let leaf_key_pem = leaf_key_pair.serialize_pem();
-
-            TlsConfig {
-                ca_cert,
-                leaf_cert,
-                leaf_key_pem,
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct GrpcStub(Arc<State>);
-
-    impl std::ops::Deref for GrpcStub {
-        type Target = State;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    #[tonic::async_trait]
-    impl ens_server::Ens for GrpcStub {
-        type ConnectionErrorsStream = ReceiverStream<Result<ConnectionError, tonic::Status>>;
-        async fn connection_errors(
-            &self,
-            _request: tonic::Request<ConnectionErrorRequest>,
-        ) -> std::result::Result<tonic::Response<Self::ConnectionErrorsStream>, tonic::Status>
-        {
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-            let command_rx = self.command_rx.clone();
-            tokio::spawn(async move {
-                // Ends on `Command::End` or when the test drops the sender,
-                // whichever comes first - not every test sends `End`.
-                while let Ok(command) = command_rx.recv().await {
-                    let sent = match command {
-                        Command::Send(e) => tx.send(Ok(e)).await,
-                        Command::Error(status) => tx.send(Err(status)).await,
-                        Command::End => break,
-                    };
-
-                    // The client might have dropped this stream already, e.g. after
-                    // reconnecting because of a keepalive timeout.
-                    if sent.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            Ok(tonic::Response::new(ReceiverStream::new(rx)))
-        }
-    }
-
-    #[tonic::async_trait]
-    impl login_server::Login for GrpcStub {
-        async fn get_challenge(
-            &self,
-            _request: tonic::Request<ChallengeRequest>,
-        ) -> std::result::Result<tonic::Response<ChallengeResponse>, tonic::Status> {
-            let challenge = Uuid::new_v4();
-            self.challenges.lock().unwrap().insert(challenge);
-            Ok(tonic::Response::new(ChallengeResponse {
-                challenge: challenge.to_string(),
-            }))
-        }
+    pub async fn spawn_authenticating_server(expected_user_agent: HeaderValue) -> ServerConfig {
+        spawn_server_with_interceptor(|stub| CheckAuthenticationInterceptor {
+            stub,
+            expected_user_agent,
+        })
+        .await
     }
 
     #[derive(Clone)]
@@ -850,22 +727,13 @@ pub mod tests {
                         &decoded[48..],
                     );
 
-                    if self
-                        .stub
-                        .challenges
-                        .lock()
-                        .unwrap()
-                        .take(&challenge_uuid)
-                        .is_some()
-                    {
-                        let secret = self.stub.vpn_server_private_key.ecdh(&client_public_key);
-                        if received_authentication_code
-                            != authentication_tag(&secret, &decoded[..48])
-                        {
-                            return Err(Status::unauthenticated("Challenge not authenticated"));
-                        }
-                    } else {
+                    if !self.stub.take_challenge(&challenge_uuid) {
                         return Err(Status::unauthenticated("Unknown auth token"));
+                    }
+
+                    let secret = self.stub.shared_secret(&client_public_key);
+                    if received_authentication_code != authentication_tag(&secret, &decoded[..48]) {
+                        return Err(Status::unauthenticated("Challenge not authenticated"));
                     }
                 }
                 _ => return Err(Status::unauthenticated("No valid auth token")),
@@ -887,62 +755,6 @@ pub mod tests {
             }
 
             Ok(req)
-        }
-    }
-
-    pub struct ServerConfig {
-        pub port: u16,
-        pub public_key: PublicKey,
-        pub command_tx: AsyncSender<Command>,
-        pub tls_config: TlsConfig,
-    }
-
-    pub async fn spawn_server(expected_user_agent: HeaderValue) -> ServerConfig {
-        let server_private_key = SecretKey::gen();
-
-        let (command_tx, command_rx) = unbounded();
-        let grpc_stub = GrpcStub(Arc::new(State::new(command_rx, server_private_key.clone())));
-        let ens_srv = EnsServer::with_interceptor(
-            grpc_stub.clone(),
-            CheckAuthenticationInterceptor {
-                stub: grpc_stub.clone(),
-                expected_user_agent,
-            },
-        );
-        let login_srv = LoginServer::new(grpc_stub.clone());
-        let (port_tx, port_rx) = oneshot::channel();
-        let tls_config = TlsConfig::new();
-
-        let cert_pem = tls_config.leaf_cert.pem().clone();
-        let key_pem = tls_config.leaf_key_pem.clone();
-        tokio::spawn({
-            let cert_pem = cert_pem.clone();
-            async move {
-                use tonic::transport::ServerTlsConfig;
-
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let actual_addr = listener.local_addr().unwrap();
-                port_tx.send(actual_addr.port()).unwrap();
-
-                let tonic_tls_config = ServerTlsConfig::new()
-                    .identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
-
-                Server::builder()
-                    .tls_config(tonic_tls_config)
-                    .unwrap()
-                    .add_service(ens_srv)
-                    .add_service(login_srv)
-                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                    .await
-                    .unwrap();
-            }
-        });
-
-        ServerConfig {
-            port: port_rx.await.unwrap(),
-            public_key: server_private_key.public(),
-            command_tx,
-            tls_config,
         }
     }
 
@@ -1051,7 +863,7 @@ pub mod tests {
         #[values(1, 5, 10)] timeout: u64,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
         let interval = Duration::from_secs(interval);
         let timeout = Duration::from_secs(timeout);
@@ -1078,13 +890,11 @@ pub mod tests {
         .await;
 
         server_config
-            .command_tx
             .send(Command::Send(ConnectionError {
                 code: EnsProtoError::Unauthenticated as i32,
                 additional_info: Some("before the silence".to_owned()),
             }))
-            .await
-            .unwrap();
+            .await;
         let (before_the_silence, _) = rx.recv().await.unwrap();
         let before_timestamp = Instant::now();
         assert_eq!(
@@ -1102,13 +912,11 @@ pub mod tests {
         let ((after_the_silence, _), after_timestamp) = tokio::time::timeout(deadline, async {
             loop {
                 server_config
-                    .command_tx
                     .send(Command::Send(ConnectionError {
                         code: EnsProtoError::ServerMaintenance as i32,
                         additional_info: Some("after the silence".to_owned()),
                     }))
-                    .await
-                    .unwrap();
+                    .await;
                 if let Ok(notification) =
                     tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
                 {
@@ -1138,7 +946,7 @@ pub mod tests {
         #[values(None, Some(1), Some(5), Some(10), Some(20))] keepalive_timeout: Option<u64>,
     ) {
         let client_private_key = SecretKey::gen();
-        let server_config = spawn_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
         let relay = TcpRelay::spawn(server_config.port).await;
 
         let allow_only_mlkem = true;
@@ -1163,13 +971,11 @@ pub mod tests {
         .await;
 
         server_config
-            .command_tx
             .send(Command::Send(ConnectionError {
                 code: EnsProtoError::Unauthenticated as i32,
                 additional_info: Some("before the silence".to_owned()),
             }))
-            .await
-            .unwrap();
+            .await;
         let (before_the_silence, _) = rx.recv().await.unwrap();
         assert_eq!(
             before_the_silence.additional_info.as_deref(),
@@ -1182,13 +988,11 @@ pub mod tests {
         let next_notification = timeout(Duration::from_secs(30), async {
             loop {
                 server_config
-                    .command_tx
                     .send(Command::Send(ConnectionError {
                         code: EnsProtoError::ServerMaintenance as i32,
                         additional_info: Some("after the silence".to_owned()),
                     }))
-                    .await
-                    .unwrap();
+                    .await;
                 if let Ok(notification) = timeout(Duration::from_millis(500), rx.recv()).await {
                     break (notification.unwrap(), Instant::now());
                 }
@@ -1199,14 +1003,6 @@ pub mod tests {
         assert_matches!(next_notification, Err(Elapsed { .. }));
 
         ens.stop().await;
-    }
-
-    pub async fn send_errors(errors_to_emit: &[ConnectionError], errors_tx: AsyncSender<Command>) {
-        let errors_to_emit = errors_to_emit.to_vec();
-        for e in errors_to_emit {
-            errors_tx.send(Command::Send(e)).await.unwrap();
-        }
-        errors_tx.send(Command::End).await.unwrap();
     }
 
     #[tokio::test]
@@ -1227,7 +1023,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
@@ -1247,7 +1043,7 @@ pub mod tests {
         )
         .await;
 
-        send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
+        server_config.send_errors(&errors_to_emit).await;
         let _collected_errors = collect_errors(2, &mut rx).await;
 
         ens.start_monitor_on_port(
@@ -1258,7 +1054,7 @@ pub mod tests {
         )
         .await;
 
-        send_errors(&errors_to_emit, server_config.command_tx.clone()).await;
+        server_config.send_errors(&errors_to_emit).await;
         let collected_errors = collect_errors(2, &mut rx).await;
 
         assert_eq!(
@@ -1302,7 +1098,7 @@ pub mod tests {
             },
         ];
 
-        let server_config = spawn_server(TEST_USER_AGENT).await;
+        let server_config = spawn_authenticating_server(TEST_USER_AGENT).await;
 
         let allow_only_mlkem = true;
 
@@ -1333,24 +1129,14 @@ pub mod tests {
         .await;
 
         for e in errors_to_emit.clone() {
-            server_config
-                .command_tx
-                .send(Command::Send(e))
-                .await
-                .unwrap();
+            server_config.send(Command::Send(e)).await;
         }
         server_config
-            .command_tx
             .send(Command::Error(tonic::Status::unknown("some message")))
-            .await
-            .unwrap();
-        server_config.command_tx.send(Command::End).await.unwrap();
+            .await;
+        server_config.send(Command::End).await;
         for e in errors_to_emit {
-            server_config
-                .command_tx
-                .send(Command::Send(e))
-                .await
-                .unwrap();
+            server_config.send(Command::Send(e)).await;
         }
         let _collected_errors = collect_errors(3, &mut rx).await;
     }

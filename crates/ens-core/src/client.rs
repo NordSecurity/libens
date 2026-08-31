@@ -262,11 +262,11 @@ impl TryFrom<Authentication> for ClientAuthentication {
 
     fn try_from(value: Authentication) -> Result<Self, Self::Error> {
         match value {
-            Authentication::Credentials { credentials } => {
+            Authentication::WithCredentials { credentials } => {
                 credentials.validate()?;
                 Ok(Self::Credentials { credentials })
             }
-            Authentication::Keys { keys } => {
+            Authentication::WithKeys { keys } => {
                 let vpn_public_key =
                     keys.vpn_public_key
                         .0
@@ -790,21 +790,23 @@ pub mod tests {
 
         pub fn to_authentication(&self, vpn_public_key: &[u8]) -> Authentication {
             match self.clone() {
-                TestAuthConfig::NordLynx { local_private_key } => Authentication::Keys {
+                TestAuthConfig::NordLynx { local_private_key } => Authentication::WithKeys {
                     keys: Keys {
                         local_private_key,
                         vpn_public_key: Hidden(vpn_public_key.to_vec()),
                         kind: KeyKind::NordLynx,
                     },
                 },
-                TestAuthConfig::NordWhisper { username, password } => Authentication::Credentials {
-                    credentials: Credentials {
-                        username,
-                        password,
-                        kind: CredentialsKind::NordWhisper,
-                    },
-                },
-                TestAuthConfig::OpenVpn { username, password } => Authentication::Credentials {
+                TestAuthConfig::NordWhisper { username, password } => {
+                    Authentication::WithCredentials {
+                        credentials: Credentials {
+                            username,
+                            password,
+                            kind: CredentialsKind::NordWhisper,
+                        },
+                    }
+                }
+                TestAuthConfig::OpenVpn { username, password } => Authentication::WithCredentials {
                     credentials: Credentials {
                         username,
                         password,
@@ -1045,7 +1047,7 @@ pub mod tests {
         client_private_key: &SecretKey,
         vpn_public_key: PublicKey,
     ) -> ClientAuthentication {
-        Authentication::Keys {
+        Authentication::WithKeys {
             keys: Keys {
                 local_private_key: Hidden(client_private_key.to_vec()),
                 vpn_public_key: Hidden(vpn_public_key.to_vec()),

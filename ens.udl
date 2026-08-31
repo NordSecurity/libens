@@ -177,9 +177,9 @@ interface Connection {
 [Enum]
 interface Authentication {
     /// Username/password authentication for OpenVPN and NordWhisper.
-    Credentials(Credentials credentials);
+    WithCredentials(Credentials credentials);
     /// Key-based authentication for NordLynx (WireGuard).
-    Keys(Keys keys);
+    WithKeys(Keys keys);
 };
 
 /// Callback for protecting `socket_fd` from being routed through the VPN tunnel.

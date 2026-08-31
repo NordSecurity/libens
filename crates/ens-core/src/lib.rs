@@ -1093,6 +1093,40 @@ mod tests {
         assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
     }
 
+    #[rstest]
+    #[case(TestAuthConfig::new_nordlynx)]
+    #[case(TestAuthConfig::new_nordwhisper)]
+    #[case(TestAuthConfig::new_openvpn)]
+    #[test_log::test]
+    fn test_authentication_rejected_by_server(#[case] make_auth: fn() -> TestAuthConfig) {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            make_auth(),
+        ));
+        let vpn_port = server_config.port;
+
+        let wrong_auth = make_auth().to_authentication(&server_config.public_key);
+
+        let callback = RecordedCallback::default();
+        let connection =
+            connect_to_test_server_with_auth(&server_config, wrong_auth, callback.clone()).unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+        );
+        assert!(callback.notifications.lock().is_empty());
+        assert_eq!(0, tracked_connections(&[connection.id]));
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
     #[test_log::test]
     fn test_disconnect_reported_when_server_gracefully_closes_the_stream() {
         run_init();

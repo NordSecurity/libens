@@ -28,7 +28,7 @@ use tokio_rustls::TlsConnector;
 use tonic::{
     metadata::{errors::InvalidMetadataValue, AsciiMetadataValue},
     transport::{Channel, Endpoint},
-    Request, Status,
+    Code, Request, Status,
 };
 use tower::service_fn;
 use uuid::Uuid;
@@ -293,6 +293,31 @@ impl TryFrom<Authentication> for ClientAuthentication {
     }
 }
 
+trait AuthRejection {
+    fn is_auth_rejection(&self) -> bool;
+}
+
+impl AuthRejection for Status {
+    fn is_auth_rejection(&self) -> bool {
+        matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
+    }
+}
+
+impl AuthRejection for Error {
+    fn is_auth_rejection(&self) -> bool {
+        matches!(self, Error::Status(status) if status.is_auth_rejection())
+    }
+}
+
+fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
+    error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
+
+    let reason = format!("'{vpn_uri}' rejected the authentication");
+    if let Err(e) = tx.try_send(Event::Disconnect(Some(reason))) {
+        warn!("Failed to publish disconnect: {e}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &str,
@@ -322,6 +347,11 @@ async fn task(
                 match $value {
                     Ok(v) => v,
                     Err(e) => {
+                        if e.is_auth_rejection() {
+                            publish_auth_rejection(&tx, vpn_uri, &e);
+                            break 'outer;
+                        }
+
                         warn!("ENS task transient failure: {e} source: {:?}", e.source());
                         if *quit_rx.borrow() == true {
                             break 'outer;
@@ -408,6 +438,10 @@ async fn task(
                             if let Err(e) = tx.try_send(Event::Disconnect(Some(msg))) {
                                 warn!("Failed to publish disconnect: {e}");
                             }
+                            break 'outer;
+                        }
+                        Err(e) if e.is_auth_rejection() => {
+                            publish_auth_rejection(&tx, vpn_uri, &e);
                             break 'outer;
                         }
                         Err(e) => {

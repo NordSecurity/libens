@@ -91,8 +91,9 @@ callback interface ErrorNotificationCallback {
 
     /// Signals that the ENS session has ended and no further `notify`
     /// calls will be made on this callback. Called at most once per
-    /// `Connection`. Calling `shutdown()` will trigger 
-    /// `disconnected("shutdown")`.
+    /// `Connection`. Calling `shutdown()` triggers disconnected("shutdown")
+    /// unless the session has already ended, in which case the original reason
+    /// is reported and no further call is made.
     void disconnected(string? reason);
 };
 
@@ -247,7 +248,8 @@ namespace ens {
     /// Tears down library-global state. After this returns, all other
     /// entry points fail with `NotInitialized` until `init()` is called
     /// again. Any live `Connection` handles are shut down as part of
-    /// this call.
+    /// this call. Calling `init` or `connect` while `deinit` is running is an
+    /// error and can lead to incorrect behaviour.
     [Throws=EnsError]
     void deinit();
 

@@ -22,12 +22,20 @@ use llt_proto::ens::ConnectionError;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use std::{
-    fmt::Display, net::SocketAddr, panic::AssertUnwindSafe, str::FromStr, sync::Arc, time::Duration,
+    collections::HashMap,
+    fmt::Display,
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    str::FromStr,
+    sync::{atomic::AtomicBool, Arc, Weak},
+    time::Duration,
 };
 use telio_sockets::{protector::make_external_protector, NativeProtector, SocketPool};
 use telio_utils::exponential_backoff::{ExponentialBackoff, ExponentialBackoffBounds};
 use thiserror::Error;
 use tokio::task::block_in_place;
+use tonic::metadata::AsciiMetadataValue;
+use uuid::Uuid;
 
 pub use memory::get_memory_usage;
 
@@ -50,10 +58,25 @@ mod built_info {
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Reason reported to `ErrorNotificationCallback::disconnected` when the
+// session was ended by `Connection::shutdown`.
+pub const SHUTDOWN_REASON: &str = "shutdown";
+
 static STATE: Mutex<Option<GlobalState>> = Mutex::new(None);
 
 struct GlobalState {
     user_agent: HeaderValue,
+    active_connections: HashMap<Uuid, Weak<Connection>>,
+}
+
+struct ActiveConnectionGuard(Uuid);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(state) = &mut *STATE.lock() {
+            state.active_connections.remove(&self.0);
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, EnsError>;
@@ -169,7 +192,11 @@ pub fn init(app_version: String) -> Result<()> {
 
         init_runtime()?;
 
-        *state = Some(GlobalState { user_agent });
+        *state = Some(GlobalState {
+            user_agent,
+            active_connections: HashMap::default(),
+        });
+
         if let Some(state) = state.as_ref() {
             info!(
                 "libens initialized ({:?}) built on {} using {}",
@@ -204,20 +231,39 @@ fn build_user_agent(app_version: &str) -> std::result::Result<HeaderValue, Inval
 }
 
 /// Deinitializes the library. After calling this, calls to other functions
-/// will fail.
+/// will fail. Calling `init` or `connect` while `deinit` is running is an error
+/// and can lead to incorrect behaviour.
 pub fn deinit() -> Result<()> {
     catch_panic_result(|| {
-        let mut state = STATE.lock();
+        // The connections are shut down without holding the `STATE` lock,
+        // because their event processing tasks need it to deregister
+        // themselves while we are waiting for them to stop.
+        let active_connections = {
+            let mut state = STATE.lock();
+            let Some(global_state) = &mut *state else {
+                return Err(EnsError::NotInitialized {
+                    reason: "deinit".to_owned(),
+                });
+            };
+            let active_connections = std::mem::take(&mut global_state.active_connections);
 
-        let was_initialized = state.is_some();
-        if !was_initialized {
-            return Err(EnsError::NotInitialized {
-                reason: "deinit".to_owned(),
-            });
+            *state = None;
+            active_connections
+        };
+
+        for connection in active_connections.values() {
+            let Some(connection) = connection.upgrade() else {
+                continue;
+            };
+            if let Err(e) = connection.shutdown() {
+                warn!(
+                    "Failed to shutdown ENS connection to {}: {e:?}",
+                    connection.vpn
+                );
+            }
         }
 
         deinit_runtime();
-        *state = None;
 
         Ok(())
     })
@@ -283,6 +329,15 @@ pub struct Credentials {
 
 pub enum KeyKind {
     NordLynx,
+}
+
+impl KeyKind {
+    #[must_use]
+    pub fn protocol_name(&self) -> AsciiMetadataValue {
+        match self {
+            KeyKind::NordLynx => AsciiMetadataValue::from_static("nordlynx"),
+        }
+    }
 }
 
 pub struct Keys {
@@ -383,7 +438,7 @@ pub fn connect(
 
         let handle = get_runtime()?;
 
-        block_in_place(|| {
+        let connection = block_in_place(|| {
             handle.block_on(connect_impl(
                 vpn,
                 protect_cb,
@@ -391,7 +446,18 @@ pub fn connect(
                 callback,
                 config,
             ))
-        })
+        });
+
+        if let Ok(connection) = connection.as_ref() {
+            if let Some(state) = STATE.lock().as_mut() {
+                let id = connection.id;
+                state
+                    .active_connections
+                    .insert(id, Arc::downgrade(connection));
+            }
+        }
+
+        connection
     })
 }
 
@@ -402,7 +468,9 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
+    let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
+    let callback = GuardedCallback::new(callback);
     let protect = make_socket_protector(protect_cb);
     let socket_pool = make_socket_pool(protect)?;
 
@@ -447,27 +515,47 @@ async fn connect_impl(
     let callback_thread_id_clone = callback_thread_id.clone();
 
     let event_processing_task = tokio::task::spawn(async move {
-        while let Some((connection_error, vpn)) = receiver.recv().await {
-            // This is behaviour documented in the udl
-            if state_clone.lock().is_shut_down() {
-                debug!("Dropping notification received after shutdown: {connection_error:?}");
-                break;
-            }
+        let _active_connection = ActiveConnectionGuard(connection_id);
+        loop {
+            match receiver.recv().await {
+                Some(client::Event::Notification {
+                    connection_error,
+                    vpn_uri,
+                }) => {
+                    // This is behaviour documented in the udl
+                    if state_clone.lock().is_finished() {
+                        debug!(
+                            "Dropping notification received after shutdown: {connection_error:?}"
+                        );
+                        break;
+                    }
 
-            debug!("Received new connection error: {connection_error:?} from {vpn:?}");
-            {
-                let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-                callback.notify(connection_error.into());
+                    debug!("Received new connection error: {connection_error:?} from {vpn_uri:?}");
+                    {
+                        let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
+                        callback.notify(connection_error.into());
+                    }
+                }
+                Some(client::Event::Disconnect(reason)) => {
+                    warn!("Got a disconnect with a reason: {reason:?}");
+                    let mut state = state_clone.lock();
+                    if !state.is_finished() {
+                        *state = ConnectionState::Ended(reason);
+                    }
+                    break;
+                }
+                None => break,
             }
         }
 
         let reason = match &*state_clone.lock() {
-            ConnectionState::ShutDown(reason) => reason.clone(),
+            ConnectionState::Ended(reason) | ConnectionState::ShutDown(reason) => reason.clone(),
             ConnectionState::Active(_) => {
                 Some("active service closed the notification stream".to_owned())
             }
         };
         {
+            debug!("disconnect after loop end: {reason:?}");
             let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
             callback.disconnected(reason);
         }
@@ -476,9 +564,11 @@ async fn connect_impl(
     });
 
     Ok(Arc::new(Connection {
+        id: connection_id,
         state,
         callback_thread_id,
         event_processing_task: Mutex::new(Some(event_processing_task)),
+        vpn,
     }))
 }
 
@@ -526,15 +616,48 @@ fn make_socket_pool(protect: Option<telio_sockets::Protect>) -> Result<Arc<Socke
 
     Ok(socket_pool)
 }
+
+struct GuardedCallback {
+    closed: AtomicBool,
+    inner: Box<dyn ErrorNotificationCallback>,
+}
+
+impl GuardedCallback {
+    pub fn new(inner: Box<dyn ErrorNotificationCallback>) -> Self {
+        Self {
+            inner,
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ErrorNotificationCallback for GuardedCallback {
+    fn notify(&self, notification: ConnectionErrorNotification) {
+        if !self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.inner.notify(notification);
+        }
+    }
+
+    fn disconnected(&self, reason: Option<String>) {
+        let was_closed = self.closed.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if !was_closed {
+            self.inner.disconnected(reason);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ConnectionState {
     Active(ErrorNotificationService),
+    // The session ended on its own with stored reason
+    Ended(Option<String>),
+    // The session was torn down by the library caller.
     ShutDown(Option<String>),
 }
 
 impl ConnectionState {
-    fn is_shut_down(&self) -> bool {
-        matches!(self, ConnectionState::ShutDown(_))
+    fn is_finished(&self) -> bool {
+        !matches!(self, ConnectionState::Active(_))
     }
 }
 
@@ -556,6 +679,8 @@ impl Drop for CallbackThreadGuard<'_> {
 
 #[derive(Debug)]
 pub struct Connection {
+    id: Uuid,
+    vpn: SocketAddr,
     state: Arc<Mutex<ConnectionState>>,
     // Set to Some(_) when the event processing task is about to call one of
     // the user provided callbacks. Which means that it's None when called from
@@ -572,11 +697,11 @@ impl Connection {
                 let mut state = self.state.lock();
                 match std::mem::replace(
                     &mut *state,
-                    ConnectionState::ShutDown(Some("shutdown".to_owned())),
+                    ConnectionState::ShutDown(Some(SHUTDOWN_REASON.to_owned())),
                 ) {
                     ConnectionState::Active(s) => s,
-                    already_shut @ ConnectionState::ShutDown(_) => {
-                        *state = already_shut;
+                    already_finished => {
+                        *state = already_finished;
                         return Ok(());
                     }
                 }
@@ -634,8 +759,8 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server, connect_to_test_server_with_keys, wait_for, Command,
-            RecordedCallback,
+            connect_to_test_server, connect_to_test_server_with_keys, wait_for,
+            wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
         },
     };
 
@@ -685,6 +810,37 @@ mod tests {
 
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
 
+    const RECONNECT_COUNT: usize = 5;
+
+    fn tracked_connections(ids: &[Uuid]) -> usize {
+        let state = STATE.lock();
+        let Some(state) = state.as_ref() else {
+            return 0;
+        };
+        ids.iter()
+            .filter(|id| state.active_connections.contains_key(*id))
+            .count()
+    }
+
+    #[test_log::test]
+    fn test_guarded_callback_reports_a_disconnect_at_most_once() {
+        let recording = RecordedCallback::default();
+        let callback = GuardedCallback::new(Box::new(recording.clone()));
+
+        callback.disconnected(Some(SHUTDOWN_REASON.to_owned()));
+        callback.disconnected(None);
+        callback.notify(ConnectionErrorNotification {
+            kind: ConnectionErrorNotificationKind::ServerMaintenance,
+            additional_info: None,
+        });
+
+        assert_eq!(
+            *recording.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+        assert_eq!(*recording.notifications.lock(), vec![]);
+    }
+
     #[test_log::test]
     fn test_explicit_shutdown() {
         run_init();
@@ -722,7 +878,7 @@ mod tests {
         // until the end of the event processing task which calls `disconnected`
         // on the callback.
         assert!(
-            callback.disconnected.lock().is_some(),
+            !callback.disconnects.lock().is_empty(),
             "shutdown() returned before the pump delivered `disconnected`"
         );
 
@@ -746,8 +902,8 @@ mod tests {
         );
 
         assert_eq!(
-            *callback.disconnected.lock(),
-            Some(Some("shutdown".to_owned()))
+            *callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
         );
 
         // `shutdown` should be idempotent
@@ -775,7 +931,7 @@ mod tests {
         drop(connection);
 
         // `drop` doesn't wait so we need to
-        wait_for(|| callback.disconnected.lock().is_some());
+        wait_for(|| !callback.disconnects.lock().is_empty());
 
         let notifications = callback.notifications.lock();
         assert_eq!(
@@ -786,7 +942,7 @@ mod tests {
             }]
         );
 
-        assert_eq!(*callback.disconnected.lock(), Some(None));
+        assert_eq!(*callback.disconnects.lock(), vec![None]);
     }
 
     #[test_log::test]
@@ -839,7 +995,7 @@ mod tests {
 
         assert_eq!(
             *callback.disconnected.lock(),
-            Some(Some("shutdown".to_owned()))
+            Some(Some(SHUTDOWN_REASON.to_owned()))
         );
     }
 
@@ -861,5 +1017,104 @@ mod tests {
         );
 
         assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_server_gracefully_closes_the_stream() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let vpn_port = server_config.port;
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server(&server_config, callback.clone());
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: Some("planned maintenance".to_owned()),
+        };
+
+        server_config.send_blocking(Command::Send(error));
+
+        wait_for(|| callback.notifications.lock().len() == 1);
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
+        );
+        assert_eq!(
+            *callback.notifications.lock(),
+            vec![ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::ServerMaintenance,
+                additional_info: Some("planned maintenance".to_owned()),
+            }]
+        );
+
+        // Safe to call multiple times; subsequent calls are no-ops.
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_matches!(connection.shutdown(), Ok(()));
+
+        let disconnects = callback.disconnects.lock().clone();
+        assert_eq!(
+            disconnects,
+            vec![Some(format!(
+                "'http://127.0.0.1:{vpn_port}' closed the grpc stream"
+            ))],
+        );
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_once_when_a_finished_connection_is_dropped() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let vpn_port = server_config.port;
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server(&server_config, callback.clone());
+        let id = connection.id;
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
+        );
+        assert_eq!(0, tracked_connections(&[id]));
+
+        drop(connection);
+
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
+    #[test_log::test]
+    fn test_active_connections_do_not_grow_with_every_reconnect() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+
+        let mut ids = Vec::new();
+
+        for _ in 0..RECONNECT_COUNT {
+            let callback = RecordedCallback::default();
+            let connection = connect_to_test_server(&server_config, callback.clone());
+            ids.push(connection.id);
+
+            assert_eq!(tracked_connections(&ids), 1);
+
+            drop(connection);
+
+            // The entry is dropped together with the event processing task, so
+            // it doesn't disappear immediately.
+            wait_for(|| tracked_connections(&ids) == 0);
+        }
+
+        assert_eq!(tracked_connections(&ids), 0,);
     }
 }

@@ -33,7 +33,7 @@ use tonic::{
 };
 use uuid::Uuid;
 
-pub const SHUTDOWN_REASON: &str = "shutdown";
+pub use ens_core::SHUTDOWN_REASON;
 
 const TEST_APP_VERSION: &str = "tests";
 const CA_COMMON_NAME: &str = "Test CA";
@@ -249,10 +249,10 @@ fn accept_any_authentication(request: Request<()>) -> Result<Request<()>, Status
 pub struct Recording {
     pub notifications: Mutex<Vec<ConnectionErrorNotification>>,
 
-    // Outer Option: whether `disconnected` was called at all.
-    // Inner Option<String>: the reason passed in.
-    #[allow(clippy::option_option)]
-    pub disconnected: Mutex<Option<Option<String>>>,
+    // The reason of every `disconnected` call, in the order they arrived. The
+    // udl documents `disconnected` as called at most once per `Connection`, so
+    // the tests assert on the whole vector and not just on the last entry.
+    pub disconnects: Mutex<Vec<Option<String>>>,
 
     // Simulate `disconnected` being slow
     pub disconnect_delay: Mutex<Duration>,
@@ -277,7 +277,7 @@ impl ErrorNotificationCallback for RecordedCallback {
     fn disconnected(&self, reason: Option<String>) {
         let delay = *self.0.disconnect_delay.lock();
         std::thread::sleep(delay);
-        *self.0.disconnected.lock() = Some(reason);
+        self.0.disconnects.lock().push(reason);
     }
 }
 
@@ -330,7 +330,7 @@ pub fn wait_for(mut predicate: impl FnMut() -> bool) {
 pub fn wait_for_disconnect_reason(callback: &RecordedCallback) -> Option<String> {
     let mut reason = None;
     wait_for(|| {
-        reason = callback.disconnected.lock().clone();
+        reason = callback.disconnects.lock().first().cloned();
         reason.is_some()
     });
     reason.flatten()

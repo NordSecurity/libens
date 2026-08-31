@@ -63,6 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.linking }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup MSVC
         uses: egor-tensin/vs-shell@54e4148eac794e4580591c2e0b7750f14b7891fc # v2.2
         if: ${{ matrix.target_os == 'windows' }}
@@ -123,6 +124,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: cli-${{ matrix.target_os }}-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup MSVC
         uses: egor-tensin/vs-shell@54e4148eac794e4580591c2e0b7750f14b7891fc # v2.2
         if: ${{ matrix.target_os == 'windows' }}

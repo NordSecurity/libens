@@ -11,6 +11,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NIGHTLY_VERSION: "nightly-2025-12-01"
+  COVERAGE_DIR: coverage
+  COVERAGE_ARGS: --all --all-features --exclude ens-cli
 
 permissions:
   contents: read
@@ -85,6 +87,53 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +${{ env.NIGHTLY_VERSION }} install cargo-udeps@0.1.61 --locked
       - run: cargo +${{ env.NIGHTLY_VERSION }} udeps --workspace --locked --output human --backend depinfo
+
+  cargo-llvm-cov:
+    name: cargo llvm-cov
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-26.04
+    outputs:
+      lines: ${{ steps.summary.outputs.lines }}
+    container:
+      image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: llvm-cov-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo install --locked cargo-llvm-cov@0.8.7
+      - name: Compute coverage from unit and integration tests
+        run: cargo llvm-cov ${{ env.COVERAGE_ARGS }} --html --output-dir ${{ env.COVERAGE_DIR }} -- --test-threads 30
+      - name: Print coverage summary
+        id: summary
+        run: |
+          cargo llvm-cov ${{ env.COVERAGE_ARGS }} --no-run | tee "$RUNNER_TEMP/summary.txt"
+          {
+            echo '## Coverage'
+            echo '```'
+            cat "$RUNNER_TEMP/summary.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk '$1 == "TOTAL" { print "::notice title=Coverage::lines " $10 ", regions " $4 ", functions " $7 }' "$RUNNER_TEMP/summary.txt"
+          awk '$1 == "TOTAL" { print "lines=" $10 }' "$RUNNER_TEMP/summary.txt" >> "$GITHUB_OUTPUT"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-html
+          path: ${{ env.COVERAGE_DIR }}/html
+          if-no-files-found: error
+
+  coverage-total:
+    name: total coverage ${{ needs.cargo-llvm-cov.outputs.lines }}
+    needs: cargo-llvm-cov
+    runs-on: ubuntu-26.04
+    steps:
+      - run: echo "${{ needs.cargo-llvm-cov.outputs.lines }}"
 
   cargo-test-linux:
     name: cargo test (linux)

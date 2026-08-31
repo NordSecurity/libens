@@ -9,52 +9,85 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-native:
+  compute-tag:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      build_tag: ${{ steps.tag.outputs.BUILD_TAG }}
+      release_kind: ${{ steps.tag.outputs.RELEASE_KIND }}
+      maven_version: ${{ steps.tag.outputs.MAVEN_VERSION }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - id: tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "${REF_TYPE}" = "tag" ] && printf '%s' "${REF_NAME}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "BUILD_TAG=${REF_NAME}"
+            echo "RELEASE_KIND=release"
+            echo "MAVEN_VERSION=${REF_NAME}"
+          else
+            [ "${REF_NAME}" = "main" ] && NAME=main || NAME=dev
+            DATE=$(git show "${SHA}" -s --date=format:%y%m%d%H%M --format=%cd)
+            echo "BUILD_TAG=${NAME}-${DATE}-${SHA:0:7}"
+            echo "RELEASE_KIND=snapshot"
+            echo "MAVEN_VERSION=${SHA}-SNAPSHOT"
+          fi >> "$GITHUB_OUTPUT"
+
+  bindings:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nordsecurity/uniffi-generators:v0.28.3-4
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Generate bindings
+        run: |
+          uniffi-bindgen generate ./ens.udl --language kotlin --config uniffi.toml --out-dir dist/android/kotlin
+          uniffi-bindgen generate ./ens.udl --language swift  --config uniffi.toml --out-dir dist/apple/Sources
+          uniffi-bindgen-cs ./ens.udl --config uniffi.toml --out-dir dist/windows/cs
+          uniffi-bindgen-go ./ens.udl --config uniffi.toml --out-dir dist/linux/go
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-bindings
+          path: |
+            dist/android/kotlin
+            dist/apple/Sources
+            dist/windows/cs
+            dist/linux/go
+          if-no-files-found: error
+
+  build-linux:
+    needs: compute-tag
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            target_os: windows
-            runner: windows-2022
-            target: x86_64-pc-windows-msvc
-            linking: static
-          - arch: x86_64
-            target_os: windows
-            runner: windows-2022
-            target: x86_64-pc-windows-msvc
-            linking: dynamic
-          - arch: aarch64
-            target_os: windows
-            runner: windows-2022
-            target: aarch64-pc-windows-msvc
-            linking: static
-          - arch: aarch64
-            target_os: windows
-            runner: windows-2022
-            target: aarch64-pc-windows-msvc
-            linking: dynamic
-          - arch: x86_64
-            target_os: linux
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            linking: default
-          - arch: aarch64
-            target_os: linux
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            linking: default
-    runs-on: ${{ matrix.runner }}
+        arch: [x86_64, aarch64]
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+        with:
+          submodules: true
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -62,31 +95,16 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.linking }}
+          key: linux-${{ matrix.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Setup MSVC
-        uses: egor-tensin/vs-shell@54e4148eac794e4580591c2e0b7750f14b7891fc # v2.2
-        if: ${{ matrix.target_os == 'windows' }}
-      - name: Configure Windows RUSTFLAGS (CFG + CRT linking)
-        if: ${{ matrix.target_os == 'windows' }}
-        shell: bash
-        run: |
-          if [ "${{ matrix.linking }}" = "static" ]; then
-            CRT_FLAG="+crt-static"
-          else
-            CRT_FLAG="-crt-static"
-          fi
-          echo "RUSTFLAGS=-C control-flow-guard -C target-feature=$CRT_FLAG $RUSTFLAGS" >> $GITHUB_ENV
       - name: Build libens
-        run: cargo build --release --target ${{ matrix.target }} --lib
-      - name: Upload shared library
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        run: python3 ci/build.py build linux ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: libens-${{ matrix.target_os }}-${{ matrix.arch }}-${{ matrix.linking }}
+          name: libens-linux-${{ matrix.arch }}
           path: |
-            target/${{ matrix.target }}/release/libens.dylib
-            target/${{ matrix.target }}/release/libens.so
-            target/${{ matrix.target }}/release/ens.dll
+            dist/linux/release/${{ matrix.arch }}/libens.so
+            dist/linux/release/${{ matrix.arch }}/libens.so.debug
           if-no-files-found: error
 
   build-cli:
@@ -138,3 +156,165 @@ jobs:
             target/${{ matrix.target }}/release/ens-cli
             target/${{ matrix.target }}/release/ens-cli.exe
           if-no-files-found: error
+
+  build-windows:
+    needs: compute-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        linking: [static, dynamic]
+    runs-on: windows-2022
+    env:
+      LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-${{ matrix.arch }}-${{ matrix.linking }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup MSVC
+        uses: egor-tensin/vs-shell@54e4148eac794e4580591c2e0b7750f14b7891fc # v2.2
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.arch }}-pc-windows-msvc
+      - name: Build libens
+        run: python3 ci/build.py build windows ${{ matrix.arch }} --linking ${{ matrix.linking }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-windows-${{ matrix.arch }}-${{ matrix.linking }}
+          path: |
+            dist/windows/release/${{ matrix.arch }}/ens.dll
+            dist/windows/release/${{ matrix.arch }}/ens.dll.lib
+          if-no-files-found: error
+
+  build-android:
+    needs: compute-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, i686, armv7]
+    runs-on: ubuntu-24.04
+    container: ghcr.io/nordsecurity/build-android-rust1.89.0:v7.2.2
+    env:
+      LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: android-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build libens
+        run: python3 ci/build.py build android ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-android-${{ matrix.arch }}
+          path: dist/android/release
+          if-no-files-found: error
+
+  build-apple:
+    needs: compute-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_os: macos
+            arch: x86_64
+            runner: macos-15-intel
+          - target_os: macos
+            arch: aarch64
+            runner: macos-15
+          - target_os: ios
+            arch: aarch64
+            runner: macos-15
+          - target_os: ios-sim
+            arch: aarch64
+            runner: macos-15
+          - target_os: ios-sim
+            arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target_os }}-${{ matrix.arch }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build libens
+        run: python3 ci/build.py build ${{ matrix.target_os }} ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-apple-${{ matrix.target_os }}-${{ matrix.arch }}
+          path: dist/darwin
+          if-no-files-found: error
+
+  package-xcframework:
+    needs: [bindings, build-apple]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: libens-apple-*
+          merge-multiple: true
+          path: dist/darwin
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libens-bindings
+          path: dist
+      - name: Create fat binaries
+        run: python3 ci/build.py lipo
+      - name: Create xcframework
+        run: python3 ci/build.py xcframework
+      - name: Archive xcframework
+        run: zip -ry libens-apple.zip dist/darwin/libensFFI.xcframework dist/apple
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libens-apple
+          path: libens-apple.zip
+          if-no-files-found: error
+
+  trigger-gitlab:
+    needs: [compute-tag, bindings, build-linux, build-windows, build-android, package-xcframework]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      actions: read
+    uses: NordSecurity/trigger-gitlab-pipeline/.github/workflows/trigger-gitlab-pipeline.yml@9c7058bbe843bb127007f28281fe0b74bcf18ba8
+    secrets:
+      ci-api-v4-url: ${{ secrets.CODEHUB_CI_API_V4_URL }}
+      access-token: ${{ secrets.CODEHUB_GITLAB_API_TOKEN }}
+      trigger-token: ${{ secrets.CODEHUB_TOKEN }}
+      project-id: ${{ secrets.CODEHUB_PROJECT_ID }}
+    with:
+      triggered-ref: master
+      cancel-outdated-pipelines: ${{ github.ref_name != 'main' }}
+      variables: |
+        GITHUB_RUN_ID=${{ github.run_id }}
+        BUILD_TAG=${{ needs.compute-tag.outputs.build_tag }}
+        RELEASE_KIND=${{ needs.compute-tag.outputs.release_kind }}
+        MAVEN_VERSION=${{ needs.compute-tag.outputs.maven_version }}

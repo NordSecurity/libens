@@ -376,30 +376,10 @@ async fn task(
             backoff
         );
 
-        let (authenticated_challenge, nord_vpn_protocol) = match &authentication {
-            ClientAuthentication::Credentials { credentials } => (
-                (
-                    http::header::AUTHORIZATION.as_str(),
-                    credentials.basic_auth()?,
-                ),
-                credentials.kind.protocol_name(),
-            ),
-            ClientAuthentication::Keys { keys } => {
-                let authenticated_challenge = handle_error!(
-                    get_login_challenge(
-                        external_channel.clone(),
-                        keys.vpn_public_key,
-                        keys.local_private_key.clone(),
-                    )
-                    .await,
-                    backoff
-                );
-                (
-                    (AUTHENTICATION_KEY, authenticated_challenge),
-                    keys.kind.protocol_name(),
-                )
-            }
-        };
+        let headers = handle_error!(
+            prepare_connection_headers(&authentication, &external_channel).await,
+            backoff
+        );
 
         debug!(
             "Prepared authentication headers, subscribing to error notifications for '{vpn_uri}'"
@@ -407,7 +387,7 @@ async fn task(
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
-            authentication_interceptor(authenticated_challenge, nord_vpn_protocol),
+            authentication_interceptor(headers),
         );
 
         let connection = handle_error!(
@@ -485,14 +465,12 @@ async fn get_login_challenge(
 }
 
 fn authentication_interceptor(
-    (authentication_header_name, authentication_value): (&'static str, AsciiMetadataValue),
-    nord_vpn_protocol: AsciiMetadataValue,
+    headers: Vec<(&'static str, AsciiMetadataValue)>,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> {
     move |mut req: Request<()>| {
-        req.metadata_mut()
-            .insert(authentication_header_name, authentication_value.clone());
-        req.metadata_mut()
-            .insert(NORD_VPN_PROTOCOL_KEY, nord_vpn_protocol.clone());
+        for (k, v) in &headers {
+            req.metadata_mut().insert(*k, v.clone());
+        }
         Ok(req)
     }
 }
@@ -685,6 +663,34 @@ fn authentication_tag(secret: &SharedSecret, message: &[u8]) -> [u8; 32] {
     *keyed_hash(&key, message).as_bytes()
 }
 
+async fn prepare_connection_headers(
+    authentication: &ClientAuthentication,
+    external_channel: &Channel,
+) -> Result<Vec<(&'static str, AsciiMetadataValue)>, Error> {
+    let res = match &authentication {
+        ClientAuthentication::Credentials { credentials } => vec![
+            (
+                http::header::AUTHORIZATION.as_str(),
+                credentials.basic_auth()?,
+            ),
+            (NORD_VPN_PROTOCOL_KEY, credentials.kind.protocol_name()),
+        ],
+        ClientAuthentication::Keys { keys } => {
+            let authenticated_challenge = get_login_challenge(
+                external_channel.clone(),
+                keys.vpn_public_key,
+                keys.local_private_key.clone(),
+            )
+            .await?;
+
+            vec![
+                (AUTHENTICATION_KEY, authenticated_challenge),
+                (NORD_VPN_PROTOCOL_KEY, keys.kind.protocol_name()),
+            ]
+        }
+    };
+    Ok(res)
+}
 #[cfg(test)]
 pub mod tests {
     use std::{

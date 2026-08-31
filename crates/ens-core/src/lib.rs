@@ -805,6 +805,7 @@ mod tests {
     use log::info;
     use rstest::rstest;
     use std::sync::Once;
+    use telio_crypto::SecretKey;
 
     use super::*;
 
@@ -1125,6 +1126,39 @@ mod tests {
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
+    #[test_log::test]
+    fn test_challenge_rejected_by_server() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let wrong_vpn_public_key = SecretKey::gen().public();
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&wrong_vpn_public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+        );
+        assert!(callback.notifications.lock().is_empty());
+        assert_eq!(0, tracked_connections(&[connection.id]));
     }
 
     #[test_log::test]

@@ -340,12 +340,17 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    fn basic_auth(&self) -> std::result::Result<AsciiMetadataValue, client::Error> {
+    fn validate(&self) -> std::result::Result<(), client::Error> {
         if self.username.contains(':') {
             return Err(client::Error::Internal {
                 reason: "in a http basic auth, username can't contain ':'".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    fn basic_auth(&self) -> std::result::Result<AsciiMetadataValue, client::Error> {
+        self.validate()?;
         // It's important to access `.0` here since the Display of HiddenString will
         // print as '***' (only) in release mode.
         let encoded = STANDARD.encode(format!("{}:{}", self.username.0, self.password.0));
@@ -1092,6 +1097,34 @@ mod tests {
         );
 
         assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
+    }
+
+    #[test_log::test]
+    fn test_connect_fails_when_username_contains_colon() {
+        run_init();
+
+        let auth = TestAuthConfig::new_openvpn();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            Authentication::Credentials {
+                credentials: Credentials {
+                    username: Hidden("user:name".to_owned()),
+                    password: Hidden("password".to_owned()),
+                    kind: CredentialsKind::OpenVPN,
+                },
+            },
+            callback.clone(),
+        );
+
+        assert_matches!(connection, Err(EnsError::InternalError { reason }) if reason.contains("':'"));
     }
 
     #[rstest]

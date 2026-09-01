@@ -262,7 +262,10 @@ impl TryFrom<Authentication> for ClientAuthentication {
 
     fn try_from(value: Authentication) -> Result<Self, Self::Error> {
         match value {
-            Authentication::Credentials { credentials } => Ok(Self::Credentials { credentials }),
+            Authentication::Credentials { credentials } => {
+                credentials.validate()?;
+                Ok(Self::Credentials { credentials })
+            }
             Authentication::Keys { keys } => {
                 let vpn_public_key =
                     keys.vpn_public_key

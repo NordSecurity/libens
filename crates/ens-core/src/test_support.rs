@@ -256,6 +256,8 @@ pub struct Recording {
 
     // Simulate `disconnected` being slow
     pub disconnect_delay: Mutex<Duration>,
+
+    pub notify_delay: Mutex<Duration>,
 }
 
 #[derive(Clone, Default)]
@@ -271,6 +273,8 @@ impl std::ops::Deref for RecordedCallback {
 
 impl ErrorNotificationCallback for RecordedCallback {
     fn notify(&self, notification: ConnectionErrorNotification) {
+        let delay = *self.0.notify_delay.lock();
+        std::thread::sleep(delay);
         self.0.notifications.lock().push(notification);
     }
 
@@ -304,7 +308,15 @@ pub fn connect_to_test_server_with_auth(
     auth: Authentication,
     callback: impl ErrorNotificationCallback + 'static,
 ) -> Result<Arc<Connection>, EnsError> {
-    let config = Config::new();
+    connect_to_test_server_with_config(server_config, auth, callback, Config::new())
+}
+
+pub fn connect_to_test_server_with_config(
+    server_config: &ServerConfig,
+    auth: Authentication,
+    callback: impl ErrorNotificationCallback + 'static,
+    config: Config,
+) -> Result<Arc<Connection>, EnsError> {
     config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
 
     connect(

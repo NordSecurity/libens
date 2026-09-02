@@ -800,8 +800,8 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server_with_auth, wait_for, wait_for_disconnect_reason, Command,
-            RecordedCallback, SHUTDOWN_REASON,
+            connect_to_test_server_with_auth, connect_to_test_server_with_config, wait_for,
+            wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
         },
     };
 
@@ -854,6 +854,10 @@ mod tests {
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
 
     const RECONNECT_COUNT: usize = 5;
+
+    const SINGLE_SLOT_BUFFER: u32 = 1;
+    const NOTIFICATIONS_OVERFLOWING_BUFFER: usize = 3;
+    const SLOW_CALLBACK_DELAY: Duration = Duration::from_millis(500);
 
     fn tracked_connections(ids: &[Uuid]) -> usize {
         let state = STATE.lock();
@@ -1249,6 +1253,49 @@ mod tests {
             vec![Some(format!(
                 "'http://127.0.0.1:{vpn_port}' closed the grpc stream"
             ))],
+        );
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_stream_closes_while_callback_is_slow() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let callback = RecordedCallback::default();
+        *callback.notify_delay.lock() = SLOW_CALLBACK_DELAY;
+
+        let config = Config::new();
+        config.set_buffer_size(SINGLE_SLOT_BUFFER);
+
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: None,
+        };
+        for _ in 0..NOTIFICATIONS_OVERFLOWING_BUFFER {
+            server_config.send_blocking(Command::Send(error.clone()));
+        }
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
         );
     }
 

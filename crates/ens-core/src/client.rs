@@ -312,11 +312,15 @@ impl AuthRejection for Error {
     }
 }
 
-fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
+async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the authentication");
-    if let Err(e) = tx.try_send(Event::Disconnect(Some(reason))) {
+    publish_disconnect(tx, reason).await;
+}
+
+async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
+    if let Err(e) = tx.send(Event::Disconnect(Some(reason))).await {
         warn!("Failed to publish disconnect: {e}");
     }
 }
@@ -351,7 +355,7 @@ async fn task(
                     Ok(v) => v,
                     Err(e) => {
                         if e.is_auth_rejection() {
-                            publish_auth_rejection(&tx, vpn_uri, &e);
+                            publish_auth_rejection(&tx, vpn_uri, &e).await;
                             break 'outer;
                         }
 
@@ -401,41 +405,42 @@ async fn task(
         );
         let mut connection_error_stream = connection.into_inner();
         loop {
-            select! {
+            let connection_error = select! {
                 _ = quit_rx.wait_for(|b| *b) => {
                     info!("ENS monitor for '{vpn_uri}' ends");
                     break 'outer;
                 }
-                connection_error = connection_error_stream.message() => {
-                    warn!("Received error notification for '{vpn_uri}': {connection_error:?}");
-                    match connection_error {
-                        Ok(Some(connection_error)) => {
-                            backoff.reset();
-                            if let Err(e) = tx.try_send(Event::Notification{connection_error, vpn_uri: vpn_uri.to_owned()}) {
-                                warn!("Failed to publish newly received error notification: {e}");
-                            }
-                        }
-                        Ok(None) => {
-                            let msg = format!("'{vpn_uri}' closed the grpc stream");
-                            debug!("{msg}");
-                            if let Err(e) = tx.try_send(Event::Disconnect(Some(msg))) {
-                                warn!("Failed to publish disconnect: {e}");
-                            }
-                            break 'outer;
-                        }
-                        Err(e) if e.is_auth_rejection() => {
-                            publish_auth_rejection(&tx, vpn_uri, &e);
-                            break 'outer;
-                        }
-                        Err(e) => {
-                            // After the first error, the stream will never return any new value, which means
-                            // we need to reconnect. For details, see: https://github.com/hyperium/tonic/blob/c9cc210cb7c6f3f937786a3134c682761a26c65c/tonic/src/codec/decode.rs#L392-L394
-                            error!("GRPC error: {e}");
-                            break;
-                        }
+                connection_error = connection_error_stream.message() => connection_error,
+            };
+
+            warn!("Received error notification for '{vpn_uri}': {connection_error:?}");
+            match connection_error {
+                Ok(Some(connection_error)) => {
+                    backoff.reset();
+                    if let Err(e) = tx.try_send(Event::Notification {
+                        connection_error,
+                        vpn_uri: vpn_uri.to_owned(),
+                    }) {
+                        warn!("Failed to publish newly received error notification: {e}");
                     }
                 }
-            };
+                Ok(None) => {
+                    let msg = format!("'{vpn_uri}' closed the grpc stream");
+                    debug!("{msg}");
+                    publish_disconnect(&tx, msg).await;
+                    break 'outer;
+                }
+                Err(e) if e.is_auth_rejection() => {
+                    publish_auth_rejection(&tx, vpn_uri, &e).await;
+                    break 'outer;
+                }
+                Err(e) => {
+                    // After the first error, the stream will never return any new value, which means
+                    // we need to reconnect. For details, see: https://github.com/hyperium/tonic/blob/c9cc210cb7c6f3f937786a3134c682761a26c65c/tonic/src/codec/decode.rs#L392-L394
+                    error!("GRPC error: {e}");
+                    break;
+                }
+            }
         }
         restart!(&mut backoff);
     }

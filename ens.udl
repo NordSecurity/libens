@@ -87,6 +87,8 @@ dictionary ConnectionErrorNotification {
 callback interface ErrorNotificationCallback {
     /// Delivers a connection-error notification received from the server.
     /// May be called zero or more times over the life of the connection.
+    /// A panic or unhandled exception raised here ends the session, which is
+    /// then reported through `disconnected`.
     void notify(ConnectionErrorNotification notification);
 
     /// Signals that the ENS session has ended and no further `notify`

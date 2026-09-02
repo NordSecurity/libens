@@ -48,7 +48,7 @@ use crate::{
         DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
-    panics::{catch_panic, catch_panic_result},
+    panics::{catch_panic, catch_panic_message, catch_panic_result},
     runtime::{deinit_runtime, get_runtime, init_runtime, is_unexpected_task_failure},
 };
 
@@ -62,6 +62,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Reason reported to `ErrorNotificationCallback::disconnected` when the
 // session was ended by `Connection::shutdown`.
 pub const SHUTDOWN_REASON: &str = "shutdown";
+
+// Prefix of the reason reported to `ErrorNotificationCallback::disconnected`
+// when a panic in `ErrorNotificationCallback::notify` ended the session.
+pub const CALLBACK_PANIC_REASON: &str = "callback panicked";
 
 static STATE: Mutex<Option<GlobalState>> = Mutex::new(None);
 
@@ -570,10 +574,20 @@ async fn connect_impl(
                     }
 
                     debug!("Received new connection error: {connection_error:?} from {vpn_uri:?}");
-                    {
+                    let notified = {
                         let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-                        callback.notify(connection_error.into());
+                        catch_panic_message(|| callback.notify(connection_error.into()))
+                    };
+                    let Err(message) = notified else {
+                        continue;
+                    };
+
+                    let mut state = state_clone.lock();
+                    if !state.is_finished() {
+                        let reason = format!("{CALLBACK_PANIC_REASON}: {message}");
+                        *state = ConnectionState::Ended(Some(reason));
                     }
+                    break;
                 }
                 Some(client::Event::Disconnect(reason)) => {
                     warn!("Got a disconnect with a reason: {reason:?}");
@@ -596,7 +610,7 @@ async fn connect_impl(
         {
             debug!("disconnect after loop end: {reason:?}");
             let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-            callback.disconnected(reason);
+            catch_panic(|| callback.disconnected(reason), ());
         }
 
         debug!("Stopping ENS notification pump");
@@ -801,7 +815,8 @@ mod tests {
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
             connect_to_test_server_with_auth, connect_to_test_server_with_config, wait_for,
-            wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
+            wait_for_disconnect_reason, Command, PanicAt, RecordedCallback, CALLBACK_PANIC_MESSAGE,
+            SHUTDOWN_REASON,
         },
     };
 
@@ -1297,6 +1312,83 @@ mod tests {
             reason,
             format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
         );
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_notify_panics() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let callback = RecordedCallback::default();
+        *callback.panic_at.lock() = PanicAt::Notify;
+
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: None,
+        };
+        server_config.send_blocking(Command::Send(error.clone()));
+        server_config.send_blocking(Command::Send(error));
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(
+            reason,
+            format!("{CALLBACK_PANIC_REASON}: {CALLBACK_PANIC_MESSAGE}")
+        );
+        assert_eq!(callback.notifications.lock().len(), 1);
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
+    #[test_log::test]
+    fn test_shutdown_succeeds_when_disconnected_panics() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let callback = RecordedCallback::default();
+        *callback.panic_at.lock() = PanicAt::Disconnected;
+
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
+        );
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
     }
 
     #[test_log::test]

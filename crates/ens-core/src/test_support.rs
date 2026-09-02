@@ -43,6 +43,7 @@ const ANY_LOCAL_PORT: &str = "127.0.0.1:0";
 const ERROR_STREAM_CHANNEL_SIZE: usize = 1;
 const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub const CALLBACK_PANIC_MESSAGE: &str = "test callback panic";
 
 static INIT: Once = Once::new();
 
@@ -245,6 +246,14 @@ fn accept_any_authentication(request: Request<()>) -> Result<Request<()>, Status
     Ok(request)
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PanicAt {
+    #[default]
+    Never,
+    Notify,
+    Disconnected,
+}
+
 #[derive(Default)]
 pub struct Recording {
     pub notifications: Mutex<Vec<ConnectionErrorNotification>>,
@@ -258,6 +267,8 @@ pub struct Recording {
     pub disconnect_delay: Mutex<Duration>,
 
     pub notify_delay: Mutex<Duration>,
+
+    pub panic_at: Mutex<PanicAt>,
 }
 
 #[derive(Clone, Default)]
@@ -271,17 +282,29 @@ impl std::ops::Deref for RecordedCallback {
     }
 }
 
+impl RecordedCallback {
+    fn panic_if(&self, stage: PanicAt) {
+        let panic_at = *self.0.panic_at.lock();
+        if panic_at != stage {
+            return;
+        }
+        panic!("{CALLBACK_PANIC_MESSAGE}");
+    }
+}
+
 impl ErrorNotificationCallback for RecordedCallback {
     fn notify(&self, notification: ConnectionErrorNotification) {
         let delay = *self.0.notify_delay.lock();
         std::thread::sleep(delay);
         self.0.notifications.lock().push(notification);
+        self.panic_if(PanicAt::Notify);
     }
 
     fn disconnected(&self, reason: Option<String>) {
         let delay = *self.0.disconnect_delay.lock();
         std::thread::sleep(delay);
         self.0.disconnects.lock().push(reason);
+        self.panic_if(PanicAt::Disconnected);
     }
 }
 

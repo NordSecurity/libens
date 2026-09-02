@@ -6,7 +6,14 @@ pub fn catch_panic_result<T, F>(operation: F) -> Result<T, EnsError>
 where
     F: FnOnce() -> Result<T, EnsError>,
 {
-    catch_unwind(AssertUnwindSafe(operation)).map_err(|e| panic_to_error(&*e))?
+    catch_panic_message(operation).map_err(|reason| EnsError::InternalError { reason })?
+}
+
+pub(crate) fn catch_panic_message<T, F>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> T,
+{
+    catch_unwind(AssertUnwindSafe(operation)).map_err(|payload| panic_to_message(&*payload))
 }
 
 pub fn catch_panic<T, F>(operation: F, fallback: T) -> T
@@ -25,10 +32,10 @@ where
     }
 }
 
-fn panic_to_error(payload: &(dyn std::any::Any + Send)) -> EnsError {
+fn panic_to_message(payload: &(dyn std::any::Any + Send)) -> String {
     let reason = panic_payload_to_string(payload);
     log::error!("caught panic across FFI boundary: {reason}");
-    EnsError::InternalError { reason }
+    reason
 }
 
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {

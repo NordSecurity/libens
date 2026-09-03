@@ -5,7 +5,10 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Once},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Once,
+    },
     time::{Duration, Instant},
 };
 
@@ -118,6 +121,7 @@ impl Default for TlsConfig {
 
 struct StubState {
     command_rx: AsyncReceiver<Command>,
+    streams: AtomicUsize,
     challenges: Mutex<HashSet<Uuid>>,
     vpn_server_private_key: SecretKey,
 }
@@ -143,6 +147,7 @@ impl ens_server::Ens for GrpcStub {
         &self,
         _request: Request<ConnectionErrorRequest>,
     ) -> Result<Response<Self::ConnectionErrorsStream>, Status> {
+        self.0.streams.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = channel(ERROR_STREAM_CHANNEL_SIZE);
 
         let command_rx = self.0.command_rx.clone();
@@ -185,9 +190,14 @@ pub struct ServerConfig {
     pub public_key: PublicKey,
     pub command_tx: AsyncSender<Command>,
     pub tls_config: TlsConfig,
+    stub: GrpcStub,
 }
 
 impl ServerConfig {
+    pub fn streams(&self) -> usize {
+        self.stub.0.streams.load(Ordering::SeqCst)
+    }
+
     pub fn send_blocking(&self, command: Command) {
         self.command_tx.send_blocking(command).unwrap();
     }
@@ -217,12 +227,13 @@ pub async fn spawn_server_with_interceptor<I: Interceptor + Clone + Send + Sync 
     let (command_tx, command_rx) = unbounded();
     let stub = GrpcStub(Arc::new(StubState {
         command_rx,
+        streams: AtomicUsize::new(0),
         challenges: Mutex::new(HashSet::default()),
         vpn_server_private_key,
     }));
 
     let ens_service = EnsServer::with_interceptor(stub.clone(), make_interceptor(stub.clone()));
-    let login_service = LoginServer::new(stub);
+    let login_service = LoginServer::new(stub.clone());
 
     let tls_config = TlsConfig::new();
     let tonic_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
@@ -249,6 +260,7 @@ pub async fn spawn_server_with_interceptor<I: Interceptor + Clone + Send + Sync 
         public_key,
         command_tx,
         tls_config,
+        stub,
     }
 }
 

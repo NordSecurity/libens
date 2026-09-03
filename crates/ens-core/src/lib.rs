@@ -827,6 +827,7 @@ mod tests {
     use std::sync::Once;
     use std::time::Instant;
     use telio_crypto::SecretKey;
+    use tonic::{Code, Status};
 
     use super::*;
 
@@ -875,6 +876,10 @@ mod tests {
     const OUTAGE_DURATION: Duration = Duration::from_secs(3);
     const RECONNECT_DEADLINE: Duration = Duration::from_secs(BACKOFF_SECONDS as u64 * 2);
     const RESEND_INTERVAL: Duration = Duration::from_millis(500);
+
+    const MAINTENANCE_INFO: &str = "planned maintenance";
+    const REJECTION_MESSAGE: &str = "token revoked";
+    const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 
     const RECONNECT_COUNT: usize = 5;
 
@@ -1605,5 +1610,51 @@ mod tests {
             *callback.disconnects.lock(),
             vec![Some(SHUTDOWN_REASON.to_owned())]
         );
+    }
+
+    #[rstest]
+    #[case::unauthenticated(Code::Unauthenticated)]
+    #[case::permission_denied(Code::PermissionDenied)]
+    #[test_log::test]
+    fn test_auth_rejection_mid_stream_ends_the_session(#[case] code: Code) {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+        assert_eq!(server_config.streams(), 1);
+
+        server_config.send_blocking(Command::Error(Status::new(code, REJECTION_MESSAGE)));
+        wait_for(|| !callback.disconnects.lock().is_empty());
+
+        let vpn_port = server_config.port;
+        assert_eq!(
+            *callback.disconnects.lock(),
+            vec![Some(format!(
+                "'http://127.0.0.1:{vpn_port}' rejected the authentication"
+            ))]
+        );
+
+        std::thread::sleep(RECONNECT_WINDOW);
+        assert_eq!(server_config.streams(), 1);
+
+        connection.shutdown().unwrap();
+        assert_eq!(callback.disconnects.lock().len(), 1);
+        assert_eq!(callback.notifications.lock().len(), 1);
     }
 }

@@ -814,9 +814,9 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server_with_auth, connect_to_test_server_with_config, wait_for,
-            wait_for_disconnect_reason, Command, PanicAt, RecordedCallback, CALLBACK_PANIC_MESSAGE,
-            SHUTDOWN_REASON,
+            connect_to_port, connect_to_test_server_with_auth, connect_to_test_server_with_config,
+            spawn_server, wait_for, wait_for_disconnect_reason, Command, PanicAt, RecordedCallback,
+            RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
         },
     };
 
@@ -825,6 +825,7 @@ mod tests {
     use log::info;
     use rstest::rstest;
     use std::sync::Once;
+    use std::time::Instant;
     use telio_crypto::SecretKey;
 
     use super::*;
@@ -867,6 +868,13 @@ mod tests {
     }
 
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
+
+    const BEFORE_OUTAGE: &str = "before the outage";
+    const AFTER_OUTAGE: &str = "after the outage";
+    const BACKOFF_SECONDS: u32 = 1;
+    const OUTAGE_DURATION: Duration = Duration::from_secs(3);
+    const RECONNECT_DEADLINE: Duration = Duration::from_secs(BACKOFF_SECONDS as u64 * 2);
+    const RESEND_INTERVAL: Duration = Duration::from_millis(500);
 
     const RECONNECT_COUNT: usize = 5;
 
@@ -1521,6 +1529,81 @@ mod tests {
         assert_eq!(
             expected_errors,
             second_callback.notifications.lock().as_slice()
+        );
+    }
+
+    fn maintenance(info: &str) -> Command {
+        Command::Send(ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: Some(info.to_owned()),
+        })
+    }
+
+    fn received(callback: &RecordedCallback, info: &str) -> bool {
+        callback
+            .notifications
+            .lock()
+            .iter()
+            .any(|n| n.additional_info.as_deref() == Some(info))
+    }
+
+    fn test_auth(server_config: &ServerConfig) -> Authentication {
+        Authentication::Keys {
+            keys: Keys {
+                local_private_key: Hidden(SecretKey::gen().to_vec()),
+                vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                kind: KeyKind::NordLynx,
+            },
+        }
+    }
+
+    #[test_log::test]
+    fn test_reconnects_after_server_outage() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+        let relay = runtime.block_on(TcpRelay::spawn(server_config.port));
+
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_port(
+            relay.port,
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(BEFORE_OUTAGE));
+        wait_for(|| received(&callback, BEFORE_OUTAGE));
+
+        relay.set_mode(RelayMode::Refuse);
+        std::thread::sleep(OUTAGE_DURATION);
+
+        assert!(callback.disconnects.lock().is_empty());
+        assert_eq!(callback.notifications.lock().len(), 1);
+
+        relay.set_mode(RelayMode::Forward);
+
+        let deadline = Instant::now() + RECONNECT_DEADLINE;
+        while !received(&callback, AFTER_OUTAGE) {
+            assert!(Instant::now() < deadline);
+            server_config.send_blocking(maintenance(AFTER_OUTAGE));
+            std::thread::sleep(RESEND_INTERVAL);
+        }
+
+        assert!(callback.disconnects.lock().is_empty());
+
+        connection.shutdown().unwrap();
+        wait_for(|| !callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
         );
     }
 }

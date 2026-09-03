@@ -25,7 +25,15 @@ use rcgen::{
     KeyPair, SanType,
 };
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
-use tokio::{net::TcpListener, sync::mpsc::channel};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    select,
+    sync::{mpsc::channel, watch},
+};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{
     service::Interceptor,
@@ -41,6 +49,7 @@ const CA_COMMON_NAME: &str = "Test CA";
 const CA_ORGANIZATION_NAME: &str = "Test Org";
 const LOCALHOST: &str = "localhost";
 const ANY_LOCAL_PORT: &str = "127.0.0.1:0";
+const RELAY_BUFFER_SIZE: usize = 4096;
 const ERROR_STREAM_CHANNEL_SIZE: usize = 1;
 const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -247,6 +256,111 @@ fn accept_any_authentication(request: Request<()>) -> Result<Request<()>, Status
     Ok(request)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayMode {
+    Forward,
+
+    // Connections accepted before the switch stay open but carry no traffic.
+    // Connections accepted afterwards forward normally.
+    Silent,
+
+    Refuse,
+}
+
+pub struct TcpRelay {
+    pub port: u16,
+    mode_tx: watch::Sender<RelayMode>,
+}
+
+impl TcpRelay {
+    pub async fn spawn(server_port: u16) -> Self {
+        let listener = TcpListener::bind(ANY_LOCAL_PORT).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (mode_tx, mode_rx) = watch::channel(RelayMode::Forward);
+
+        tokio::spawn(relay_loop(listener, addr, server_port, mode_rx));
+
+        Self {
+            port: addr.port(),
+            mode_tx,
+        }
+    }
+
+    pub fn set_mode(&self, mode: RelayMode) {
+        self.mode_tx.send(mode).unwrap();
+    }
+}
+
+async fn relay_loop(
+    mut listener: TcpListener,
+    addr: SocketAddr,
+    server_port: u16,
+    mut mode_rx: watch::Receiver<RelayMode>,
+) {
+    loop {
+        loop {
+            let client = select! {
+                accepted = listener.accept() => accepted.unwrap().0,
+                _ = mode_rx.wait_for(|m| *m == RelayMode::Refuse) => break,
+            };
+            let server = TcpStream::connect((Ipv4Addr::LOCALHOST, server_port))
+                .await
+                .unwrap();
+            let mode_at_accept = *mode_rx.borrow();
+
+            let (client_rx, client_tx) = client.into_split();
+            let (server_rx, server_tx) = server.into_split();
+            tokio::spawn(run_pipe(
+                server_rx,
+                client_tx,
+                mode_at_accept,
+                mode_rx.clone(),
+            ));
+            tokio::spawn(run_pipe(
+                client_rx,
+                server_tx,
+                mode_at_accept,
+                mode_rx.clone(),
+            ));
+        }
+
+        drop(listener);
+        if mode_rx.wait_for(|m| *m != RelayMode::Refuse).await.is_err() {
+            return;
+        }
+        listener = TcpListener::bind(addr).await.unwrap();
+    }
+}
+
+async fn run_pipe(
+    mut rx: OwnedReadHalf,
+    mut tx: OwnedWriteHalf,
+    mode_at_accept: RelayMode,
+    mut mode_rx: watch::Receiver<RelayMode>,
+) {
+    let mut buf = [0u8; RELAY_BUFFER_SIZE];
+    loop {
+        let read = select! {
+            read = rx.read(&mut buf) => read,
+            _ = mode_rx.wait_for(|m| *m == RelayMode::Refuse) => break,
+        };
+        let n = match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        let silenced =
+            mode_at_accept == RelayMode::Forward && *mode_rx.borrow() == RelayMode::Silent;
+        if silenced {
+            continue;
+        }
+
+        if tx.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum PanicAt {
     #[default]
@@ -341,10 +455,20 @@ pub fn connect_to_test_server_with_config(
     callback: impl ErrorNotificationCallback + 'static,
     config: Config,
 ) -> Result<Arc<Connection>, EnsError> {
+    connect_to_port(server_config.port, server_config, auth, callback, config)
+}
+
+pub fn connect_to_port(
+    port: u16,
+    server_config: &ServerConfig,
+    auth: Authentication,
+    callback: impl ErrorNotificationCallback + 'static,
+    config: Config,
+) -> Result<Arc<Connection>, EnsError> {
     config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
 
     connect(
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_config.port)),
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
         None,
         auth,
         Box::new(callback),

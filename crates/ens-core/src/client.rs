@@ -703,10 +703,7 @@ async fn prepare_connection_headers(
 pub mod tests {
     use std::{
         net::Ipv4Addr,
-        sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            LazyLock,
-        },
+        sync::{atomic::AtomicUsize, LazyLock},
         time::{Duration, Instant},
     };
 
@@ -729,7 +726,10 @@ pub mod tests {
     use tonic::service::Interceptor;
 
     use crate::{
-        test_support::{spawn_server_with_interceptor, Command, GrpcStub, ServerConfig, TlsConfig},
+        test_support::{
+            spawn_server_with_interceptor, Command, GrpcStub, RelayMode, ServerConfig, TcpRelay,
+            TlsConfig,
+        },
         CredentialsKind, Keys, STATE,
     };
 
@@ -966,88 +966,6 @@ pub mod tests {
         }
     }
 
-    struct TcpRelay {
-        port: u16,
-
-        // After setting to true, all **existing** connections become silent (sockets stay open,
-        // but no traffic is forwarded).
-        silent: Arc<AtomicBool>,
-    }
-
-    impl TcpRelay {
-        async fn spawn(server_port: u16) -> Self {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let silent = Arc::new(AtomicBool::new(false));
-
-            tokio::spawn({
-                let silent = silent.clone();
-                async move {
-                    while let Ok((client, _)) = listener.accept().await {
-                        let connected_before_silent = !silent.load(Ordering::Relaxed);
-                        let server = tokio::net::TcpStream::connect(("127.0.0.1", server_port))
-                            .await
-                            .unwrap();
-                        let (mut client_rx, mut client_tx) = client.into_split();
-                        let (mut server_rx, mut server_tx) = server.into_split();
-
-                        // server -> client
-                        tokio::spawn({
-                            let silent = silent.clone();
-                            async move {
-                                let mut buf = [0u8; 4096];
-                                loop {
-                                    match server_rx.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            if connected_before_silent
-                                                && silent.load(Ordering::Relaxed)
-                                            {
-                                                continue;
-                                            }
-                                            if client_tx.write_all(&buf[..n]).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                        // client -> server
-                        tokio::spawn({
-                            let silent = silent.clone();
-                            async move {
-                                let mut buf = [0u8; 4096];
-                                loop {
-                                    match client_rx.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            // Keep draining the client, just never let anything
-                                            // through - a silent server still reads its socket.
-                                            if connected_before_silent
-                                                && silent.load(Ordering::Relaxed)
-                                            {
-                                                continue;
-                                            }
-                                            if server_tx.write_all(&buf[..n]).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            });
-
-            Self { port, silent }
-        }
-    }
-
     fn client_authentication(
         client_private_key: &SecretKey,
         vpn_public_key: PublicKey,
@@ -1117,7 +1035,7 @@ pub mod tests {
             Some("before the silence")
         );
 
-        relay.silent.store(true, Ordering::Relaxed);
+        relay.set_mode(RelayMode::Silent);
         info!("server has gone silent, the client should give up on the connection and reconnect");
 
         // We have no way to know when exactly the tonic/hyper reconnects. Which means
@@ -1204,7 +1122,7 @@ pub mod tests {
             Some("before the silence")
         );
 
-        relay.silent.store(true, Ordering::Relaxed);
+        relay.set_mode(RelayMode::Silent);
         info!("server has gone silent, but without the keepalives the client will not notice");
 
         let next_notification = timeout(Duration::from_secs(30), async {

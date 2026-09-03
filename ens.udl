@@ -267,8 +267,8 @@ namespace ens {
     /// replaced with dots in release builds. Can be called before `init` to
     /// enable logging output during initialisation.
     ///
-    /// Replaces any previously registered log callback. Passing a new
-    /// callback drops the previous one.
+    /// Can be called once per process. A second call fails with
+    /// `InternalError` and keeps the first callback.
     [Throws=EnsError]
     void set_log_callback(LogLevel max_level, LogCallback callback);
 

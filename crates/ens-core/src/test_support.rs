@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
 #![allow(clippy::unnecessary_wraps)]
 
 use std::{
@@ -11,7 +12,7 @@ use std::{
 use async_channel::{unbounded, Receiver as AsyncReceiver, Sender as AsyncSender};
 use ens_core::{
     connect, Authentication, Config, Connection, ConnectionErrorNotification, EnsError,
-    ErrorNotificationCallback, Hidden, KeyKind, Keys,
+    ErrorNotificationCallback, Hidden, KeyKind, Keys, LogCallback, LogLevel,
 };
 use llt_proto::ens::{
     ens_server::{self, EnsServer},
@@ -371,4 +372,25 @@ pub fn wait_for_disconnect_reason(callback: &RecordedCallback) -> Option<String>
         reason.is_some()
     });
     reason.flatten()
+}
+
+pub type LogEntry = (LogLevel, String);
+
+#[derive(Clone, Default)]
+pub struct RecordedLogCallback(Arc<Mutex<Vec<LogEntry>>>);
+
+impl RecordedLogCallback {
+    pub fn entries(&self) -> Vec<LogEntry> {
+        self.0.lock().clone()
+    }
+
+    pub fn received(&self, text: &str) -> bool {
+        self.entries().iter().any(|(_, m)| m.contains(text))
+    }
+}
+
+impl LogCallback for RecordedLogCallback {
+    fn log(&self, log_level: LogLevel, message: String) {
+        self.0.lock().push((log_level, message));
+    }
 }

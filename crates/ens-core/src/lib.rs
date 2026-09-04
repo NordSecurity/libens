@@ -814,9 +814,10 @@ mod tests {
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_port, connect_to_test_server_with_auth, connect_to_test_server_with_config,
-            spawn_server, wait_for, wait_for_disconnect_reason, Command, PanicAt, RecordedCallback,
-            RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
+            connect_to_port, connect_to_test_server, connect_to_test_server_with_auth,
+            connect_to_test_server_with_config, spawn_server, wait_for, wait_for_disconnect_reason,
+            Command, PanicAt, RecordedCallback, RelayMode, ServerConfig, TcpRelay,
+            CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
         },
     };
 
@@ -880,6 +881,10 @@ mod tests {
     const MAINTENANCE_INFO: &str = "planned maintenance";
     const REJECTION_MESSAGE: &str = "token revoked";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+
+    const OLD_SERVER_INFO: &str = "bar";
+    const NEW_SERVER_INFO: &str = "baz";
+    const NEW_SERVER_INFO_2: &str = "quux";
 
     const RECONNECT_COUNT: usize = 5;
 
@@ -1656,5 +1661,122 @@ mod tests {
         connection.shutdown().unwrap();
         assert_eq!(callback.disconnects.lock().len(), 1);
         assert_eq!(callback.notifications.lock().len(), 1);
+    }
+
+    fn error(code: EnsProtoError, info: &str) -> Command {
+        Command::Send(ConnectionError {
+            code: code as i32,
+            additional_info: Some(info.to_owned()),
+        })
+    }
+
+    fn infos(callback: &RecordedCallback) -> Vec<Option<String>> {
+        callback
+            .notifications
+            .lock()
+            .iter()
+            .map(|n| n.additional_info.clone())
+            .collect()
+    }
+
+    // Mirrors the RFC flow: on maintenance the app opens a session to the next
+    // server from inside `notify`, on the pump thread of the current session.
+    struct MovingCallback {
+        own: RecordedCallback,
+        next_server: Arc<ServerConfig>,
+        next_callback: RecordedCallback,
+        next_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    }
+
+    impl ErrorNotificationCallback for MovingCallback {
+        fn notify(&self, notification: ConnectionErrorNotification) {
+            if notification.kind == ConnectionErrorNotificationKind::ServerMaintenance {
+                let next = connect_to_test_server(&self.next_server, self.next_callback.clone());
+                *self.next_connection.lock() = Some(next);
+            }
+            self.own.notify(notification);
+        }
+
+        fn disconnected(&self, reason: Option<String>) {
+            self.own.disconnected(reason);
+        }
+    }
+
+    #[test_log::test]
+    fn test_connect_from_inside_notify() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let old_server = runtime.block_on(spawn_server());
+        let new_server = Arc::new(runtime.block_on(spawn_server()));
+
+        let old_callback = RecordedCallback::default();
+        let new_callback = RecordedCallback::default();
+        let next_connection = Arc::new(Mutex::new(None));
+        let moving = MovingCallback {
+            own: old_callback.clone(),
+            next_server: new_server.clone(),
+            next_callback: new_callback.clone(),
+            next_connection: next_connection.clone(),
+        };
+
+        let old = connect_to_test_server(&old_server, moving);
+
+        old_server.send_blocking(error(EnsProtoError::ServerMaintenance, MAINTENANCE_INFO));
+        wait_for(|| !old_callback.notifications.lock().is_empty());
+        assert_eq!(
+            infos(&old_callback),
+            vec![Some(MAINTENANCE_INFO.to_owned())]
+        );
+
+        new_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            NEW_SERVER_INFO,
+        ));
+        wait_for(|| !new_callback.notifications.lock().is_empty());
+        assert_eq!(infos(&new_callback), vec![Some(NEW_SERVER_INFO.to_owned())]);
+
+        old_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            OLD_SERVER_INFO,
+        ));
+        wait_for(|| old_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            infos(&old_callback),
+            vec![
+                Some(MAINTENANCE_INFO.to_owned()),
+                Some(OLD_SERVER_INFO.to_owned())
+            ]
+        );
+        assert_eq!(infos(&new_callback), vec![Some(NEW_SERVER_INFO.to_owned())]);
+
+        old.shutdown().unwrap();
+        wait_for(|| !old_callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *old_callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+        assert!(new_callback.disconnects.lock().is_empty());
+
+        new_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            NEW_SERVER_INFO_2,
+        ));
+        wait_for(|| new_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            infos(&new_callback),
+            vec![
+                Some(NEW_SERVER_INFO.to_owned()),
+                Some(NEW_SERVER_INFO_2.to_owned())
+            ]
+        );
+
+        let new = next_connection.lock().take().unwrap();
+        new.shutdown().unwrap();
+        wait_for(|| !new_callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *new_callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
     }
 }

@@ -33,7 +33,7 @@ fn create_winres(version: &str) -> Result<(), Box<dyn Error>> {
         let (minor, parse) = parse.split_once('.')?;
         let minor: u16 = minor.parse().ok()?;
 
-        let patch: u16 = parse.parse().ok()?;
+        let patch: u16 = parse.split(['-', '+']).next()?.parse().ok()?;
 
         Some([major, minor, patch])
     }

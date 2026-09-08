@@ -815,9 +815,9 @@ mod tests {
         client::tests::{closed_reason, global_user_agent, spawn_authenticating_server},
         test_support::{
             connect_to_port, connect_to_test_server, connect_to_test_server_with_auth,
-            connect_to_test_server_with_config, spawn_server, wait_for, wait_for_disconnect_reason,
-            Command, PanicAt, RecordedCallback, RelayMode, ServerConfig, TcpRelay,
-            CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
+            connect_to_test_server_with_config, error, maintenance, spawn_server, test_auth,
+            wait_for, wait_for_disconnect_reason, Command, PanicAt, RecordedCallback, RelayMode,
+            ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
         },
     };
 
@@ -1525,29 +1525,12 @@ mod tests {
         );
     }
 
-    fn maintenance(info: &str) -> Command {
-        Command::Send(ConnectionError {
-            code: EnsProtoError::ServerMaintenance as i32,
-            additional_info: Some(info.to_owned()),
-        })
-    }
-
     fn received(callback: &RecordedCallback, info: &str) -> bool {
         callback
             .notifications
             .lock()
             .iter()
             .any(|n| n.additional_info.as_deref() == Some(info))
-    }
-
-    fn test_auth(server_config: &ServerConfig) -> Authentication {
-        Authentication::Keys {
-            keys: Keys {
-                local_private_key: Hidden(SecretKey::gen().to_vec()),
-                vpn_public_key: Hidden(server_config.public_key.to_vec()),
-                kind: KeyKind::NordLynx,
-            },
-        }
     }
 
     #[test_log::test]
@@ -1646,22 +1629,6 @@ mod tests {
         assert_eq!(callback.notifications.lock().len(), 1);
     }
 
-    fn error(code: EnsProtoError, info: &str) -> Command {
-        Command::Send(ConnectionError {
-            code: code as i32,
-            additional_info: Some(info.to_owned()),
-        })
-    }
-
-    fn infos(callback: &RecordedCallback) -> Vec<Option<String>> {
-        callback
-            .notifications
-            .lock()
-            .iter()
-            .map(|n| n.additional_info.clone())
-            .collect()
-    }
-
     // Mirrors the RFC flow: on maintenance the app opens a session to the next
     // server from inside `notify`, on the pump thread of the current session.
     struct MovingCallback {
@@ -1708,7 +1675,7 @@ mod tests {
         old_server.send_blocking(error(EnsProtoError::ServerMaintenance, MAINTENANCE_INFO));
         wait_for(|| !old_callback.notifications.lock().is_empty());
         assert_eq!(
-            infos(&old_callback),
+            old_callback.infos(),
             vec![Some(MAINTENANCE_INFO.to_owned())]
         );
 
@@ -1717,7 +1684,7 @@ mod tests {
             NEW_SERVER_INFO,
         ));
         wait_for(|| !new_callback.notifications.lock().is_empty());
-        assert_eq!(infos(&new_callback), vec![Some(NEW_SERVER_INFO.to_owned())]);
+        assert_eq!(new_callback.infos(), vec![Some(NEW_SERVER_INFO.to_owned())]);
 
         old_server.send_blocking(error(
             EnsProtoError::ConnectionLimitReached,
@@ -1725,13 +1692,13 @@ mod tests {
         ));
         wait_for(|| old_callback.notifications.lock().len() == 2);
         assert_eq!(
-            infos(&old_callback),
+            old_callback.infos(),
             vec![
                 Some(MAINTENANCE_INFO.to_owned()),
                 Some(OLD_SERVER_INFO.to_owned())
             ]
         );
-        assert_eq!(infos(&new_callback), vec![Some(NEW_SERVER_INFO.to_owned())]);
+        assert_eq!(new_callback.infos(), vec![Some(NEW_SERVER_INFO.to_owned())]);
 
         old.shutdown().unwrap();
         wait_for(|| !old_callback.disconnects.lock().is_empty());
@@ -1747,7 +1714,7 @@ mod tests {
         ));
         wait_for(|| new_callback.notifications.lock().len() == 2);
         assert_eq!(
-            infos(&new_callback),
+            new_callback.infos(),
             vec![
                 Some(NEW_SERVER_INFO.to_owned()),
                 Some(NEW_SERVER_INFO_2.to_owned())

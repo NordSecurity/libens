@@ -21,6 +21,7 @@ use llt_proto::ens::{
     ens_server::{self, EnsServer},
     login_server::{self, LoginServer},
     ChallengeRequest, ChallengeResponse, ConnectionError, ConnectionErrorRequest,
+    Error as EnsProtoError,
 };
 use parking_lot::Mutex;
 use rcgen::{
@@ -410,6 +411,15 @@ impl std::ops::Deref for RecordedCallback {
 }
 
 impl RecordedCallback {
+    pub fn infos(&self) -> Vec<Option<String>> {
+        self.0
+            .notifications
+            .lock()
+            .iter()
+            .map(|n| n.additional_info.clone())
+            .collect()
+    }
+
     fn panic_if(&self, stage: PanicAt) {
         let panic_at = *self.0.panic_at.lock();
         if panic_at != stage {
@@ -435,22 +445,32 @@ impl ErrorNotificationCallback for RecordedCallback {
     }
 }
 
+pub fn test_auth(server_config: &ServerConfig) -> Authentication {
+    Authentication::WithKeys {
+        keys: Keys {
+            local_private_key: Hidden(SecretKey::gen().to_vec()),
+            vpn_public_key: Hidden(server_config.public_key.to_vec()),
+            kind: KeyKind::NordLynx,
+        },
+    }
+}
+
+pub fn error(code: EnsProtoError, info: &str) -> Command {
+    Command::Send(ConnectionError {
+        code: code as i32,
+        additional_info: Some(info.to_owned()),
+    })
+}
+
+pub fn maintenance(info: &str) -> Command {
+    error(EnsProtoError::ServerMaintenance, info)
+}
+
 pub fn connect_to_test_server(
     server_config: &ServerConfig,
     callback: impl ErrorNotificationCallback + 'static,
 ) -> Arc<Connection> {
-    connect_to_test_server_with_auth(
-        server_config,
-        Authentication::WithKeys {
-            keys: Keys {
-                local_private_key: Hidden(SecretKey::gen().to_vec()),
-                vpn_public_key: Hidden(server_config.public_key.to_vec()),
-                kind: KeyKind::NordLynx,
-            },
-        },
-        callback,
-    )
-    .unwrap()
+    connect_to_test_server_with_auth(server_config, test_auth(server_config), callback).unwrap()
 }
 
 pub fn connect_to_test_server_with_auth(

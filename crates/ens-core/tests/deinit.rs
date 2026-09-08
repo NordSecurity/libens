@@ -5,32 +5,19 @@ use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use ens_core::{
-    deinit, get_memory_usage, get_version, init, Authentication, Connection,
-    ConnectionErrorNotification, ConnectionErrorNotificationKind, EnsError, Hidden, KeyKind, Keys,
+    deinit, get_memory_usage, get_version, init, Connection, ConnectionErrorNotification,
+    ConnectionErrorNotificationKind, EnsError,
 };
 use llt_proto::ens::{ConnectionError, Error as EnsProtoError};
-use telio_crypto::SecretKey;
 use tokio::runtime::Runtime;
 
 use test_support::{
-    connect_to_test_server, run_init, spawn_server, wait_for, Command, RecordedCallback,
-    ServerConfig, SHUTDOWN_REASON,
+    connect_to_test_server, connect_to_test_server_with_auth, run_init, spawn_server, test_auth,
+    wait_for, Command, RecordedCallback, ServerConfig, SHUTDOWN_REASON,
 };
-
-use crate::test_support::connect_to_test_server_with_auth;
 
 const APP_VERSION: &str = "deinit-tests";
 const MAINTENANCE_INFO: &str = "planned maintenance";
-
-fn test_auth(server_config: &ServerConfig) -> Authentication {
-    Authentication::WithKeys {
-        keys: Keys {
-            local_private_key: Hidden(SecretKey::gen().to_vec()),
-            vpn_public_key: Hidden(server_config.public_key.to_vec()),
-            kind: KeyKind::NordLynx,
-        },
-    }
-}
 
 fn connect_and_await_first_notification(
     server_config: &ServerConfig,

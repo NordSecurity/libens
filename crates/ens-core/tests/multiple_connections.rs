@@ -4,11 +4,10 @@ mod test_support;
 use std::sync::Arc;
 
 use ens_core::{deinit, Connection};
-use llt_proto::ens::{ConnectionError, Error as EnsProtoError};
 use tokio::runtime::Runtime;
 
 use test_support::{
-    connect_to_test_server, run_init, spawn_server, wait_for, Command, RecordedCallback,
+    connect_to_test_server, maintenance, run_init, spawn_server, wait_for, RecordedCallback,
     ServerConfig, SHUTDOWN_REASON,
 };
 
@@ -16,22 +15,6 @@ const FIRST: &str = "first";
 const SECOND: &str = "second";
 const THIRD: &str = "third";
 const SECOND_AGAIN: &str = "second again";
-
-fn maintenance(info: &str) -> Command {
-    Command::Send(ConnectionError {
-        code: EnsProtoError::ServerMaintenance as i32,
-        additional_info: Some(info.to_owned()),
-    })
-}
-
-fn infos(callback: &RecordedCallback) -> Vec<Option<String>> {
-    callback
-        .notifications
-        .lock()
-        .iter()
-        .map(|n| n.additional_info.clone())
-        .collect()
-}
 
 fn connect_and_notify(server: &ServerConfig, info: &str) -> (Arc<Connection>, RecordedCallback) {
     let callback = RecordedCallback::default();
@@ -56,9 +39,9 @@ fn multiple_connections_at_the_same_time() {
     let (_second, second_callback) = connect_and_notify(&second_server, SECOND);
     let (_third, third_callback) = connect_and_notify(&third_server, THIRD);
 
-    assert_eq!(infos(&first_callback), vec![Some(FIRST.to_owned())]);
-    assert_eq!(infos(&second_callback), vec![Some(SECOND.to_owned())]);
-    assert_eq!(infos(&third_callback), vec![Some(THIRD.to_owned())]);
+    assert_eq!(first_callback.infos(), vec![Some(FIRST.to_owned())]);
+    assert_eq!(second_callback.infos(), vec![Some(SECOND.to_owned())]);
+    assert_eq!(third_callback.infos(), vec![Some(THIRD.to_owned())]);
 
     first.shutdown().unwrap();
     wait_for(|| !first_callback.disconnects.lock().is_empty());
@@ -72,11 +55,11 @@ fn multiple_connections_at_the_same_time() {
     second_server.send_blocking(maintenance(SECOND_AGAIN));
     wait_for(|| second_callback.notifications.lock().len() == 2);
     assert_eq!(
-        infos(&second_callback),
+        second_callback.infos(),
         vec![Some(SECOND.to_owned()), Some(SECOND_AGAIN.to_owned())]
     );
-    assert_eq!(infos(&first_callback), vec![Some(FIRST.to_owned())]);
-    assert_eq!(infos(&third_callback), vec![Some(THIRD.to_owned())]);
+    assert_eq!(first_callback.infos(), vec![Some(FIRST.to_owned())]);
+    assert_eq!(third_callback.infos(), vec![Some(THIRD.to_owned())]);
 
     deinit().unwrap();
     wait_for(|| {

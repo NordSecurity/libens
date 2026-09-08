@@ -153,6 +153,24 @@ jobs:
       - run: cargo build --all
       - run: cargo test --all --all-features -- --nocapture --test-threads 30
 
+  cargo-test-release:
+    name: cargo test (release)
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-26.04
+    container:
+      image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-release-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --all
+      - run: cargo test --release --all --all-features -- --nocapture --test-threads 30
+
   cargo-test-windows:
     name: cargo test (windows)
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository

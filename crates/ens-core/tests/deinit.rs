@@ -5,26 +5,30 @@ use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use ens_core::{
-    deinit, get_memory_usage, get_version, init, Connection, ConnectionErrorNotification,
-    ConnectionErrorNotificationKind, EnsError, Hidden, KeyKind, Keys,
+    deinit, get_memory_usage, get_version, init, Authentication, Connection,
+    ConnectionErrorNotification, ConnectionErrorNotificationKind, EnsError, Hidden, KeyKind, Keys,
 };
 use llt_proto::ens::{ConnectionError, Error as EnsProtoError};
 use telio_crypto::SecretKey;
 use tokio::runtime::Runtime;
 
 use test_support::{
-    connect_to_test_server, connect_to_test_server_with_keys, run_init, spawn_server, wait_for,
-    Command, RecordedCallback, ServerConfig, SHUTDOWN_REASON,
+    connect_to_test_server, run_init, spawn_server, wait_for, Command, RecordedCallback,
+    ServerConfig, SHUTDOWN_REASON,
 };
+
+use crate::test_support::connect_to_test_server_with_auth;
 
 const APP_VERSION: &str = "deinit-tests";
 const MAINTENANCE_INFO: &str = "planned maintenance";
 
-fn test_keys(server_config: &ServerConfig) -> Keys {
-    Keys {
-        local_private_key: Hidden(SecretKey::gen().to_vec()),
-        vpn_public_key: Hidden(server_config.public_key.to_vec()),
-        kind: KeyKind::NordLynx,
+fn test_auth(server_config: &ServerConfig) -> Authentication {
+    Authentication::Keys {
+        keys: Keys {
+            local_private_key: Hidden(SecretKey::gen().to_vec()),
+            vpn_public_key: Hidden(server_config.public_key.to_vec()),
+            kind: KeyKind::NordLynx,
+        },
     }
 }
 
@@ -75,9 +79,9 @@ fn nothing_works_after_deinit() {
     let rejected_callback = RecordedCallback::default();
 
     assert_matches!(
-        connect_to_test_server_with_keys(
+        connect_to_test_server_with_auth(
             &second_server,
-            test_keys(&second_server),
+            test_auth(&second_server),
             rejected_callback.clone()
         ),
         Err(EnsError::NotInitialized { .. })

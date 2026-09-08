@@ -17,6 +17,7 @@ extern crate self as ens_core;
 #[cfg(test)]
 mod test_support;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use http::{header::InvalidHeaderValue, HeaderValue};
 use llt_proto::ens::ConnectionError;
 use log::{debug, info, warn};
@@ -316,17 +317,53 @@ pub trait ErrorNotificationCallback: Send + Sync {
     fn disconnected(&self, reason: Option<String>);
 }
 
+#[derive(Clone)]
 pub enum CredentialsKind {
     OpenVPN,
     NordWhisper,
 }
+impl CredentialsKind {
+    #[must_use]
+    pub fn protocol_name(&self) -> AsciiMetadataValue {
+        match self {
+            CredentialsKind::OpenVPN => AsciiMetadataValue::from_static("openvpn"),
+            CredentialsKind::NordWhisper => AsciiMetadataValue::from_static("nordwhisper"),
+        }
+    }
+}
 
+#[derive(Clone)]
 pub struct Credentials {
     pub username: HiddenString,
     pub password: HiddenString,
     pub kind: CredentialsKind,
 }
 
+impl Credentials {
+    fn validate(&self) -> std::result::Result<(), client::Error> {
+        if self.username.contains(':') {
+            return Err(client::Error::Internal {
+                reason: "in a http basic auth, username can't contain ':'".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn basic_auth(&self) -> std::result::Result<AsciiMetadataValue, client::Error> {
+        self.validate()?;
+        // It's important to access `.0` here since the Display of HiddenString will
+        // print as '***' (only) in release mode.
+        let encoded = STANDARD.encode(format!("{}:{}", self.username.0, self.password.0));
+        let v = AsciiMetadataValue::from_str(&format!("Basic {encoded}")).map_err(|e| {
+            client::Error::Internal {
+                reason: format!("failed to encode basic auth: {e}"),
+            }
+        })?;
+        Ok(v)
+    }
+}
+
+#[derive(Clone, Copy)]
 pub enum KeyKind {
     NordLynx,
 }
@@ -340,12 +377,14 @@ impl KeyKind {
     }
 }
 
+#[derive(Clone)]
 pub struct Keys {
     pub local_private_key: HiddenBytes,
     pub vpn_public_key: HiddenBytes,
     pub kind: KeyKind,
 }
 
+#[derive(Clone)]
 pub enum Authentication {
     Credentials { credentials: Credentials },
     Keys { keys: Keys },
@@ -756,18 +795,22 @@ impl Drop for Connection {
 #[cfg(test)]
 mod tests {
 
+    #[cfg(test)]
+    use crate::client::tests::TestAuthConfig;
     use crate::{
         client::tests::{global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server, connect_to_test_server_with_keys, wait_for,
-            wait_for_disconnect_reason, Command, RecordedCallback, SHUTDOWN_REASON,
+            connect_to_test_server_with_auth, wait_for, wait_for_disconnect_reason, Command,
+            RecordedCallback, SHUTDOWN_REASON,
         },
     };
 
     use assert_matches::assert_matches;
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
+    use rstest::rstest;
     use std::sync::Once;
+    use telio_crypto::SecretKey;
 
     use super::*;
 
@@ -845,10 +888,20 @@ mod tests {
     fn test_explicit_shutdown() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
 
         let errors_to_emit = [
             ConnectionError {
@@ -914,10 +967,20 @@ mod tests {
     fn test_implicit_shutdown() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
 
         let error = ConnectionError {
             code: EnsProtoError::Unauthenticated as i32,
@@ -949,10 +1012,20 @@ mod tests {
     fn test_shutdown_called_by_callback() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let callback = Arc::new(RecursiveCallback::default());
-        let connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
         *callback.connection.lock() = Some(connection.clone());
 
         let errors_to_emit = [
@@ -1003,15 +1076,22 @@ mod tests {
     fn test_connect_fails_when_key_material_is_incorrect() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server_with_keys(
+        let connection = connect_to_test_server_with_auth(
             &server_config,
-            Keys {
-                local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
-                vpn_public_key: Hidden(server_config.public_key.to_vec()),
-                kind: crate::KeyKind::NordLynx,
+            Authentication::Keys {
+                keys: Keys {
+                    local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
+                    vpn_public_key: Hidden(server_config.public_key.to_vec()),
+                    kind: crate::KeyKind::NordLynx,
+                },
             },
             callback.clone(),
         );
@@ -1020,14 +1100,119 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_disconnect_reported_when_server_gracefully_closes_the_stream() {
+    fn test_connect_fails_when_username_contains_colon() {
+        run_init();
+
+        let auth = TestAuthConfig::new_openvpn();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            Authentication::Credentials {
+                credentials: Credentials {
+                    username: Hidden("user:name".to_owned()),
+                    password: Hidden("password".to_owned()),
+                    kind: CredentialsKind::OpenVPN,
+                },
+            },
+            callback.clone(),
+        );
+
+        assert_matches!(connection, Err(EnsError::InternalError { reason }) if reason.contains("':'"));
+    }
+
+    #[rstest]
+    #[case(TestAuthConfig::new_nordlynx)]
+    #[case(TestAuthConfig::new_nordwhisper)]
+    #[case(TestAuthConfig::new_openvpn)]
+    #[test_log::test]
+    fn test_authentication_rejected_by_server(#[case] make_auth: fn() -> TestAuthConfig) {
         run_init();
 
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            make_auth(),
+        ));
+        let vpn_port = server_config.port;
+
+        let wrong_auth = make_auth().to_authentication(&server_config.public_key);
+
+        let callback = RecordedCallback::default();
+        let connection =
+            connect_to_test_server_with_auth(&server_config, wrong_auth, callback.clone()).unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+        );
+        assert!(callback.notifications.lock().is_empty());
+        assert_eq!(0, tracked_connections(&[connection.id]));
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
+    #[test_log::test]
+    fn test_challenge_rejected_by_server() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let wrong_vpn_public_key = SecretKey::gen().public();
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&wrong_vpn_public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+
+        assert_eq!(
+            reason,
+            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+        );
+        assert!(callback.notifications.lock().is_empty());
+        assert_eq!(0, tracked_connections(&[connection.id]));
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_server_gracefully_closes_the_stream() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let vpn_port = server_config.port;
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
 
         let error = ConnectionError {
             code: EnsProtoError::ServerMaintenance as i32,
@@ -1071,11 +1256,21 @@ mod tests {
     fn test_disconnect_reported_once_when_a_finished_connection_is_dropped() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
         let vpn_port = server_config.port;
         let callback = RecordedCallback::default();
-        let connection = connect_to_test_server(&server_config, callback.clone());
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
         let id = connection.id;
 
         server_config.send_blocking(Command::End);
@@ -1096,14 +1291,24 @@ mod tests {
     fn test_active_connections_do_not_grow_with_every_reconnect() {
         run_init();
 
+        let auth = TestAuthConfig::new_nordlynx();
+
         let runtime = get_runtime().unwrap();
-        let server_config = runtime.block_on(spawn_authenticating_server(global_user_agent()));
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
 
         let mut ids = Vec::new();
 
         for _ in 0..RECONNECT_COUNT {
             let callback = RecordedCallback::default();
-            let connection = connect_to_test_server(&server_config, callback.clone());
+            let connection = connect_to_test_server_with_auth(
+                &server_config,
+                auth.to_authentication(&server_config.public_key),
+                callback.clone(),
+            )
+            .unwrap();
             ids.push(connection.id);
 
             assert_eq!(tracked_connections(&ids), 1);
@@ -1116,5 +1321,67 @@ mod tests {
         }
 
         assert_eq!(tracked_connections(&ids), 0,);
+    }
+
+    #[rstest]
+    #[case(TestAuthConfig::new_nordlynx())]
+    #[case(TestAuthConfig::new_nordwhisper())]
+    #[case(TestAuthConfig::new_openvpn())]
+    #[test_log::test]
+    fn test_ens(#[case] auth: TestAuthConfig) {
+        run_init();
+
+        let errors_to_emit = [
+            ConnectionError {
+                code: 42,
+                additional_info: None,
+            },
+            ConnectionError {
+                code: EnsProtoError::ConnectionLimitReached as i32,
+                additional_info: Some("additional info".to_owned()),
+            },
+        ];
+        let expected_errors = [
+            ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::Unknown { kind: 42 },
+                additional_info: None,
+            },
+            ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::ConnectionLimitReached,
+                additional_info: Some("additional info".to_owned()),
+            },
+        ];
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let auth = auth.to_authentication(&server_config.public_key);
+
+        let first_callback = RecordedCallback::default();
+        let _first_connection =
+            connect_to_test_server_with_auth(&server_config, auth.clone(), first_callback.clone())
+                .unwrap();
+
+        runtime.block_on(server_config.send_errors(&errors_to_emit));
+        wait_for(|| first_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            expected_errors,
+            first_callback.notifications.lock().as_slice()
+        );
+
+        let second_callback = RecordedCallback::default();
+        let _second_connection =
+            connect_to_test_server_with_auth(&server_config, auth, second_callback.clone())
+                .unwrap();
+
+        runtime.block_on(server_config.send_errors(&errors_to_emit));
+        wait_for(|| second_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            expected_errors,
+            second_callback.notifications.lock().as_slice()
+        );
     }
 }

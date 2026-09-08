@@ -325,6 +325,10 @@ async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
     }
 }
 
+pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
+    format!("'{vpn_uri}' closed the grpc stream")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &str,
@@ -425,7 +429,7 @@ async fn task(
                     }
                 }
                 Ok(None) => {
-                    let msg = format!("'{vpn_uri}' closed the grpc stream");
+                    let msg = stream_closed_reason(vpn_uri);
                     debug!("{msg}");
                     publish_disconnect(&tx, msg).await;
                     break 'outer;
@@ -820,6 +824,10 @@ pub mod tests {
                 },
             }
         }
+    }
+
+    pub fn closed_reason(vpn_port: u16) -> String {
+        stream_closed_reason(&format!("http://127.0.0.1:{vpn_port}"))
     }
 
     /// The user agent that `init` installed. Tests going through the public

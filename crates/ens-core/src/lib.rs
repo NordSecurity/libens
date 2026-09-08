@@ -812,7 +812,7 @@ mod tests {
     #[cfg(test)]
     use crate::client::tests::TestAuthConfig;
     use crate::{
-        client::tests::{global_user_agent, spawn_authenticating_server},
+        client::tests::{closed_reason, global_user_agent, spawn_authenticating_server},
         test_support::{
             connect_to_port, connect_to_test_server, connect_to_test_server_with_auth,
             connect_to_test_server_with_config, spawn_server, wait_for, wait_for_disconnect_reason,
@@ -1264,10 +1264,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
 
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
         assert_eq!(
             *callback.notifications.lock(),
             vec![ConnectionErrorNotification {
@@ -1281,12 +1278,7 @@ mod tests {
         assert_matches!(connection.shutdown(), Ok(()));
 
         let disconnects = callback.disconnects.lock().clone();
-        assert_eq!(
-            disconnects,
-            vec![Some(format!(
-                "'http://127.0.0.1:{vpn_port}' closed the grpc stream"
-            ))],
-        );
+        assert_eq!(disconnects, vec![Some(closed_reason(vpn_port))],);
     }
 
     #[test_log::test]
@@ -1326,10 +1318,7 @@ mod tests {
         server_config.send_blocking(Command::End);
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
     }
 
     #[test_log::test]
@@ -1399,10 +1388,7 @@ mod tests {
         server_config.send_blocking(Command::End);
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
         wait_for(|| tracked_connections(&[connection.id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
@@ -1433,10 +1419,7 @@ mod tests {
         server_config.send_blocking(Command::End);
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
         assert_eq!(0, tracked_connections(&[id]));
 
         drop(connection);

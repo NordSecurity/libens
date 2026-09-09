@@ -1480,6 +1480,10 @@ mod tests {
                 code: EnsProtoError::ConnectionLimitReached as i32,
                 additional_info: Some("additional info".to_owned()),
             },
+            ConnectionError {
+                code: EnsProtoError::Superseded as i32,
+                additional_info: None,
+            },
         ];
         let expected_errors = [
             ConnectionErrorNotification {
@@ -1489,6 +1493,10 @@ mod tests {
             ConnectionErrorNotification {
                 kind: ConnectionErrorNotificationKind::ConnectionLimitReached,
                 additional_info: Some("additional info".to_owned()),
+            },
+            ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::Superseded,
+                additional_info: None,
             },
         ];
 
@@ -1506,7 +1514,7 @@ mod tests {
                 .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
-        wait_for(|| first_callback.notifications.lock().len() == 2);
+        wait_for(|| first_callback.notifications.lock().len() == expected_errors.len());
         assert_eq!(
             expected_errors,
             first_callback.notifications.lock().as_slice()
@@ -1518,7 +1526,7 @@ mod tests {
                 .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
-        wait_for(|| second_callback.notifications.lock().len() == 2);
+        wait_for(|| second_callback.notifications.lock().len() == expected_errors.len());
         assert_eq!(
             expected_errors,
             second_callback.notifications.lock().as_slice()

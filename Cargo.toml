@@ -33,9 +33,12 @@ uniffi = { version = "0.28.3", features = ["build"] }
 
 [profile.release]
 opt-level = "z"
-strip = "symbols"
 lto = true
 codegen-units = 1
+debug = "full"
+
+[profile.release.package.ens-cli]
+strip = "symbols"
 
 [package.metadata.winresource]
 CompanyName = "Nord Security"

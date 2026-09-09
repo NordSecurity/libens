@@ -23,7 +23,7 @@ const APP_VERSION: &str = "deinit-tests";
 const MAINTENANCE_INFO: &str = "planned maintenance";
 
 fn test_auth(server_config: &ServerConfig) -> Authentication {
-    Authentication::Keys {
+    Authentication::WithKeys {
         keys: Keys {
             local_private_key: Hidden(SecretKey::gen().to_vec()),
             vpn_public_key: Hidden(server_config.public_key.to_vec()),

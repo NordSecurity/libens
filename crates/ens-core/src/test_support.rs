@@ -287,7 +287,7 @@ pub fn connect_to_test_server(
 ) -> Arc<Connection> {
     connect_to_test_server_with_auth(
         server_config,
-        Authentication::Keys {
+        Authentication::WithKeys {
             keys: Keys {
                 local_private_key: Hidden(SecretKey::gen().to_vec()),
                 vpn_public_key: Hidden(server_config.public_key.to_vec()),

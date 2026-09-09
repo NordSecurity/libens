@@ -23,6 +23,22 @@ cargo build --all
 cargo build --release --lib   # only the shared library
 ```
 
+## CI
+
+Every push builds all platforms via `ci/build.py`, which wraps the
+`rust_build_utils` submodule, then triggers the GitLab `libens-build` pipeline
+to publish the artifacts. A `v*` semver tag publishes a release; anything else
+publishes a `<sha>-SNAPSHOT`.
+
+Initialise the submodule before building locally:
+
+```sh
+git submodule update --init --recursive
+```
+
+Builds run inside the `ghcr.io/nordsecurity/build-*` images — see
+`.github/workflows/build.yml` for the invocations.
+
 ## Testing
 
 ```sh

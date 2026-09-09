@@ -386,8 +386,8 @@ pub struct Keys {
 
 #[derive(Clone)]
 pub enum Authentication {
-    Credentials { credentials: Credentials },
-    Keys { keys: Keys },
+    WithCredentials { credentials: Credentials },
+    WithKeys { keys: Keys },
 }
 
 pub trait ProtectCallback: Send + Sync {
@@ -1086,7 +1086,7 @@ mod tests {
         let callback = RecordedCallback::default();
         let connection = connect_to_test_server_with_auth(
             &server_config,
-            Authentication::Keys {
+            Authentication::WithKeys {
                 keys: Keys {
                     local_private_key: Hidden(MALFORMED_PRIVATE_KEY.to_vec()),
                     vpn_public_key: Hidden(server_config.public_key.to_vec()),
@@ -1114,7 +1114,7 @@ mod tests {
         let callback = RecordedCallback::default();
         let connection = connect_to_test_server_with_auth(
             &server_config,
-            Authentication::Credentials {
+            Authentication::WithCredentials {
                 credentials: Credentials {
                     username: Hidden("user:name".to_owned()),
                     password: Hidden("password".to_owned()),

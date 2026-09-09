@@ -232,7 +232,7 @@ fn main() {
                     };
                     let vpn_public_key = BASE64_STANDARD.decode(public_key).unwrap();
 
-                    let auth = Authentication::Keys {
+                    let auth = Authentication::WithKeys {
                         keys: ens::Keys {
                             local_private_key: Hidden(local_private_key),
                             vpn_public_key: Hidden(vpn_public_key),

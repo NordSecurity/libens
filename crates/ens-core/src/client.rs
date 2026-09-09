@@ -1346,6 +1346,15 @@ pub mod tests {
     }
 
     #[test]
+    fn test_built_in_root_certificate_loads() {
+        assert!(make_trusted_root_cert_verifier(
+            make_crypto_provider(true),
+            DEFAULT_ROOT_CERTIFICATE
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_cert_verification_rejects_invalid_request() {
         use rustls::{
             client::danger::ServerCertVerifier,

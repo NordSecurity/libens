@@ -814,10 +814,11 @@ mod tests {
     use crate::{
         client::tests::{closed_reason, global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_port, connect_to_test_server, connect_to_test_server_with_auth,
-            connect_to_test_server_with_config, error, maintenance, spawn_server, test_auth,
-            wait_for, wait_for_disconnect_reason, Command, PanicAt, RecordedCallback, RelayMode,
-            ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
+            connect_local, connect_to_port, connect_to_test_server,
+            connect_to_test_server_with_auth, connect_to_test_server_with_config, error,
+            maintenance, spawn_server, test_auth, wait_for, wait_for_disconnect_reason, Command,
+            PanicAt, RecordedCallback, RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE,
+            SHUTDOWN_REASON,
         },
     };
 
@@ -1736,5 +1737,50 @@ mod tests {
             *new_callback.disconnects.lock(),
             vec![Some(SHUTDOWN_REASON.to_owned())]
         );
+    }
+
+    fn fast_backoff() -> Config {
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+        config
+    }
+
+    #[test_log::test]
+    fn test_built_in_root_rejects_server_with_unknown_certificate() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let untrusting = RecordedCallback::default();
+        let _untrusting_connection = connect_local(
+            server_config.port,
+            test_auth(&server_config),
+            untrusting.clone(),
+            fast_backoff(),
+        )
+        .unwrap();
+
+        std::thread::sleep(RECONNECT_WINDOW);
+        assert_eq!(server_config.streams(), 0);
+
+        let trusting = RecordedCallback::default();
+        let _trusting_connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            trusting.clone(),
+            fast_backoff(),
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !trusting.notifications.lock().is_empty());
+        assert_eq!(server_config.streams(), 1);
+
+        std::thread::sleep(RECONNECT_WINDOW);
+        assert_eq!(server_config.streams(), 1);
+        assert!(untrusting.notifications.lock().is_empty());
+        assert!(untrusting.disconnects.lock().is_empty());
     }
 }

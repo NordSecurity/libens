@@ -499,6 +499,15 @@ pub fn connect_to_port(
 ) -> Result<Arc<Connection>, EnsError> {
     config.set_root_certificate_override(Some(server_config.tls_config.ca_cert.der().to_vec()));
 
+    connect_local(port, auth, callback, config)
+}
+
+pub fn connect_local(
+    port: u16,
+    auth: Authentication,
+    callback: impl ErrorNotificationCallback + 'static,
+    config: Config,
+) -> Result<Arc<Connection>, EnsError> {
     connect(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
         None,

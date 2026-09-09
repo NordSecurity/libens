@@ -11,6 +11,7 @@ The version in use is pinned in `crates/ens-core/Cargo.toml`.
 ## Layout
 
 - `crates/ens-core` - the implementation
+- `crates/ens-stub` - fake ENS server the tests run against
 - `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
 - `cli` (`ens-cli`) - tool for manual testing
 
@@ -49,16 +50,26 @@ To collect merged coverage from unit and integration tests into
 `target/llvm-cov/html/index.html`:
 
 ```sh
-cargo llvm-cov --all --all-features --exclude ens-cli --html
+cargo llvm-cov --all --all-features --exclude ens-cli --exclude ens-stub --html
 ```
 
 To run lints:
 
 ```sh
 cargo fmt -- --check
-cargo clippy --all-targets --all-features --package libens --package ens-core -- --deny warnings
+cargo clippy --all-targets --all-features --package libens --package ens-core --package ens-stub -- --deny warnings
 cargo deny check
 ```
+
+### ENS stub
+
+`ens-stub` is a fake ENS server. It speaks the real wire format and checks
+authentication the same way a real server does, but the notifications it sends
+are the ones a test asks for.
+
+`spawn_server` picks the authentication schema, `ExpectedAuth`, and starts a
+server on a free port. Commands are queued, so a test can send them before the
+client connects.
 
 ## CLI
 

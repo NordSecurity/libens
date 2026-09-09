@@ -282,6 +282,10 @@ namespace ens {
     /// The `authentication` variant must match the VPN protocol whose
     /// tunnel ENS is meant to monitor: `Credentials` for OpenVPN and
     /// NordWhisper, `Keys` for NordLynx.
+    ///
+    /// A server certificate that is not part of the trusted chain ends the
+    /// session without retrying. The `connect` returns no error, but the
+    /// connection emits disconnect event.
     [Throws=EnsError]
     Connection connect(
         SocketAddr socket_addr,

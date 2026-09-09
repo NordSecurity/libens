@@ -70,6 +70,8 @@ pub enum Error {
     InvalidKey { reason: String },
     #[error("Internal error: {reason}")]
     Internal { reason: String },
+    #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
+    UntrustedCertificate { vpn_uri: String, reason: String },
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -312,6 +314,29 @@ impl AuthRejection for Error {
     }
 }
 
+fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
+    let Error::Transport(transport) = error else {
+        return None;
+    };
+
+    let mut source = std::error::Error::source(transport);
+    while let Some(current) = source {
+        let tls = current.downcast_ref::<rustls::Error>().or_else(|| {
+            current
+                .downcast_ref::<std::io::Error>()?
+                .get_ref()?
+                .downcast_ref::<rustls::Error>()
+        });
+        if let Some(tls @ rustls::Error::InvalidCertificate(_)) = tls {
+            return Some(tls);
+        }
+
+        source = current.source();
+    }
+
+    None
+}
+
 async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
@@ -373,28 +398,27 @@ async fn task(
             };
         }
 
-        let pool = pool.clone();
-        let external_channel = handle_error!(
-            Box::pin(create_external_channel(
-                vpn_uri,
-                pool,
-                allow_only_mlkem,
-                root_certificate.clone(),
-                keepalive,
-                user_agent.clone()
-            ))
-            .await,
-            backoff
-        );
+        let external_channel = match Box::pin(open_channel(
+            vpn_uri,
+            pool.clone(),
+            &tx,
+            allow_only_mlkem,
+            root_certificate.clone(),
+            keepalive,
+            user_agent.clone(),
+        ))
+        .await
+        {
+            Err(Error::UntrustedCertificate { .. }) => break 'outer,
+            attempt => handle_error!(attempt, backoff),
+        };
 
         let headers = handle_error!(
             prepare_connection_headers(&authentication, &external_channel).await,
             backoff
         );
 
-        debug!(
-            "Prepared authentication headers, subscribing to error notifications for '{vpn_uri}'"
-        );
+        debug!("Subscribing to error notifications for '{vpn_uri}'");
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
@@ -450,6 +474,39 @@ async fn task(
     }
     debug!("ENS monitor for '{vpn_uri}' terminates");
     Ok(())
+}
+
+async fn open_channel(
+    vpn_uri: &str,
+    pool: Arc<SocketPool>,
+    tx: &Sender<Event>,
+    allow_only_mlkem: bool,
+    root_certificate: Vec<u8>,
+    keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
+) -> Result<Channel, Error> {
+    let attempt = create_external_channel(
+        vpn_uri,
+        pool,
+        allow_only_mlkem,
+        root_certificate,
+        keepalive,
+        user_agent,
+    )
+    .await;
+
+    let Some(tls) = attempt.as_ref().err().and_then(certificate_rejection) else {
+        return attempt;
+    };
+
+    let untrusted = Error::UntrustedCertificate {
+        vpn_uri: vpn_uri.to_owned(),
+        reason: tls.to_string(),
+    };
+    error!("{untrusted}");
+    publish_disconnect(tx, untrusted.to_string()).await;
+
+    Err(untrusted)
 }
 
 async fn get_login_challenge(

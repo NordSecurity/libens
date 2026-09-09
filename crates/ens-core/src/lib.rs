@@ -125,6 +125,9 @@ impl From<client::Error> for EnsError {
             },
             client::Error::InvalidKey { reason } => Self::UnknownError { reason },
             client::Error::Internal { reason } => Self::InternalError { reason },
+            untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
+                reason: untrusted.to_string(),
+            },
         }
     }
 }
@@ -1747,40 +1750,65 @@ mod tests {
     }
 
     #[test_log::test]
-    fn test_built_in_root_rejects_server_with_unknown_certificate() {
+    fn test_untrusted_certificate_on_connect_ends_the_session() {
         run_init();
 
         let runtime = get_runtime().unwrap();
         let server_config = runtime.block_on(spawn_server());
 
-        let untrusting = RecordedCallback::default();
-        let _untrusting_connection = connect_local(
+        let callback = RecordedCallback::default();
+        let _connection = connect_local(
             server_config.port,
             test_auth(&server_config),
-            untrusting.clone(),
-            fast_backoff(),
+            callback.clone(),
+            Config::new(),
         )
         .unwrap();
 
-        std::thread::sleep(RECONNECT_WINDOW);
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("UnknownIssuer"));
         assert_eq!(server_config.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
 
         let trusting = RecordedCallback::default();
-        let _trusting_connection = connect_to_test_server_with_config(
-            &server_config,
-            test_auth(&server_config),
-            trusting.clone(),
-            fast_backoff(),
-        )
-        .unwrap();
+        let _trusting_connection = connect_to_test_server(&server_config, trusting.clone());
 
         server_config.send_blocking(maintenance(MAINTENANCE_INFO));
         wait_for(|| !trusting.notifications.lock().is_empty());
         assert_eq!(server_config.streams(), 1);
+    }
+
+    #[test_log::test]
+    fn test_untrusted_certificate_on_reconnect_ends_the_session() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let trusted = runtime.block_on(spawn_server());
+        let untrusted = runtime.block_on(spawn_server());
+        let relay = runtime.block_on(TcpRelay::spawn(trusted.port));
+
+        let callback = RecordedCallback::default();
+        let _connection = connect_to_port(
+            relay.port,
+            &trusted,
+            test_auth(&trusted),
+            callback.clone(),
+            fast_backoff(),
+        )
+        .unwrap();
+
+        trusted.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        relay.set_mode(RelayMode::Redirect(untrusted.port));
+        trusted.send_blocking(Command::Error(Status::internal(REJECTION_MESSAGE)));
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("untrusted certificate"));
 
         std::thread::sleep(RECONNECT_WINDOW);
-        assert_eq!(server_config.streams(), 1);
-        assert!(untrusting.notifications.lock().is_empty());
-        assert!(untrusting.disconnects.lock().is_empty());
+        assert_eq!(untrusted.streams(), 0);
+        assert_eq!(trusted.streams(), 1);
+        assert_eq!(callback.disconnects.lock().len(), 1);
     }
 }

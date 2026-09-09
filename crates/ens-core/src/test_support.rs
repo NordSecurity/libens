@@ -278,6 +278,9 @@ pub enum RelayMode {
     Silent,
 
     Refuse,
+
+    // Connections accepted afterwards go to this port instead of the server.
+    Redirect(u16),
 }
 
 pub struct TcpRelay {
@@ -316,10 +319,14 @@ async fn relay_loop(
                 accepted = listener.accept() => accepted.unwrap().0,
                 _ = mode_rx.wait_for(|m| *m == RelayMode::Refuse) => break,
             };
-            let server = TcpStream::connect((Ipv4Addr::LOCALHOST, server_port))
+            let mode_at_accept = *mode_rx.borrow();
+            let target_port = match mode_at_accept {
+                RelayMode::Redirect(port) => port,
+                _ => server_port,
+            };
+            let server = TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
                 .await
                 .unwrap();
-            let mode_at_accept = *mode_rx.borrow();
 
             let (client_rx, client_tx) = client.into_split();
             let (server_rx, server_tx) = server.into_split();

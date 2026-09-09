@@ -926,14 +926,13 @@ name = "ens-core"
 version = "0.0.1"
 dependencies = [
  "assert_matches",
- "async-channel",
  "base64 0.23.1",
  "blake3",
  "built",
  "crypto_box",
+ "ens-stub",
  "hex",
  "http",
- "http-auth-basic",
  "hyper-util",
  "llt-proto",
  "log",
@@ -950,7 +949,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tonic",
  "tower",
  "uuid",

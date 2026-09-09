@@ -71,6 +71,36 @@ are the ones a test asks for.
 server on a free port. Commands are queued, so a test can send them before the
 client connects.
 
+The same stub also runs as a binary, for tests written in other languages:
+
+1. The first argument picks the authentication schema - `nordlynx` (the
+   default), `nordwhisper` or `openvpn`.
+2. On startup the stub prints one json line with everything needed to connect.
+   The password based schemas also print the credentials they expect.
+3. Every line written to stdin is a command.
+4. Closing stdin stops the stub.
+
+```sh
+cargo run --package ens-stub -- openvpn
+```
+
+Printed on startup:
+
+```json
+{"port":40913,"public_key":"<base64>","root_certificate":"<base64 DER>","username":"<generated>","password":"<generated>"}
+```
+
+Commands read from stdin, one per line:
+
+```json
+{"command":"notification","code":2,"additional_info":"planned maintenance"}
+{"command":"error","message":"some message"}
+{"command":"end"}
+```
+
+`notification` delivers one error notification, `error` fails the stream with a
+grpc error and `end` closes the stream.
+
 ## CLI
 
 `ens-cli` resolves servers and credentials through the NordVPN API, then opens

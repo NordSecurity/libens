@@ -11,6 +11,8 @@ authors = ["LLT TCP team"]
 async-channel = "2.5.0"
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8.7", default-features = false }
+clap = { version = "4.6.6", features = ["derive"] }
+env_logger = { version = "0.11.11", default-features = false }
 http = { version = "1.5.0", default-features = false }
 http-auth-basic = "0.3.7"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
@@ -18,9 +20,11 @@ log = { version = "0.4.34", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
 rand = "0.9.5"
 rcgen = { version = "0.14.7", default-features = false, features = ["pem", "aws_lc_rs"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 telio-crypto = { git = "https://github.com/NordSecurity/libtelio.git", rev = "e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b" }
 thiserror = { version = "2", default-features = false }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1.19"
 tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
 uuid = { version = "1.20.0", default-features = false, features = ["v4"] }

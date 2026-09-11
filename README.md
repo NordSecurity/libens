@@ -14,6 +14,7 @@ The version in use is pinned in `crates/ens-core/Cargo.toml`.
 - `crates/ens-stub` - fake ENS server the tests run against
 - `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
 - `cli` (`ens-cli`) - tool for manual testing
+- `tests/go` - integration tests for the generated go bindings
 
 ## Building
 
@@ -71,7 +72,7 @@ are the ones a test asks for.
 server on a free port. Commands are queued, so a test can send them before the
 client connects.
 
-The same stub also runs as a binary, for tests written in other languages:
+The bindings tests drive the same stub as a binary, over stdin and stdout:
 
 1. The first argument picks the authentication schema - `nordlynx` (the
    default), `nordwhisper` or `openvpn`.
@@ -100,6 +101,30 @@ Commands read from stdin, one per line:
 
 `notification` delivers one error notification, `error` fails the stream with a
 grpc error and `end` closes the stream.
+
+### Bindings tests
+
+`tests/go` drives the stub through the generated go bindings, one test per
+authentication schema and one for a rejected authentication. Linux only.
+
+The bindings are part of `libens-bindings` workflow job.
+
+```sh
+uniffi-bindgen-go ./ens.udl --config uniffi.toml --out-dir libens-bindings/linux/go
+cp tests/go/bindings.mod libens-bindings/linux/go/go.mod
+```
+
+The tests load `libens.so` and spawn the stub:
+
+```sh
+cargo build --package libens --package ens-stub
+cd tests/go
+export CGO_CFLAGS="-I$PWD/../../libens-bindings/linux/go/ens"
+export CGO_LDFLAGS="-L$PWD/../../target/debug -lens -Wl,-rpath,$PWD/../../target/debug"
+go test ./...
+```
+
+`ENS_STUB` overrides the stub binary path.
 
 ## CLI
 

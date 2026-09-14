@@ -135,6 +135,16 @@ LIBENS_CONFIG = {
         "env": {},
         "packages": {"libens": {"ens": "libens.dylib"}},
     },
+    "tvos": {
+        "build_args": [],
+        "env": {},
+        "packages": {"libens": {"ens": "libens.dylib"}},
+    },
+    "tvos-sim": {
+        "build_args": [],
+        "env": {},
+        "packages": {"libens": {"ens": "libens.dylib"}},
+    },
     "ios-sim": {
         "build_args": [],
         "env": {},
@@ -173,7 +183,6 @@ def main():
             "ensFFI",
             headers,
             "libens.dylib",
-            target_os_list=["macos", "ios", "ios-sim"],
         )
     else:
         assert False, f"command “{args.command}” not supported"

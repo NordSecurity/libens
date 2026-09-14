@@ -246,6 +246,15 @@ jobs:
           - target_os: ios-sim
             arch: x86_64
             runner: macos-15-intel
+          - target_os: tvos
+            arch: aarch64
+            runner: macos-15
+          - target_os: tvos-sim
+            arch: aarch64
+            runner: macos-15
+          - target_os: tvos-sim
+            arch: x86_64
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     env:
       LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}

@@ -68,6 +68,8 @@ interface ConnectionErrorNotificationKind {
     /// A newer session for the same account has taken over on this
     /// server. This session is being terminated.
     Superseded();
+    /// The server rejected the cipher used by the VPN connection.
+    UnsupportedCipher();
 };
 
 /// A single connection-error notification pushed from the VPN server.

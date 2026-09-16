@@ -284,6 +284,7 @@ pub enum ConnectionErrorNotificationKind {
     ServerMaintenance, // Only this error type can cause automatic recconection to a different server
     Unauthenticated,
     Superseded,
+    UnsupportedCipher,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -308,6 +309,9 @@ impl From<ConnectionError> for ConnectionErrorNotification {
             }
             code if code == GrpcError::Superseded as i32 => {
                 ConnectionErrorNotificationKind::Superseded
+            }
+            code if code == GrpcError::UnsupportedCipher as i32 => {
+                ConnectionErrorNotificationKind::UnsupportedCipher
             }
             other => ConnectionErrorNotificationKind::Unknown { kind: other },
         };
@@ -1473,11 +1477,13 @@ mod tests {
     #[case(TestAuthConfig::new_openvpn())]
     #[test_log::test]
     fn test_ens(#[case] auth: TestAuthConfig) {
+        const OUT_OF_RANGE_ERROR_CODE: i32 = EnsProtoError::UnsupportedCipher as i32 + 1;
+
         run_init();
 
         let errors_to_emit = [
             ConnectionError {
-                code: 42,
+                code: OUT_OF_RANGE_ERROR_CODE,
                 additional_info: None,
             },
             ConnectionError {
@@ -1488,10 +1494,16 @@ mod tests {
                 code: EnsProtoError::Superseded as i32,
                 additional_info: None,
             },
+            ConnectionError {
+                code: EnsProtoError::UnsupportedCipher as i32,
+                additional_info: Some("caesar cipher is unsupported".to_owned()),
+            },
         ];
         let expected_errors = [
             ConnectionErrorNotification {
-                kind: ConnectionErrorNotificationKind::Unknown { kind: 42 },
+                kind: ConnectionErrorNotificationKind::Unknown {
+                    kind: OUT_OF_RANGE_ERROR_CODE,
+                },
                 additional_info: None,
             },
             ConnectionErrorNotification {
@@ -1501,6 +1513,10 @@ mod tests {
             ConnectionErrorNotification {
                 kind: ConnectionErrorNotificationKind::Superseded,
                 additional_info: None,
+            },
+            ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::UnsupportedCipher,
+                additional_info: Some("caesar cipher is unsupported".to_owned()),
             },
         ];
 

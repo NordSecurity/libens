@@ -268,6 +268,32 @@ impl ErrorNotificationService {
         Ok(())
     }
 
+    pub async fn bootstrap_ech(
+        &self,
+        vpn_ip: IpAddr,
+        ens_port: u16,
+        tls: &TlsOptions,
+    ) -> Result<Vec<u8>, Error> {
+        let vpn_uri =
+            Uri::from_str(&format!("http://{vpn_ip}:{ens_port}")).map_err(http::Error::from)?;
+
+        let EchBootstrap::Enabled(timeout) = tls.ech else {
+            return Err(Error::Internal {
+                reason: "ECH bootstrap disabled".to_owned(),
+            });
+        };
+
+        ech::retry_configs(
+            &vpn_uri,
+            tls,
+            self.socket_pool.clone(),
+            self.allow_only_pq,
+            &self.root_certificate,
+            timeout,
+        )
+        .await
+    }
+
     /// Stop ENS
     pub async fn stop(&mut self) {
         if let Some(join_handle) = self.stop_old_monitor() {

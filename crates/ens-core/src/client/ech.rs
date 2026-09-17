@@ -19,11 +19,8 @@ pub(super) async fn bootstrap(
     root_certificate: &[u8],
     timeout: Duration,
 ) -> Result<EchConfig, Error> {
-    let bootstrap = handshake(uri, tls, pool, allow_only_pq, root_certificate);
-
-    let retry_configs = tokio::time::timeout(timeout, bootstrap)
-        .await
-        .map_err(|e| Error::EchBootstrappingFailed { source: e.into() })??;
+    let retry_configs =
+        retry_configs(uri, tls, pool, allow_only_pq, root_certificate, timeout).await?;
 
     let ech_config = EchConfig::new(
         EchConfigListBytes::from(retry_configs),
@@ -36,6 +33,21 @@ pub(super) async fn bootstrap(
 
     info!("ECH bootstrapping success");
     Ok(ech_config)
+}
+
+pub(super) async fn retry_configs(
+    uri: &Uri,
+    tls: &TlsOptions,
+    pool: Arc<SocketPool>,
+    allow_only_pq: bool,
+    root_certificate: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, Error> {
+    let handshake = handshake(uri, tls, pool, allow_only_pq, root_certificate);
+
+    tokio::time::timeout(timeout, handshake)
+        .await
+        .map_err(|e| Error::EchBootstrappingFailed { source: e.into() })?
 }
 
 async fn handshake(

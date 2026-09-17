@@ -3,16 +3,23 @@
 #![allow(clippy::unnecessary_wraps)]
 
 use std::{
+    io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Once},
+    process::{Child, ChildStdout, Command as ProcessCommand, Stdio},
+    str::SplitWhitespace,
+    sync::{
+        mpsc::{self, Sender},
+        Arc, Once,
+    },
     time::{Duration, Instant},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use ens_core::{
     connect, Authentication, Config, Connection, ConnectionErrorNotification, EnsError,
     ErrorNotificationCallback, Hidden, KeyKind, Keys, LogCallback, LogLevel,
 };
-use ens_stub::ExpectedAuth;
+use ens_stub::{ExpectedAuth, ServerType};
 use llt_proto::ens::{ConnectionError, Error as EnsProtoError};
 use parking_lot::Mutex;
 use telio_crypto::SecretKey;
@@ -34,6 +41,11 @@ const ANY_LOCAL_PORT: &str = "127.0.0.1:0";
 const RELAY_BUFFER_SIZE: usize = 4096;
 const MAX_WAIT_TIME: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ECH_STUB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/echstub");
+const ECH_STUB_START_TIMEOUT: Duration = Duration::from_secs(120);
+const ECH_STUB_READY: &str = "ready";
+const ECH_STUB_HANDSHAKE: &str = "handshake";
+const ECH_STUB_NONE: &str = "-";
 pub const CALLBACK_PANIC_MESSAGE: &str = "test callback panic";
 
 static INIT: Once = Once::new();
@@ -46,6 +58,157 @@ pub async fn spawn_server() -> ServerConfig {
     ens_stub::spawn_server(ExpectedAuth::any_nordlynx(), None)
         .await
         .unwrap()
+}
+
+pub async fn spawn_plain_server() -> ServerConfig {
+    ens_stub::spawn_server_of_type(ExpectedAuth::any_nordlynx(), None, ServerType::Plain)
+        .await
+        .unwrap()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EchMode {
+    On,
+    Off,
+}
+
+impl EchMode {
+    fn flag(self) -> &'static str {
+        match self {
+            EchMode::On => "on",
+            EchMode::Off => "off",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handshake {
+    pub accepted: bool,
+    pub sni_seen: Option<String>,
+    pub outer_sni: Option<String>,
+}
+
+struct EchStubReady {
+    port: u16,
+    ca_der: Vec<u8>,
+    ech_config_list: Vec<u8>,
+}
+
+pub struct GoEchStub {
+    child: Child,
+    ready: EchStubReady,
+    handshakes: Arc<Mutex<Vec<Handshake>>>,
+}
+
+impl GoEchStub {
+    pub fn spawn(upstream_port: u16, public_name: &str, ech: EchMode) -> Self {
+        let upstream = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, upstream_port));
+        let mut child = ProcessCommand::new("go")
+            .args(["run", "."])
+            .args(["-upstream", &upstream.to_string()])
+            .args(["-public-name", public_name])
+            .args(["-ech", ech.flag()])
+            .current_dir(ECH_STUB_DIR)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("ECH tests need go 1.24+ on PATH: {e}"));
+
+        let stdout = child.stdout.take().unwrap();
+        let handshakes = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let recorded = handshakes.clone();
+        std::thread::spawn(move || read_ech_stub_output(stdout, &ready_tx, &recorded));
+
+        let ready = ready_rx
+            .recv_timeout(ECH_STUB_START_TIMEOUT)
+            .expect("echstub did not report `ready`");
+
+        Self {
+            child,
+            ready,
+            handshakes,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.ready.port
+    }
+
+    pub fn ca_der(&self) -> &[u8] {
+        &self.ready.ca_der
+    }
+
+    pub fn ech_config_list(&self) -> &[u8] {
+        &self.ready.ech_config_list
+    }
+
+    pub fn handshakes(&self) -> Vec<Handshake> {
+        self.handshakes.lock().clone()
+    }
+}
+
+impl Drop for GoEchStub {
+    fn drop(&mut self) {
+        // The stub exits on stdin EOF, `go run` would leave it behind on kill
+        drop(self.child.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_ech_stub_output(
+    stdout: ChildStdout,
+    ready_tx: &Sender<EchStubReady>,
+    handshakes: &Mutex<Vec<Handshake>>,
+) {
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else {
+            return;
+        };
+
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some(ECH_STUB_READY) => {
+                let _ = ready_tx.send(parse_ech_stub_ready(fields));
+            }
+            Some(ECH_STUB_HANDSHAKE) => handshakes.lock().push(parse_handshake(fields)),
+            _ => panic!("unexpected echstub output: {line}"),
+        }
+    }
+}
+
+fn parse_ech_stub_ready(mut fields: SplitWhitespace) -> EchStubReady {
+    let port = fields.next().unwrap().parse().unwrap();
+    let ca_der = STANDARD.decode(fields.next().unwrap()).unwrap();
+    let ech_config_list = match fields.next().unwrap() {
+        ECH_STUB_NONE => vec![],
+        encoded => STANDARD.decode(encoded).unwrap(),
+    };
+
+    EchStubReady {
+        port,
+        ca_der,
+        ech_config_list,
+    }
+}
+
+fn parse_handshake(mut fields: SplitWhitespace) -> Handshake {
+    let accepted = fields.next().unwrap().parse().unwrap();
+    let sni_seen = parse_name(fields.next().unwrap());
+    let outer_sni = parse_name(fields.next().unwrap());
+
+    Handshake {
+        accepted,
+        sni_seen,
+    }
+}
+
+fn parse_name(field: &str) -> Option<String> {
+    match field {
+        ECH_STUB_NONE => None,
+        name => Some(name.to_owned()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

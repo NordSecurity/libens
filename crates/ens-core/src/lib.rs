@@ -823,8 +823,9 @@ mod tests {
         test_support::{
             connect_local, connect_to_port, connect_to_test_server,
             connect_to_test_server_with_auth, connect_to_test_server_with_config, error,
-            maintenance, spawn_server, test_auth, wait_for, wait_for_disconnect_reason, Command,
-            PanicAt, RecordedCallback, RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE,
+            maintenance, spawn_plain_server, spawn_server, test_auth, wait_for,
+            wait_for_disconnect_reason, Command, EchMode, GoEchStub, Handshake, PanicAt,
+            RecordedCallback, RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE,
             SHUTDOWN_REASON,
         },
     };
@@ -888,6 +889,7 @@ mod tests {
 
     const MAINTENANCE_INFO: &str = "planned maintenance";
     const REJECTION_MESSAGE: &str = "token revoked";
+    const ECH_PUBLIC_NAME: &str = "cover.example.com";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 
     const OLD_SERVER_INFO: &str = "bar";
@@ -1826,5 +1828,34 @@ mod tests {
         assert_eq!(untrusted.streams(), 0);
         assert_eq!(trusted.streams(), 1);
         assert_eq!(callback.disconnects.lock().len(), 1);
+    }
+
+    #[test_log::test]
+    fn plain_tls_through_go_stub() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, EchMode::Off);
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+        assert!(callback.disconnects.lock().is_empty());
+        assert_eq!(
+            stub.handshakes(),
+            vec![Handshake {
+                accepted: false,
+                sni_seen: None,
+                outer_sni: None,
+            }]
+        );
     }
 }

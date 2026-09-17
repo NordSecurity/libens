@@ -240,11 +240,26 @@ impl ServerConfig {
     }
 }
 
+/// Whether the stub terminates TLS itself
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerType {
+    Tls,
+    Plain,
+}
+
 /// Starts a stub verifying authentication the same way the real ENS server
 /// does. The user agent is only verified when `expected_user_agent` is given.
 pub async fn spawn_server(
     auth: ExpectedAuth,
     expected_user_agent: Option<HeaderValue>,
+) -> Result<ServerConfig> {
+    spawn_server_of_type(auth, expected_user_agent, ServerType::Tls).await
+}
+
+pub async fn spawn_server_of_type(
+    auth: ExpectedAuth,
+    expected_user_agent: Option<HeaderValue>,
+    server_type: ServerType,
 ) -> Result<ServerConfig> {
     let vpn_server_private_key = SecretKey::gen();
     let public_key = vpn_server_private_key.public();
@@ -261,18 +276,23 @@ pub async fn spawn_server(
     let login_service = LoginServer::new(stub.clone());
 
     let tls_config = TlsConfig::new()?;
-    let tonic_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
-        tls_config.leaf_cert.pem(),
-        &tls_config.leaf_key_pem,
-    ));
+
+    let builder = Server::builder();
+    let mut builder = match server_type {
+        ServerType::Tls => {
+            let tonic_tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+                tls_config.leaf_cert.pem(),
+                &tls_config.leaf_key_pem,
+            ));
+            builder.tls_config(tonic_tls_config)?
+        }
+        ServerType::Plain => builder,
+    };
 
     let listener = TcpListener::bind(ANY_LOCAL_PORT).await?;
     let port = listener.local_addr()?.port();
 
-    let server = Server::builder()
-        .tls_config(tonic_tls_config)?
-        .add_service(ens_service)
-        .add_service(login_service);
+    let server = builder.add_service(ens_service).add_service(login_service);
 
     tokio::spawn(async move {
         if let Err(e) = server

@@ -409,6 +409,7 @@ pub trait ProtectCallback: Send + Sync {
 struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
+    enable_ech: bool,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
@@ -430,6 +431,7 @@ impl Config {
         let state = ConfigState {
             buffer_size: 5,
             allow_only_pq: true,
+            enable_ech: false,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -452,6 +454,10 @@ impl Config {
 
     pub fn set_allow_only_pq(&self, allow_only_pq: bool) {
         self.state.lock().allow_only_pq = allow_only_pq;
+    }
+
+    pub fn set_enable_ech(&self, enable_ech: bool) {
+        self.state.lock().enable_ech = enable_ech;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -485,6 +491,9 @@ pub fn connect(
 ) -> Result<Arc<Connection>> {
     catch_panic_result(|| {
         let config = config.state.lock().clone();
+        if config.enable_ech {
+            warn!("ECH requested but not implemented yet, connecting without it");
+        }
 
         let handle = get_runtime()?;
 
@@ -1850,12 +1859,58 @@ mod tests {
         assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
         assert!(callback.disconnects.lock().is_empty());
         assert_eq!(
-            stub.handshakes(),
+            stub.wait_for_handshakes(1),
             vec![Handshake {
                 accepted: false,
                 sni_seen: None,
                 outer_sni: None,
             }]
+        );
+    }
+
+    #[test_log::test]
+    fn ech_bootstraps_from_retry_configs() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, EchMode::On);
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_enable_ech(true);
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        info!("XXX");
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+        assert!(callback.disconnects.lock().is_empty());
+        assert_eq!(upstream.streams(), 1);
+
+        let handshakes = stub.wait_for_handshakes(2);
+        assert_eq!(handshakes.len(), 2, "handshakes: {handshakes:?}");
+
+        let bootstrap = &handshakes[0];
+        assert!(!bootstrap.accepted);
+        let cover_name = bootstrap
+            .outer_sni
+            .clone()
+            .expect("bootstrap hello without SNI");
+        assert_ne!(cover_name, ECH_PUBLIC_NAME);
+        assert_eq!(bootstrap.sni_seen, Some(cover_name));
+
+        assert_eq!(
+            handshakes[1],
+            Handshake {
+                accepted: true,
+                sni_seen: None,
+                outer_sni: Some(ECH_PUBLIC_NAME.to_owned()),
+            }
         );
     }
 }

@@ -205,6 +205,13 @@ interface Config {
     /// [default true]
     void set_allow_only_pq(boolean allow_only_pq);
 
+    /// When enabled, the TLS handshake with the ENS server uses Encrypted
+    /// Client Hello. The first handshake offers ECH with a throwaway key, the
+    /// server rejects it and returns its ECH configuration, and the client
+    /// reconnects with it.
+    /// [default false]
+    void set_enable_ech(boolean enable_ech);
+
     /// DER encoded root certificate used to verify the ENS server instead of
     /// the one built into the library. Intended for testing.
     /// When set to null, the built in certificate is used.

@@ -5,7 +5,7 @@
 use std::{
     io::{BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    process::{Child, ChildStdout, Command as ProcessCommand, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command as ProcessCommand, Stdio},
     str::SplitWhitespace,
     sync::{
         mpsc::{self, Sender},
@@ -46,6 +46,10 @@ const ECH_STUB_START_TIMEOUT: Duration = Duration::from_secs(120);
 const ECH_STUB_READY: &str = "ready";
 const ECH_STUB_HANDSHAKE: &str = "handshake";
 const ECH_STUB_NONE: &str = "-";
+const ECH_STUB_KEYLOG_ENV: &str = "ECH_STUB_KEYLOG";
+const ECH_STUB_LOG_TARGET: &str = "echstub";
+const SLOG_TIME_KEY: &str = "time=";
+const SLOG_LEVEL_KEY: &str = "level=";
 pub const CALLBACK_PANIC_MESSAGE: &str = "test callback panic";
 
 static INIT: Once = Once::new();
@@ -103,16 +107,28 @@ pub struct GoEchStub {
 impl GoEchStub {
     pub fn spawn(upstream_port: u16, public_name: &str, ech: EchMode) -> Self {
         let upstream = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, upstream_port));
-        let mut child = ProcessCommand::new("go")
+        let mut command = ProcessCommand::new("go");
+        command
             .args(["run", "."])
             .args(["-upstream", &upstream.to_string()])
             .args(["-public-name", public_name])
             .args(["-ech", ech.flag()])
+            .arg("-v");
+        if let Some(path) = std::env::var_os(ECH_STUB_KEYLOG_ENV) {
+            command.arg("-keylog").arg(path);
+        }
+
+        let mut child = command
             .current_dir(ECH_STUB_DIR)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("ECH tests need go 1.24+ on PATH: {e}"));
+
+        // Spawned from the test thread so libtest captures the forwarded lines
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || forward_ech_stub_stderr(stderr));
 
         let stdout = child.stdout.take().unwrap();
         let handshakes = Arc::new(Mutex::new(Vec::new()));
@@ -146,6 +162,16 @@ impl GoEchStub {
     pub fn handshakes(&self) -> Vec<Handshake> {
         self.handshakes.lock().clone()
     }
+
+    // Returns what arrived once `count` handshakes are in or the wait runs out,
+    // so the caller's assertion reports the actual list instead of a timeout.
+    pub fn wait_for_handshakes(&self, count: usize) -> Vec<Handshake> {
+        let deadline = Instant::now() + MAX_WAIT_TIME;
+        while self.handshakes.lock().len() < count && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        self.handshakes()
+    }
 }
 
 impl Drop for GoEchStub {
@@ -154,6 +180,39 @@ impl Drop for GoEchStub {
         drop(self.child.stdin.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn forward_ech_stub_stderr(stderr: ChildStderr) {
+    for line in BufReader::new(stderr).lines() {
+        let Ok(line) = line else {
+            return;
+        };
+        let (level, message) = parse_slog_line(&line);
+        log::log!(target: ECH_STUB_LOG_TARGET, level, "{message}");
+    }
+}
+
+fn parse_slog_line(line: &str) -> (log::Level, &str) {
+    let without_time = match line.split_once(' ') {
+        Some((time, rest)) if time.starts_with(SLOG_TIME_KEY) => rest,
+        _ => line,
+    };
+    match without_time
+        .strip_prefix(SLOG_LEVEL_KEY)
+        .and_then(|l| l.split_once(' '))
+    {
+        Some((level, message)) => (slog_level(level), message),
+        None => (log::Level::Warn, without_time),
+    }
+}
+
+fn slog_level(name: &str) -> log::Level {
+    match name {
+        "DEBUG" => log::Level::Debug,
+        "INFO" => log::Level::Info,
+        "WARN" => log::Level::Warn,
+        _ => log::Level::Error,
     }
 }
 

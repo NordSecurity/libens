@@ -409,7 +409,7 @@ pub trait ProtectCallback: Send + Sync {
 struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
-    enable_ech: bool,
+    tls_domain: Option<String>,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
@@ -431,7 +431,7 @@ impl Config {
         let state = ConfigState {
             buffer_size: 5,
             allow_only_pq: true,
-            enable_ech: false,
+            tls_domain: None,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -456,8 +456,8 @@ impl Config {
         self.state.lock().allow_only_pq = allow_only_pq;
     }
 
-    pub fn set_enable_ech(&self, enable_ech: bool) {
-        self.state.lock().enable_ech = enable_ech;
+    pub fn set_enable_ech_bootstrap(&self, tls_domain: Option<String>) {
+        self.state.lock().tls_domain = tls_domain;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -491,9 +491,6 @@ pub fn connect(
 ) -> Result<Arc<Connection>> {
     catch_panic_result(|| {
         let config = config.state.lock().clone();
-        if config.enable_ech {
-            warn!("ECH requested but not implemented yet, connecting without it");
-        }
 
         let handle = get_runtime()?;
 
@@ -527,6 +524,14 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
+    let tls_domain: Option<DnsName> = config
+        .tls_domain
+        .map(|d| d.try_into())
+        .transpose()
+        .map_err(|e| EnsError::InternalError {
+            reason: format!("tls_domain is incorrect: {e:?}"),
+        })?;
+
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
     let callback = GuardedCallback::new(callback);
@@ -563,7 +568,7 @@ async fn connect_impl(
     });
 
     client
-        .start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff)
+        .start_monitor_on_port(vpn.ip(), vpn.port(), tls_domain, authentication, backoff)
         .await;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
@@ -899,6 +904,7 @@ mod tests {
     const MAINTENANCE_INFO: &str = "planned maintenance";
     const REJECTION_MESSAGE: &str = "token revoked";
     const ECH_PUBLIC_NAME: &str = "cover.example.com";
+    const TLS_DOMAIN: &str = "secret.example.com";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 
     const OLD_SERVER_INFO: &str = "bar";
@@ -1874,33 +1880,29 @@ mod tests {
 
         let runtime = get_runtime().unwrap();
         let upstream = runtime.block_on(spawn_plain_server());
-        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, EchMode::On);
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            EchMode::On {
+                tls_domain: TLS_DOMAIN,
+            },
+        );
 
         let callback = RecordedCallback::default();
         let config = Config::new();
         config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
-        config.set_enable_ech(true);
+        config.set_enable_ech_bootstrap(Some(TLS_DOMAIN.to_owned()));
         let _connection =
             connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
 
-        info!("XXX");
-
-        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
-        wait_for(|| !callback.notifications.lock().is_empty());
-
-        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
-        assert!(callback.disconnects.lock().is_empty());
-        assert_eq!(upstream.streams(), 1);
-
         let handshakes = stub.wait_for_handshakes(2);
         assert_eq!(handshakes.len(), 2, "handshakes: {handshakes:?}");
+        assert_eq!(upstream.streams(), 1);
+        assert!(callback.disconnects.lock().is_empty());
 
         let bootstrap = &handshakes[0];
         assert!(!bootstrap.accepted);
-        let cover_name = bootstrap
-            .outer_sni
-            .clone()
-            .expect("bootstrap hello without SNI");
+        let cover_name = bootstrap.outer_sni.clone().unwrap();
         assert_ne!(cover_name, ECH_PUBLIC_NAME);
         assert_eq!(bootstrap.sni_seen, Some(cover_name));
 
@@ -1908,9 +1910,14 @@ mod tests {
             handshakes[1],
             Handshake {
                 accepted: true,
-                sni_seen: None,
+                sni_seen: Some(TLS_DOMAIN.to_owned()),
                 outer_sni: Some(ECH_PUBLIC_NAME.to_owned()),
             }
         );
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
     }
 }

@@ -77,6 +77,7 @@ func report(format string, args ...any) {
 func main() {
 	upstream := flag.String("upstream", "", "plaintext upstream host:port")
 	publicName := flag.String("public-name", "", "ECHConfig public_name")
+	tlsDomain := flag.String("tls-domain", "", "inner name the leaf certificate also covers")
 	ech := flag.String("ech", echOn, "on|off")
 	verbose := flag.Bool("v", false, "debug logging on stderr")
 	keyLog := flag.String("keylog", "", "append TLS secrets in NSS key log format to this file")
@@ -96,7 +97,7 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	caDER, leaf := makeCerts(*publicName)
+	caDER, leaf := makeCerts(*publicName, *tlsDomain)
 	cfg := &tls.Config{
 		Certificates: []tls.Certificate{leaf},
 		NextProtos:   []string{alpnH2},
@@ -151,7 +152,7 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
-func makeCerts(publicName string) ([]byte, tls.Certificate) {
+func makeCerts(publicName, tlsDomain string) ([]byte, tls.Certificate) {
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		fatal("crypto setup failed", err)
@@ -179,6 +180,10 @@ func makeCerts(publicName string) ([]byte, tls.Certificate) {
 	if err != nil {
 		fatal("crypto setup failed", err)
 	}
+	dnsNames := []string{publicName}
+	if tlsDomain != "" {
+		dnsNames = append(dnsNames, tlsDomain)
+	}
 	leafTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: publicName},
@@ -186,7 +191,7 @@ func makeCerts(publicName string) ([]byte, tls.Certificate) {
 		NotAfter:     now.Add(certLifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{publicName},
+		DNSNames:     dnsNames,
 		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
 	}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)

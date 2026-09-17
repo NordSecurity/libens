@@ -12,7 +12,9 @@ use http::{HeaderValue, Uri};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use rustls::{
-    client::danger::ServerCertVerifier, crypto::CryptoProvider, pki_types::CertificateDer,
+    client::{danger::ServerCertVerifier, EchConfig},
+    crypto::{aws_lc_rs::hpke::ALL_SUPPORTED_SUITES, hpke::Hpke, CryptoProvider},
+    pki_types::{CertificateDer, DnsName, EchConfigListBytes, ServerName},
     ClientConfig, RootCertStore,
 };
 use tokio::{
@@ -44,6 +46,8 @@ const AUTHENTICATION_KEY: &str = "authentication";
 const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
+const MISSING_HOST_MSG: &str = "missing host in vpn uri";
+const MISSING_PORT_MSG: &str = "missing port in vpn uri";
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -177,10 +181,11 @@ impl ErrorNotificationService {
         &mut self,
         vpn_ip: IpAddr,
         ens_port: u16,
+        tls_domain: Option<DnsName<'static>>,
         authentication: ClientAuthentication,
         backoff: impl Backoff,
     ) {
-        info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
+        info!("Will start ENS monitoring on {vpn_ip}:{ens_port}, tls_domain: {tls_domain:?}");
         self.stop().await;
 
         let (quit_tx, quit_rx): (watch::Sender<bool>, watch::Receiver<bool>) =
@@ -201,6 +206,7 @@ impl ErrorNotificationService {
             // This future is too big for keeping it on the stack
             if let Err(e) = Box::pin(task(
                 &vpn_uri,
+                tls_domain,
                 authentication,
                 pool.clone(),
                 tx,
@@ -357,6 +363,7 @@ pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &str,
+    tls_domain: Option<DnsName<'static>>,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
     tx: Sender<Event>,
@@ -400,6 +407,7 @@ async fn task(
 
         let external_channel = match Box::pin(open_channel(
             vpn_uri,
+            tls_domain.as_ref(),
             pool.clone(),
             &tx,
             allow_only_mlkem,
@@ -478,6 +486,7 @@ async fn task(
 
 async fn open_channel(
     vpn_uri: &str,
+    tls_domain: Option<&DnsName<'static>>,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
     allow_only_mlkem: bool,
@@ -487,6 +496,7 @@ async fn open_channel(
 ) -> Result<Channel, Error> {
     let attempt = create_external_channel(
         vpn_uri,
+        tls_domain.cloned(),
         pool,
         allow_only_mlkem,
         root_certificate,
@@ -544,38 +554,118 @@ fn authentication_interceptor(
     }
 }
 
+async fn bootstrap_ech(
+    uri: Uri,
+    expected_tls_hostname: ServerName<'static>,
+    pool: Arc<SocketPool>,
+    allow_only_mlkem: bool,
+    root_certificate: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(host) = uri.host() else {
+        return Err(Error::Internal {
+            reason: MISSING_HOST_MSG.to_owned(),
+        });
+    };
+    let Some(port) = uri.port_u16() else {
+        return Err(Error::Internal {
+            reason: MISSING_PORT_MSG.to_owned(),
+        });
+    };
+
+    let socket = pool.new_external_tcp_v4(None).unwrap();
+    let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        .unwrap();
+
+    if let Some(resolved) = lookup_host((host, port)).await.unwrap().next() {
+        let tcp_stream = socket.connect(resolved).await.unwrap();
+        let tls_connector = make_tls_connector(
+            allow_only_mlkem,
+            root_certificate,
+            EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
+        )
+        .unwrap();
+        let tls_stream = tls_connector.connect(domain, tcp_stream).await;
+        if let Err(e) = &tls_stream {
+            fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
+                e.get_ref()?.downcast_ref::<rustls::Error>()
+            }
+
+            if let Some(rustls::Error::PeerIncompatible(
+                rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+            )) = as_rustls_error(&e)
+            {
+                use rustls::internal::msgs::codec::Codec;
+
+                return Ok(Some(retry_configs.get_encoding()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 async fn create_external_channel(
     vpn_uri: &str,
+    tls_domain: Option<DnsName<'static>>,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
     user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
+    let bootstrapped_ech_config_list = if let Some(tls_domain) = &tls_domain {
+        let retry_configs = bootstrap_ech(
+            vpn_uri.parse().unwrap(),
+            ServerName::DnsName(tls_domain.to_owned()),
+            pool.clone(),
+            allow_only_mlkem,
+            &root_certificate,
+        )
+        .await?;
+        if retry_configs.is_some() {
+            info!("ECH bootstrapping success");
+        }
+        retry_configs
+    } else {
+        None
+    };
+
     let socket_factory = move |uri: Uri| {
+        let tls_domain = tls_domain.clone();
         let pool = pool.clone();
         let root_certificate = root_certificate.clone();
+        let bootstrapped_ech_config_list = bootstrapped_ech_config_list.clone();
         async move {
             let Some(host) = uri.host() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "missing host in vpn uri",
+                    MISSING_HOST_MSG,
                 ));
             };
             let Some(port) = uri.port_u16() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "missing port in vpn uri",
+                    MISSING_PORT_MSG,
                 ));
             };
 
             let socket = pool.new_external_tcp_v4(None)?;
-            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let domain = if let Some(tls_domain) = &tls_domain {
+                ServerName::DnsName(tls_domain.to_owned())
+            } else {
+                tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+            };
 
             if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
-                let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate)?;
+                let mode = match bootstrapped_ech_config_list {
+                    Some(bootstrapped_ech_config_list) => {
+                        EchMode::UseEchConfigList(bootstrapped_ech_config_list)
+                    }
+                    None => EchMode::None,
+                };
+                let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate, mode)?;
                 let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
                 return Ok::<_, std::io::Error>(TokioIo::new(tls_stream));
             }
@@ -627,6 +717,7 @@ fn make_crypto_provider(allow_only_mlkem: bool) -> Arc<CryptoProvider> {
 fn make_trusted_root_cert_verifier(
     crypto_provider: Arc<CryptoProvider>,
     root_certificate: &[u8],
+    expected_tls_hostname: Option<ServerName<'static>>,
 ) -> std::io::Result<Arc<impl ServerCertVerifier>> {
     use rustls::{
         client::{danger::HandshakeSignatureValid, WebPkiServerVerifier},
@@ -635,7 +726,10 @@ fn make_trusted_root_cert_verifier(
     };
 
     #[derive(Debug)]
-    struct CertFingerprintLogger(Arc<WebPkiServerVerifier>);
+    struct CertFingerprintLogger {
+        inner: Arc<WebPkiServerVerifier>,
+        expected_tls_hostname: Option<ServerName<'static>>,
+    }
 
     impl ServerCertVerifier for CertFingerprintLogger {
         fn verify_server_cert(
@@ -653,10 +747,20 @@ fn make_trusted_root_cert_verifier(
                 hex::encode(hash)
             );
 
-            let verification = self.0.verify_server_cert(
+            // In case of ECH bootstrap we need to switch the hostname. The
+            // RFC compliant behaviour of rustls is to pass in here the random
+            // public domain that we sent in the initial TLS connection. The
+            // server will return certificate that doesn't include that domain
+            // but will include the secret domain that we also know. Which is
+            // why we switch, so that verification is done against the secret
+            // domain.
+            let verification = self.inner.verify_server_cert(
                 end_entity,
                 intermediates,
-                server_name,
+                match &self.expected_tls_hostname {
+                    Some(expected_tls_hostname) => expected_tls_hostname,
+                    None => server_name,
+                },
                 ocsp_response,
                 now,
             );
@@ -672,7 +776,7 @@ fn make_trusted_root_cert_verifier(
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            self.0.verify_tls12_signature(message, cert, dss)
+            self.inner.verify_tls12_signature(message, cert, dss)
         }
 
         fn verify_tls13_signature(
@@ -681,11 +785,11 @@ fn make_trusted_root_cert_verifier(
             cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            self.0.verify_tls13_signature(message, cert, dss)
+            self.inner.verify_tls13_signature(message, cert, dss)
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.0.supported_verify_schemes()
+            self.inner.supported_verify_schemes()
         }
     }
 
@@ -700,25 +804,216 @@ fn make_trusted_root_cert_verifier(
     }
     debug!("Added {added} certs to trusted store, ignored: {ignored}");
 
-    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), crypto_provider)
+    let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), crypto_provider)
         .build()
         .map_err(std::io::Error::other)?;
-    Ok(Arc::new(CertFingerprintLogger(verifier)))
+    Ok(Arc::new(CertFingerprintLogger {
+        inner,
+        expected_tls_hostname,
+    }))
+}
+
+pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError> {
+    // take the first entry of supported suites
+    let hpke = rustls::crypto::aws_lc_rs::hpke::DH_KEM_P256_HKDF_SHA256_AES_128;
+
+    let mut buf = Vec::new();
+
+    // push number of entries to be filled later
+    buf.extend(0u16.to_be_bytes());
+
+    // `ECHConfig[0]`
+    buf.extend(0xfe0du16.to_be_bytes()); // version
+    buf.extend(0u16.to_be_bytes()); // length to be filled later
+
+    let offset = buf.len();
+
+    // `HpkeKeyConfig`
+    buf.extend([0u8]); // config_id
+    buf.extend(u16::from(hpke.suite().kem).to_be_bytes()); // kem_id
+
+    let key = if let Ok((pubkey, _)) = hpke.generate_key_pair() {
+        pubkey.0
+    } else {
+        // In practice, this should never be triggered
+        const FALLBACK_PUBKEY:&[u8] = b"\x04\x8e\x6a\xeb\x94\xc7\x86\x27\x53\xcc\xce\x22\x70\x5f\xa5\x68\xa9\x3d\x82\x0e\x41\xf7\xb1\x75\xbd\xcd\x77\x40\x4a\xd3\x8b\x11\x70\x71\x61\x95\xd7\x5f\x52\xf9\xaa\xc0\x80\xb4\x6b\x8d\x3a\xb1\x5d\xc4\x3e\xea\xae\xf5\x64\xa6\xf0\xcb\x4e\xe3\xef\xf8\xa0\xef\x60";
+        FALLBACK_PUBKEY.to_vec()
+    };
+
+    buf.extend(u16::try_from(key.len())?.to_be_bytes()); // public key
+    buf.extend(key);
+
+    // `HpkeSymmetricCipherSuite`
+    buf.extend(4u16.to_be_bytes()); // len + 4
+
+    buf.extend(u16::from(hpke.suite().sym.kdf_id).to_be_bytes()); // kdf_id
+    buf.extend(u16::from(hpke.suite().sym.aead_id).to_be_bytes()); // aead_id
+
+    buf.extend([0u8]); // maximum_name_length
+
+    let opaque_name = public_domain.as_bytes();
+    let len: u8 = opaque_name.len().min(255).try_into()?;
+
+    buf.extend([len]);
+    buf.extend(&opaque_name[..len as usize]); // public_name
+
+    buf.extend(0u16.to_be_bytes()); // extensions
+
+    // fixup `ECHConfig` length
+
+    let len = u16::try_from(buf.len() - offset)?;
+    buf[(offset - 2)..][..2].copy_from_slice(&len.to_be_bytes());
+
+    // fixup whole list length
+    let len = u16::try_from(buf.len() - 2)?;
+    buf[..2].copy_from_slice(&len.to_be_bytes());
+
+    Ok(buf)
+}
+
+pub fn generate_random_domain() -> String {
+    // Most popular English words according to https://en.wikipedia.org/wiki/Most_common_words_in_English
+    //
+    const NOUNS: &[&str] = &[
+        "time",
+        "person",
+        "year",
+        "way",
+        "day",
+        "thing",
+        "man",
+        "world",
+        "life",
+        "hand",
+        "part",
+        "child",
+        "eye",
+        "woman",
+        "place",
+        "work",
+        "week",
+        "case",
+        "point",
+        "government",
+        "company",
+        "number",
+        "group",
+        "problem",
+        "fact",
+    ];
+
+    const VERBS: &[&str] = &[
+        "be", "have", "do", "say", "get", "make", "go", "know", "take", "see", "come", "think",
+        "look", "want", "give", "use", "find", "tell", "ask", "work", "seem", "feel", "try",
+        "leave", "call",
+    ];
+
+    const ADJECTIVES: &[&str] = &[
+        "good",
+        "new",
+        "first",
+        "last",
+        "long",
+        "great",
+        "little",
+        "own",
+        "other",
+        "old",
+        "right",
+        "big",
+        "high",
+        "different",
+        "small",
+        "large",
+        "next",
+        "early",
+        "young",
+        "important",
+        "few",
+        "public",
+        "bad",
+        "same",
+        "able",
+    ];
+
+    const CODES: &[&str] = &["io", "org", "com"];
+
+    const SEPARATORS: &[&str] = &["", "-"];
+
+    fn sample<'a>(slice: &[&'a str]) -> &'a str {
+        slice[rand::random_range(0..slice.len())]
+    }
+
+    let mut domain = String::new();
+
+    let sep = sample(SEPARATORS);
+
+    domain.push_str(sample(VERBS));
+    domain.push_str(sep);
+
+    if rand::random_bool(0.5) {
+        // use adjective
+        domain.push_str(sample(ADJECTIVES));
+        domain.push_str(sep);
+    }
+
+    domain.push_str(sample(NOUNS));
+    domain.push('.');
+    domain.push_str(sample(CODES));
+
+    domain
+}
+
+enum EchMode {
+    None,
+    BootstrapWithExpectedServerName(ServerName<'static>),
+    UseEchConfigList(Vec<u8>),
 }
 
 fn make_tls_connector(
     allow_only_mlkem: bool,
     root_certificate: &[u8],
+    ech_mode: EchMode,
 ) -> std::io::Result<TlsConnector> {
     let provider = make_crypto_provider(allow_only_mlkem);
 
-    let mut tls_config = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(std::io::Error::other)?
+    let (mode, expected_tls_hostname) = match ech_mode {
+        EchMode::None => (None, None),
+        EchMode::BootstrapWithExpectedServerName(server_name) => {
+            let domain = generate_random_domain();
+            let ech_config_list = random_key_config(&domain);
+            let ech_config_list = EchConfigListBytes::from(ech_config_list);
+            let hpke_suites = ALL_SUPPORTED_SUITES;
+            // TODO: is that hpke correct?
+            let ech_config: EchConfig = EchConfig::new(ech_config_list, hpke_suites).unwrap();
+            (
+                Some(rustls::client::EchMode::Enable(random_ech_config)),
+                Some(server_name),
+            )
+        }
+        EchMode::UseEchConfigList(ech_config_bytes) => {
+            let hpke_suites = ALL_SUPPORTED_SUITES;
+            let ech_config: EchConfig =
+                EchConfig::new(EchConfigListBytes::from(ech_config_bytes), hpke_suites).unwrap();
+            (Some(rustls::client::EchMode::Enable(ech_config)), None)
+        }
+    };
+
+    let tls_config = ClientConfig::builder_with_provider(provider.clone());
+    let tls_config = match mode {
+        Some(ech_mode) => tls_config
+            .with_ech(ech_mode)
+            .map_err(std::io::Error::other)?,
+        None => tls_config
+            .with_safe_default_protocol_versions()
+            .map_err(std::io::Error::other)?,
+    };
+    let mut tls_config = tls_config
         .dangerous()
         .with_custom_certificate_verifier(make_trusted_root_cert_verifier(
             provider,
             root_certificate,
+            expected_tls_hostname,
         )?)
         .with_no_client_auth();
 
@@ -972,6 +1267,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
+            None,
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1060,6 +1356,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
+            None,
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1163,6 +1460,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
+            None,
             client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
@@ -1262,6 +1560,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             port_rx.await.unwrap(),
+            None,
             client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1297,13 +1596,15 @@ pub mod tests {
     fn test_built_in_root_certificate_loads() {
         assert!(make_trusted_root_cert_verifier(
             make_crypto_provider(true),
-            DEFAULT_ROOT_CERTIFICATE
+            DEFAULT_ROOT_CERTIFICATE,
+            None,
         )
         .is_ok());
     }
 
     #[test]
     fn test_cert_verification_rejects_invalid_request() {
+        // TODO: add tests for the handling of optional servername
         use rustls::{
             client::danger::ServerCertVerifier,
             internal::msgs::codec::{Codec, Reader},
@@ -1312,7 +1613,8 @@ pub mod tests {
 
         let tls = TlsConfig::new().unwrap();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der(), None)
+                .unwrap();
         let leaf_cert = tls.leaf_cert.der();
 
         // DigitallySignedStruct with incorrect signature bytes
@@ -1353,6 +1655,7 @@ pub mod tests {
 
     #[test]
     fn test_cert_verification_accepts_correct_request() {
+        // TODO: server name handling tests
         use rustls::{
             client::danger::ServerCertVerified,
             pki_types::{ServerName, UnixTime},
@@ -1360,7 +1663,8 @@ pub mod tests {
 
         let tls = TlsConfig::new().unwrap();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der(), None)
+                .unwrap();
 
         assert_matches!(
             verifier.verify_server_cert(
@@ -1380,7 +1684,8 @@ pub mod tests {
 
         let tls = TlsConfig::new().unwrap();
         let verifier =
-            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der()).unwrap();
+            make_trusted_root_cert_verifier(make_crypto_provider(true), tls.ca_cert.der(), None)
+                .unwrap();
 
         assert_matches!(
             verifier.verify_server_cert(

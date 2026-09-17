@@ -72,14 +72,14 @@ pub async fn spawn_plain_server() -> ServerConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchMode {
-    On,
+    On { tls_domain: &'static str },
     Off,
 }
 
 impl EchMode {
     fn flag(self) -> &'static str {
         match self {
-            EchMode::On => "on",
+            EchMode::On { .. } => "on",
             EchMode::Off => "off",
         }
     }
@@ -88,8 +88,9 @@ impl EchMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Handshake {
     pub accepted: bool,
-    pub sni_seen: Option<String>,
     pub outer_sni: Option<String>,
+    // "Inner" SNI as seen by the Go proxy
+    pub sni_seen: Option<String>,
 }
 
 struct EchStubReady {
@@ -114,6 +115,9 @@ impl GoEchStub {
             .args(["-public-name", public_name])
             .args(["-ech", ech.flag()])
             .arg("-v");
+        if let EchMode::On { tls_domain } = ech {
+            command.args(["-tls-domain", tls_domain]);
+        }
         if let Some(path) = std::env::var_os(ECH_STUB_KEYLOG_ENV) {
             command.arg("-keylog").arg(path);
         }

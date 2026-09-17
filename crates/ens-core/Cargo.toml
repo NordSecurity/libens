@@ -13,7 +13,7 @@ telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32
 telio-crypto = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b" }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
 parking_lot = "0.12.5"
-llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v1.0.0" }
+llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
 thiserror = { version = "2", default-features = false }
 log = { version = "0.4.34", default-features = false, features = ["std"] }
 built = { version = "0.8.0", default-features = false }

@@ -126,6 +126,26 @@ go test ./...
 
 `ENS_STUB` overrides the stub binary path.
 
+`tests/cs` drives the stub through the generated c# bindings. The generator
+emits `internal` types, so the bindings are compiled into the test assembly
+rather than referenced as a package. Linux only, against the released
+`libens.so`.
+
+```sh
+uniffi-bindgen-cs ./ens.udl --config uniffi.toml --out-dir dist/windows/cs
+mkdir -p tests/cs/bindings
+cp dist/windows/cs/ens.cs tests/cs/bindings/
+python3 ci/build.py build linux x86_64
+cargo build --package ens-stub
+```
+
+```sh
+cd tests/cs
+export LD_LIBRARY_PATH="$PWD/../../dist/linux/release/x86_64"
+export ENS_STUB="$PWD/../../target/debug/ens-stub"
+dotnet test
+```
+
 ## CLI
 
 `ens-cli` resolves servers and credentials through the NordVPN API, then opens

@@ -657,6 +657,36 @@ async fn connect_impl(
     }))
 }
 
+// Runs only the ECH bootstrap against `vpn`, ignoring the ECH setting in `config`
+pub fn bootstrap_ech(vpn: SocketAddr, config: &Arc<Config>) -> Result<Option<Vec<u8>>> {
+    catch_panic_result(|| {
+        let config = config.state.lock().clone();
+
+        let handle = get_runtime()?;
+
+        block_in_place(|| handle.block_on(bootstrap_ech_impl(vpn, config)))
+    })
+}
+
+async fn bootstrap_ech_impl(vpn: SocketAddr, config: ConfigState) -> Result<Option<Vec<u8>>> {
+    let tls = TlsOptions::new(&config)?;
+    let socket_pool = make_socket_pool(None)?;
+
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| EnsError::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+
+    let (client, _receiver) =
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
+
+    Ok(client.bootstrap_ech(vpn.ip(), vpn.port(), &tls).await?)
+}
+
 fn make_socket_protector(
     protect_cb: Option<Box<dyn ProtectCallback>>,
 ) -> Option<telio_sockets::Protect> {
@@ -858,6 +888,7 @@ mod tests {
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
     use rstest::rstest;
+    use std::net::Ipv4Addr;
     use std::sync::Once;
     use std::time::Instant;
     use telio_crypto::SecretKey;
@@ -918,6 +949,8 @@ mod tests {
     const INVALID_TLS_DOMAIN_REASON: &str = "tls_domain is incorrect";
     const STUB_CERTIFICATE_DOMAIN: &str = "localhost";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+    const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(10);
+    const BOOTSTRAP_ECH_TIMEOUT_SECONDS: u32 = 1;
 
     const OLD_SERVER_INFO: &str = "bar";
     const NEW_SERVER_INFO: &str = "baz";
@@ -1007,6 +1040,46 @@ mod tests {
         assert!(reason.contains("not valid for name"));
         assert_eq!(server_config.streams(), 0);
         assert!(callback.notifications.lock().is_empty());
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_with_invalid_tls_domain_returns_internal_error() {
+        run_init();
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let vpn = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let bootstrapped = bootstrap_ech(vpn, &Arc::new(config));
+
+        assert_matches!(bootstrapped, Err(EnsError::InternalError{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_against_silent_server_returns() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let vpn = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let mut accepted = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_bootstrap_ech_timeout(BOOTSTRAP_ECH_TIMEOUT_SECONDS);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(bootstrap_ech(vpn, &Arc::new(config)));
+        });
+
+        let bootstrapped = done_rx.recv_timeout(BOOTSTRAP_DEADLINE);
+        assert_matches!(bootstrapped, Ok(Err(_)));
     }
 
     #[test_log::test]

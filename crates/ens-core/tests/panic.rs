@@ -1,33 +1,18 @@
-use ens_core::{panics::catch_panic, set_log_callback, LogCallback, LogLevel};
-use std::sync::{Arc, Mutex};
+#[path = "../src/test_support.rs"]
+mod test_support;
 
-type LogEntry = (LogLevel, String);
+use ens_core::{panics::catch_panic, set_log_callback, LogLevel};
 
-struct RecordingCallback {
-    storage: Arc<Mutex<Vec<LogEntry>>>,
-}
-
-impl RecordingCallback {
-    pub fn new(storage: Arc<Mutex<Vec<LogEntry>>>) -> Self {
-        Self { storage }
-    }
-}
-
-impl LogCallback for RecordingCallback {
-    fn log(&self, log_level: LogLevel, message: String) {
-        self.storage.lock().unwrap().push((log_level, message));
-    }
-}
+use test_support::RecordedLogCallback;
 
 #[test]
 fn test_catch_panic() {
-    let storage = Arc::new(Mutex::new(vec![]));
-    let callback = Box::new(RecordingCallback::new(storage.clone()));
-    set_log_callback(LogLevel::Debug, callback).unwrap();
+    let callback = RecordedLogCallback::default();
+    set_log_callback(LogLevel::Debug, Box::new(callback.clone())).unwrap();
     let v = catch_panic(|| -> u32 { panic!("foo") }, 42);
     assert_eq!(42, v);
-    let storage = storage.lock().unwrap().clone();
-    assert_eq!(1, storage.len());
-    assert_eq!(LogLevel::Error, storage[0].0);
-    assert!(storage[0].1.contains("foo"));
+    let entries = callback.entries();
+    assert_eq!(1, entries.len());
+    assert_eq!(LogLevel::Error, entries[0].0);
+    assert!(entries[0].1.contains("foo"));
 }

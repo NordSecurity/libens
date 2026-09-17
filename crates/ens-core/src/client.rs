@@ -70,6 +70,8 @@ pub enum Error {
     InvalidKey { reason: String },
     #[error("Internal error: {reason}")]
     Internal { reason: String },
+    #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
+    UntrustedCertificate { vpn_uri: String, reason: String },
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -312,13 +314,44 @@ impl AuthRejection for Error {
     }
 }
 
-fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
+fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
+    let Error::Transport(transport) = error else {
+        return None;
+    };
+
+    let mut source = std::error::Error::source(transport);
+    while let Some(current) = source {
+        let tls = current.downcast_ref::<rustls::Error>().or_else(|| {
+            current
+                .downcast_ref::<std::io::Error>()?
+                .get_ref()?
+                .downcast_ref::<rustls::Error>()
+        });
+        if let Some(tls @ rustls::Error::InvalidCertificate(_)) = tls {
+            return Some(tls);
+        }
+
+        source = current.source();
+    }
+
+    None
+}
+
+async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the authentication");
-    if let Err(e) = tx.try_send(Event::Disconnect(Some(reason))) {
+    publish_disconnect(tx, reason).await;
+}
+
+async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
+    if let Err(e) = tx.send(Event::Disconnect(Some(reason))).await {
         warn!("Failed to publish disconnect: {e}");
     }
+}
+
+pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
+    format!("'{vpn_uri}' closed the grpc stream")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -351,7 +384,7 @@ async fn task(
                     Ok(v) => v,
                     Err(e) => {
                         if e.is_auth_rejection() {
-                            publish_auth_rejection(&tx, vpn_uri, &e);
+                            publish_auth_rejection(&tx, vpn_uri, &e).await;
                             break 'outer;
                         }
 
@@ -365,28 +398,27 @@ async fn task(
             };
         }
 
-        let pool = pool.clone();
-        let external_channel = handle_error!(
-            Box::pin(create_external_channel(
-                vpn_uri,
-                pool,
-                allow_only_mlkem,
-                root_certificate.clone(),
-                keepalive,
-                user_agent.clone()
-            ))
-            .await,
-            backoff
-        );
+        let external_channel = match Box::pin(open_channel(
+            vpn_uri,
+            pool.clone(),
+            &tx,
+            allow_only_mlkem,
+            root_certificate.clone(),
+            keepalive,
+            user_agent.clone(),
+        ))
+        .await
+        {
+            Err(Error::UntrustedCertificate { .. }) => break 'outer,
+            attempt => handle_error!(attempt, backoff),
+        };
 
         let headers = handle_error!(
             prepare_connection_headers(&authentication, &external_channel).await,
             backoff
         );
 
-        debug!(
-            "Prepared authentication headers, subscribing to error notifications for '{vpn_uri}'"
-        );
+        debug!("Subscribing to error notifications for '{vpn_uri}'");
 
         let mut client = ens_client::EnsClient::with_interceptor(
             external_channel,
@@ -401,46 +433,80 @@ async fn task(
         );
         let mut connection_error_stream = connection.into_inner();
         loop {
-            select! {
+            let connection_error = select! {
                 _ = quit_rx.wait_for(|b| *b) => {
                     info!("ENS monitor for '{vpn_uri}' ends");
                     break 'outer;
                 }
-                connection_error = connection_error_stream.message() => {
-                    warn!("Received error notification for '{vpn_uri}': {connection_error:?}");
-                    match connection_error {
-                        Ok(Some(connection_error)) => {
-                            backoff.reset();
-                            if let Err(e) = tx.try_send(Event::Notification{connection_error, vpn_uri: vpn_uri.to_owned()}) {
-                                warn!("Failed to publish newly received error notification: {e}");
-                            }
-                        }
-                        Ok(None) => {
-                            let msg = format!("'{vpn_uri}' closed the grpc stream");
-                            debug!("{msg}");
-                            if let Err(e) = tx.try_send(Event::Disconnect(Some(msg))) {
-                                warn!("Failed to publish disconnect: {e}");
-                            }
-                            break 'outer;
-                        }
-                        Err(e) if e.is_auth_rejection() => {
-                            publish_auth_rejection(&tx, vpn_uri, &e);
-                            break 'outer;
-                        }
-                        Err(e) => {
-                            // After the first error, the stream will never return any new value, which means
-                            // we need to reconnect. For details, see: https://github.com/hyperium/tonic/blob/c9cc210cb7c6f3f937786a3134c682761a26c65c/tonic/src/codec/decode.rs#L392-L394
-                            error!("GRPC error: {e}");
-                            break;
-                        }
+                connection_error = connection_error_stream.message() => connection_error,
+            };
+
+            warn!("Received error notification for '{vpn_uri}': {connection_error:?}");
+            match connection_error {
+                Ok(Some(connection_error)) => {
+                    backoff.reset();
+                    if let Err(e) = tx.try_send(Event::Notification {
+                        connection_error,
+                        vpn_uri: vpn_uri.to_owned(),
+                    }) {
+                        warn!("Failed to publish newly received error notification: {e}");
                     }
                 }
-            };
+                Ok(None) => {
+                    let msg = stream_closed_reason(vpn_uri);
+                    debug!("{msg}");
+                    publish_disconnect(&tx, msg).await;
+                    break 'outer;
+                }
+                Err(e) if e.is_auth_rejection() => {
+                    publish_auth_rejection(&tx, vpn_uri, &e).await;
+                    break 'outer;
+                }
+                Err(e) => {
+                    // After the first error, the stream will never return any new value, which means
+                    // we need to reconnect. For details, see: https://github.com/hyperium/tonic/blob/c9cc210cb7c6f3f937786a3134c682761a26c65c/tonic/src/codec/decode.rs#L392-L394
+                    error!("GRPC error: {e}");
+                    break;
+                }
+            }
         }
         restart!(&mut backoff);
     }
     debug!("ENS monitor for '{vpn_uri}' terminates");
     Ok(())
+}
+
+async fn open_channel(
+    vpn_uri: &str,
+    pool: Arc<SocketPool>,
+    tx: &Sender<Event>,
+    allow_only_mlkem: bool,
+    root_certificate: Vec<u8>,
+    keepalive: KeepaliveConfig,
+    user_agent: HeaderValue,
+) -> Result<Channel, Error> {
+    let attempt = create_external_channel(
+        vpn_uri,
+        pool,
+        allow_only_mlkem,
+        root_certificate,
+        keepalive,
+        user_agent,
+    )
+    .await;
+
+    let Some(tls) = attempt.as_ref().err().and_then(certificate_rejection) else {
+        return attempt;
+    };
+
+    let untrusted = Error::UntrustedCertificate {
+        vpn_uri: vpn_uri.to_owned(),
+        reason: tls.to_string(),
+    };
+    error!("{untrusted}");
+    publish_disconnect(tx, untrusted.to_string()).await;
+
+    Err(untrusted)
 }
 
 async fn get_login_challenge(
@@ -698,10 +764,7 @@ async fn prepare_connection_headers(
 pub mod tests {
     use std::{
         net::Ipv4Addr,
-        sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            LazyLock,
-        },
+        sync::{atomic::AtomicUsize, LazyLock},
         time::{Duration, Instant},
     };
 
@@ -724,7 +787,10 @@ pub mod tests {
     use tonic::service::Interceptor;
 
     use crate::{
-        test_support::{spawn_server_with_interceptor, Command, GrpcStub, ServerConfig, TlsConfig},
+        test_support::{
+            spawn_server_with_interceptor, Command, GrpcStub, RelayMode, ServerConfig, TcpRelay,
+            TlsConfig,
+        },
         CredentialsKind, Keys, STATE,
     };
 
@@ -815,6 +881,10 @@ pub mod tests {
                 },
             }
         }
+    }
+
+    pub fn closed_reason(vpn_port: u16) -> String {
+        stream_closed_reason(&format!("http://127.0.0.1:{vpn_port}"))
     }
 
     /// The user agent that `init` installed. Tests going through the public
@@ -961,88 +1031,6 @@ pub mod tests {
         }
     }
 
-    struct TcpRelay {
-        port: u16,
-
-        // After setting to true, all **existing** connections become silent (sockets stay open,
-        // but no traffic is forwarded).
-        silent: Arc<AtomicBool>,
-    }
-
-    impl TcpRelay {
-        async fn spawn(server_port: u16) -> Self {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let silent = Arc::new(AtomicBool::new(false));
-
-            tokio::spawn({
-                let silent = silent.clone();
-                async move {
-                    while let Ok((client, _)) = listener.accept().await {
-                        let connected_before_silent = !silent.load(Ordering::Relaxed);
-                        let server = tokio::net::TcpStream::connect(("127.0.0.1", server_port))
-                            .await
-                            .unwrap();
-                        let (mut client_rx, mut client_tx) = client.into_split();
-                        let (mut server_rx, mut server_tx) = server.into_split();
-
-                        // server -> client
-                        tokio::spawn({
-                            let silent = silent.clone();
-                            async move {
-                                let mut buf = [0u8; 4096];
-                                loop {
-                                    match server_rx.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            if connected_before_silent
-                                                && silent.load(Ordering::Relaxed)
-                                            {
-                                                continue;
-                                            }
-                                            if client_tx.write_all(&buf[..n]).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                        // client -> server
-                        tokio::spawn({
-                            let silent = silent.clone();
-                            async move {
-                                let mut buf = [0u8; 4096];
-                                loop {
-                                    match client_rx.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            // Keep draining the client, just never let anything
-                                            // through - a silent server still reads its socket.
-                                            if connected_before_silent
-                                                && silent.load(Ordering::Relaxed)
-                                            {
-                                                continue;
-                                            }
-                                            if server_tx.write_all(&buf[..n]).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            });
-
-            Self { port, silent }
-        }
-    }
-
     fn client_authentication(
         client_private_key: &SecretKey,
         vpn_public_key: PublicKey,
@@ -1112,7 +1100,7 @@ pub mod tests {
             Some("before the silence")
         );
 
-        relay.silent.store(true, Ordering::Relaxed);
+        relay.set_mode(RelayMode::Silent);
         info!("server has gone silent, the client should give up on the connection and reconnect");
 
         // We have no way to know when exactly the tonic/hyper reconnects. Which means
@@ -1199,7 +1187,7 @@ pub mod tests {
             Some("before the silence")
         );
 
-        relay.silent.store(true, Ordering::Relaxed);
+        relay.set_mode(RelayMode::Silent);
         info!("server has gone silent, but without the keepalives the client will not notice");
 
         let next_notification = timeout(Duration::from_secs(30), async {
@@ -1412,6 +1400,15 @@ pub mod tests {
             )
             .unwrap(),
         ))
+    }
+
+    #[test]
+    fn test_built_in_root_certificate_loads() {
+        assert!(make_trusted_root_cert_verifier(
+            make_crypto_provider(true),
+            DEFAULT_ROOT_CERTIFICATE
+        )
+        .is_ok());
     }
 
     #[test]

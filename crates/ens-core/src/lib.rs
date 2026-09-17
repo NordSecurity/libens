@@ -48,7 +48,7 @@ use crate::{
         DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
-    panics::{catch_panic, catch_panic_result},
+    panics::{catch_panic, catch_panic_message, catch_panic_result},
     runtime::{deinit_runtime, get_runtime, init_runtime, is_unexpected_task_failure},
 };
 
@@ -62,6 +62,10 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // Reason reported to `ErrorNotificationCallback::disconnected` when the
 // session was ended by `Connection::shutdown`.
 pub const SHUTDOWN_REASON: &str = "shutdown";
+
+// Prefix of the reason reported to `ErrorNotificationCallback::disconnected`
+// when a panic in `ErrorNotificationCallback::notify` ended the session.
+pub const CALLBACK_PANIC_REASON: &str = "callback panicked";
 
 static STATE: Mutex<Option<GlobalState>> = Mutex::new(None);
 
@@ -121,6 +125,9 @@ impl From<client::Error> for EnsError {
             },
             client::Error::InvalidKey { reason } => Self::UnknownError { reason },
             client::Error::Internal { reason } => Self::InternalError { reason },
+            untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
+                reason: untrusted.to_string(),
+            },
         }
     }
 }
@@ -570,10 +577,20 @@ async fn connect_impl(
                     }
 
                     debug!("Received new connection error: {connection_error:?} from {vpn_uri:?}");
-                    {
+                    let notified = {
                         let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-                        callback.notify(connection_error.into());
+                        catch_panic_message(|| callback.notify(connection_error.into()))
+                    };
+                    let Err(message) = notified else {
+                        continue;
+                    };
+
+                    let mut state = state_clone.lock();
+                    if !state.is_finished() {
+                        let reason = format!("{CALLBACK_PANIC_REASON}: {message}");
+                        *state = ConnectionState::Ended(Some(reason));
                     }
+                    break;
                 }
                 Some(client::Event::Disconnect(reason)) => {
                     warn!("Got a disconnect with a reason: {reason:?}");
@@ -596,7 +613,7 @@ async fn connect_impl(
         {
             debug!("disconnect after loop end: {reason:?}");
             let _guard = CallbackThreadGuard::enter(&callback_thread_id_clone);
-            callback.disconnected(reason);
+            catch_panic(|| callback.disconnected(reason), ());
         }
 
         debug!("Stopping ENS notification pump");
@@ -798,10 +815,13 @@ mod tests {
     #[cfg(test)]
     use crate::client::tests::TestAuthConfig;
     use crate::{
-        client::tests::{global_user_agent, spawn_authenticating_server},
+        client::tests::{closed_reason, global_user_agent, spawn_authenticating_server},
         test_support::{
-            connect_to_test_server_with_auth, wait_for, wait_for_disconnect_reason, Command,
-            RecordedCallback, SHUTDOWN_REASON,
+            connect_local, connect_to_port, connect_to_test_server,
+            connect_to_test_server_with_auth, connect_to_test_server_with_config, error,
+            maintenance, spawn_server, test_auth, wait_for, wait_for_disconnect_reason, Command,
+            PanicAt, RecordedCallback, RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE,
+            SHUTDOWN_REASON,
         },
     };
 
@@ -810,7 +830,9 @@ mod tests {
     use log::info;
     use rstest::rstest;
     use std::sync::Once;
+    use std::time::Instant;
     use telio_crypto::SecretKey;
+    use tonic::{Code, Status};
 
     use super::*;
 
@@ -853,7 +875,26 @@ mod tests {
 
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
 
+    const BEFORE_OUTAGE: &str = "before the outage";
+    const AFTER_OUTAGE: &str = "after the outage";
+    const BACKOFF_SECONDS: u32 = 1;
+    const OUTAGE_DURATION: Duration = Duration::from_secs(3);
+    const RECONNECT_DEADLINE: Duration = Duration::from_secs(BACKOFF_SECONDS as u64 * 2);
+    const RESEND_INTERVAL: Duration = Duration::from_millis(500);
+
+    const MAINTENANCE_INFO: &str = "planned maintenance";
+    const REJECTION_MESSAGE: &str = "token revoked";
+    const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+
+    const OLD_SERVER_INFO: &str = "bar";
+    const NEW_SERVER_INFO: &str = "baz";
+    const NEW_SERVER_INFO_2: &str = "quux";
+
     const RECONNECT_COUNT: usize = 5;
+
+    const SINGLE_SLOT_BUFFER: u32 = 1;
+    const NOTIFICATIONS_OVERFLOWING_BUFFER: usize = 3;
+    const SLOW_CALLBACK_DELAY: Duration = Duration::from_millis(500);
 
     fn tracked_connections(ids: &[Uuid]) -> usize {
         let state = STATE.lock();
@@ -1227,10 +1268,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
 
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
         assert_eq!(
             *callback.notifications.lock(),
             vec![ConnectionErrorNotification {
@@ -1244,12 +1282,121 @@ mod tests {
         assert_matches!(connection.shutdown(), Ok(()));
 
         let disconnects = callback.disconnects.lock().clone();
+        assert_eq!(disconnects, vec![Some(closed_reason(vpn_port))],);
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_stream_closes_while_callback_is_slow() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let callback = RecordedCallback::default();
+        *callback.notify_delay.lock() = SLOW_CALLBACK_DELAY;
+
+        let config = Config::new();
+        config.set_buffer_size(SINGLE_SLOT_BUFFER);
+
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: None,
+        };
+        for _ in 0..NOTIFICATIONS_OVERFLOWING_BUFFER {
+            server_config.send_blocking(Command::Send(error.clone()));
+        }
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(reason, closed_reason(vpn_port));
+    }
+
+    #[test_log::test]
+    fn test_disconnect_reported_when_notify_panics() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let callback = RecordedCallback::default();
+        *callback.panic_at.lock() = PanicAt::Notify;
+
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        let error = ConnectionError {
+            code: EnsProtoError::ServerMaintenance as i32,
+            additional_info: None,
+        };
+        server_config.send_blocking(Command::Send(error.clone()));
+        server_config.send_blocking(Command::Send(error));
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
         assert_eq!(
-            disconnects,
-            vec![Some(format!(
-                "'http://127.0.0.1:{vpn_port}' closed the grpc stream"
-            ))],
+            reason,
+            format!("{CALLBACK_PANIC_REASON}: {CALLBACK_PANIC_MESSAGE}")
         );
+        assert_eq!(callback.notifications.lock().len(), 1);
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
+    }
+
+    #[test_log::test]
+    fn test_shutdown_succeeds_when_disconnected_panics() {
+        run_init();
+
+        let auth = TestAuthConfig::new_nordlynx();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+        let vpn_port = server_config.port;
+
+        let callback = RecordedCallback::default();
+        *callback.panic_at.lock() = PanicAt::Disconnected;
+
+        let connection = connect_to_test_server_with_auth(
+            &server_config,
+            auth.to_authentication(&server_config.public_key),
+            callback.clone(),
+        )
+        .unwrap();
+
+        server_config.send_blocking(Command::End);
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert_eq!(reason, closed_reason(vpn_port));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
+
+        assert_matches!(connection.shutdown(), Ok(()));
+        assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
     }
 
     #[test_log::test]
@@ -1276,10 +1423,7 @@ mod tests {
         server_config.send_blocking(Command::End);
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' closed the grpc stream")
-        );
+        assert_eq!(reason, closed_reason(vpn_port));
         assert_eq!(0, tracked_connections(&[id]));
 
         drop(connection);
@@ -1340,6 +1484,10 @@ mod tests {
                 code: EnsProtoError::ConnectionLimitReached as i32,
                 additional_info: Some("additional info".to_owned()),
             },
+            ConnectionError {
+                code: EnsProtoError::Superseded as i32,
+                additional_info: None,
+            },
         ];
         let expected_errors = [
             ConnectionErrorNotification {
@@ -1349,6 +1497,10 @@ mod tests {
             ConnectionErrorNotification {
                 kind: ConnectionErrorNotificationKind::ConnectionLimitReached,
                 additional_info: Some("additional info".to_owned()),
+            },
+            ConnectionErrorNotification {
+                kind: ConnectionErrorNotificationKind::Superseded,
+                additional_info: None,
             },
         ];
 
@@ -1366,7 +1518,7 @@ mod tests {
                 .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
-        wait_for(|| first_callback.notifications.lock().len() == 2);
+        wait_for(|| first_callback.notifications.lock().len() == expected_errors.len());
         assert_eq!(
             expected_errors,
             first_callback.notifications.lock().as_slice()
@@ -1378,10 +1530,285 @@ mod tests {
                 .unwrap();
 
         runtime.block_on(server_config.send_errors(&errors_to_emit));
-        wait_for(|| second_callback.notifications.lock().len() == 2);
+        wait_for(|| second_callback.notifications.lock().len() == expected_errors.len());
         assert_eq!(
             expected_errors,
             second_callback.notifications.lock().as_slice()
         );
+    }
+
+    fn received(callback: &RecordedCallback, info: &str) -> bool {
+        callback
+            .notifications
+            .lock()
+            .iter()
+            .any(|n| n.additional_info.as_deref() == Some(info))
+    }
+
+    #[test_log::test]
+    fn test_reconnects_after_server_outage() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+        let relay = runtime.block_on(TcpRelay::spawn(server_config.port));
+
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_port(
+            relay.port,
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(BEFORE_OUTAGE));
+        wait_for(|| received(&callback, BEFORE_OUTAGE));
+
+        relay.set_mode(RelayMode::Refuse);
+        std::thread::sleep(OUTAGE_DURATION);
+
+        assert!(callback.disconnects.lock().is_empty());
+        assert_eq!(callback.notifications.lock().len(), 1);
+
+        relay.set_mode(RelayMode::Forward);
+
+        let deadline = Instant::now() + RECONNECT_DEADLINE;
+        while !received(&callback, AFTER_OUTAGE) {
+            assert!(Instant::now() < deadline);
+            server_config.send_blocking(maintenance(AFTER_OUTAGE));
+            std::thread::sleep(RESEND_INTERVAL);
+        }
+
+        assert!(callback.disconnects.lock().is_empty());
+
+        connection.shutdown().unwrap();
+        wait_for(|| !callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+    }
+
+    #[rstest]
+    #[case::unauthenticated(Code::Unauthenticated)]
+    #[case::permission_denied(Code::PermissionDenied)]
+    #[test_log::test]
+    fn test_auth_rejection_mid_stream_ends_the_session(#[case] code: Code) {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+        assert_eq!(server_config.streams(), 1);
+
+        server_config.send_blocking(Command::Error(Status::new(code, REJECTION_MESSAGE)));
+        wait_for(|| !callback.disconnects.lock().is_empty());
+
+        let vpn_port = server_config.port;
+        assert_eq!(
+            *callback.disconnects.lock(),
+            vec![Some(format!(
+                "'http://127.0.0.1:{vpn_port}' rejected the authentication"
+            ))]
+        );
+
+        std::thread::sleep(RECONNECT_WINDOW);
+        assert_eq!(server_config.streams(), 1);
+
+        connection.shutdown().unwrap();
+        assert_eq!(callback.disconnects.lock().len(), 1);
+        assert_eq!(callback.notifications.lock().len(), 1);
+    }
+
+    // Mirrors the RFC flow: on maintenance the app opens a session to the next
+    // server from inside `notify`, on the pump thread of the current session.
+    struct MovingCallback {
+        own: RecordedCallback,
+        next_server: Arc<ServerConfig>,
+        next_callback: RecordedCallback,
+        next_connection: Arc<Mutex<Option<Arc<Connection>>>>,
+    }
+
+    impl ErrorNotificationCallback for MovingCallback {
+        fn notify(&self, notification: ConnectionErrorNotification) {
+            if notification.kind == ConnectionErrorNotificationKind::ServerMaintenance {
+                let next = connect_to_test_server(&self.next_server, self.next_callback.clone());
+                *self.next_connection.lock() = Some(next);
+            }
+            self.own.notify(notification);
+        }
+
+        fn disconnected(&self, reason: Option<String>) {
+            self.own.disconnected(reason);
+        }
+    }
+
+    #[test_log::test]
+    fn test_connect_from_inside_notify() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let old_server = runtime.block_on(spawn_server());
+        let new_server = Arc::new(runtime.block_on(spawn_server()));
+
+        let old_callback = RecordedCallback::default();
+        let new_callback = RecordedCallback::default();
+        let next_connection = Arc::new(Mutex::new(None));
+        let moving = MovingCallback {
+            own: old_callback.clone(),
+            next_server: new_server.clone(),
+            next_callback: new_callback.clone(),
+            next_connection: next_connection.clone(),
+        };
+
+        let old = connect_to_test_server(&old_server, moving);
+
+        old_server.send_blocking(error(EnsProtoError::ServerMaintenance, MAINTENANCE_INFO));
+        wait_for(|| !old_callback.notifications.lock().is_empty());
+        assert_eq!(
+            old_callback.infos(),
+            vec![Some(MAINTENANCE_INFO.to_owned())]
+        );
+
+        new_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            NEW_SERVER_INFO,
+        ));
+        wait_for(|| !new_callback.notifications.lock().is_empty());
+        assert_eq!(new_callback.infos(), vec![Some(NEW_SERVER_INFO.to_owned())]);
+
+        old_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            OLD_SERVER_INFO,
+        ));
+        wait_for(|| old_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            old_callback.infos(),
+            vec![
+                Some(MAINTENANCE_INFO.to_owned()),
+                Some(OLD_SERVER_INFO.to_owned())
+            ]
+        );
+        assert_eq!(new_callback.infos(), vec![Some(NEW_SERVER_INFO.to_owned())]);
+
+        old.shutdown().unwrap();
+        wait_for(|| !old_callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *old_callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+        assert!(new_callback.disconnects.lock().is_empty());
+
+        new_server.send_blocking(error(
+            EnsProtoError::ConnectionLimitReached,
+            NEW_SERVER_INFO_2,
+        ));
+        wait_for(|| new_callback.notifications.lock().len() == 2);
+        assert_eq!(
+            new_callback.infos(),
+            vec![
+                Some(NEW_SERVER_INFO.to_owned()),
+                Some(NEW_SERVER_INFO_2.to_owned())
+            ]
+        );
+
+        let new = next_connection.lock().take().unwrap();
+        new.shutdown().unwrap();
+        wait_for(|| !new_callback.disconnects.lock().is_empty());
+        assert_eq!(
+            *new_callback.disconnects.lock(),
+            vec![Some(SHUTDOWN_REASON.to_owned())]
+        );
+    }
+
+    fn fast_backoff() -> Config {
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+        config
+    }
+
+    #[test_log::test]
+    fn test_untrusted_certificate_on_connect_ends_the_session() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let callback = RecordedCallback::default();
+        let _connection = connect_local(
+            server_config.port,
+            test_auth(&server_config),
+            callback.clone(),
+            Config::new(),
+        )
+        .unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("UnknownIssuer"));
+        assert_eq!(server_config.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
+
+        let trusting = RecordedCallback::default();
+        let _trusting_connection = connect_to_test_server(&server_config, trusting.clone());
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !trusting.notifications.lock().is_empty());
+        assert_eq!(server_config.streams(), 1);
+    }
+
+    #[test_log::test]
+    fn test_untrusted_certificate_on_reconnect_ends_the_session() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let trusted = runtime.block_on(spawn_server());
+        let untrusted = runtime.block_on(spawn_server());
+        let relay = runtime.block_on(TcpRelay::spawn(trusted.port));
+
+        let callback = RecordedCallback::default();
+        let _connection = connect_to_port(
+            relay.port,
+            &trusted,
+            test_auth(&trusted),
+            callback.clone(),
+            fast_backoff(),
+        )
+        .unwrap();
+
+        trusted.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        relay.set_mode(RelayMode::Redirect(untrusted.port));
+        trusted.send_blocking(Command::Error(Status::internal(REJECTION_MESSAGE)));
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("untrusted certificate"));
+
+        std::thread::sleep(RECONNECT_WINDOW);
+        assert_eq!(untrusted.streams(), 0);
+        assert_eq!(trusted.streams(), 1);
+        assert_eq!(callback.disconnects.lock().len(), 1);
     }
 }

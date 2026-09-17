@@ -87,6 +87,8 @@ dictionary ConnectionErrorNotification {
 callback interface ErrorNotificationCallback {
     /// Delivers a connection-error notification received from the server.
     /// May be called zero or more times over the life of the connection.
+    /// A panic or unhandled exception raised here ends the session, which is
+    /// then reported through `disconnected`.
     void notify(ConnectionErrorNotification notification);
 
     /// Signals that the ENS session has ended and no further `notify`
@@ -265,8 +267,8 @@ namespace ens {
     /// replaced with dots in release builds. Can be called before `init` to
     /// enable logging output during initialisation.
     ///
-    /// Replaces any previously registered log callback. Passing a new
-    /// callback drops the previous one.
+    /// Can be called once per process. A second call fails with
+    /// `InternalError` and keeps the first callback.
     [Throws=EnsError]
     void set_log_callback(LogLevel max_level, LogCallback callback);
 
@@ -280,6 +282,10 @@ namespace ens {
     /// The `authentication` variant must match the VPN protocol whose
     /// tunnel ENS is meant to monitor: `Credentials` for OpenVPN and
     /// NordWhisper, `Keys` for NordLynx.
+    ///
+    /// A server certificate that is not part of the trusted chain ends the
+    /// session without retrying. The `connect` returns no error, but the
+    /// connection emits disconnect event.
     [Throws=EnsError]
     Connection connect(
         SocketAddr socket_addr,

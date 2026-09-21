@@ -126,6 +126,35 @@ go test ./...
 
 `ENS_STUB` overrides the stub binary path.
 
+`tests/kotlin` drives the stub through the generated kotlin bindings, as android
+instrumented tests on an x86_64 emulator. The stub is cross compiled for android
+and shipped inside the test apk as a jni library, because android only executes
+binaries from the directory the apk was unpacked into.
+
+```sh
+uniffi-bindgen generate ./ens.udl --language kotlin --config uniffi.toml --out-dir dist/android/kotlin
+cargo build --package ens-stub --target x86_64-linux-android
+python3 ci/build.py build android x86_64
+```
+
+The bindings, `libens.so` and the stub are copied into the test project, which
+then runs against a booted emulator:
+
+```sh
+JNI_LIBS=tests/kotlin/lib/src/androidTest/jniLibs/x86_64
+mkdir -p "$JNI_LIBS"
+cp dist/android/kotlin/com/nordsec/ens/ens.kt tests/kotlin/lib/src/androidTest/kotlin/com/nordsec/ens/
+cp dist/android/release/x86_64/libens.so "$JNI_LIBS"
+cp target/x86_64-linux-android/debug/ens-stub "$JNI_LIBS/libens_stub.so"
+gradle -p tests/kotlin :lib:connectedDebugAndroidTest
+```
+
+The library logs under the `libens` tag and the stub under `ens-stub`:
+
+```sh
+adb logcat -d -s libens:V ens-stub:V
+```
+
 ## CLI
 
 `ens-cli` resolves servers and credentials through the NordVPN API, then opens

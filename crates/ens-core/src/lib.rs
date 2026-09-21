@@ -44,8 +44,8 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 
 use crate::{
     client::{
-        ErrorNotificationService, KeepaliveConfig, DEFAULT_KEEPALIVE_INTERVAL,
-        DEFAULT_KEEPALIVE_TIMEOUT,
+        EchBootstrap, ErrorNotificationService, KeepaliveConfig, TlsOptions,
+        DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_message, catch_panic_result},
@@ -410,6 +410,7 @@ struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
     tls_domain: Option<String>,
+    ech: EchBootstrap,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
@@ -432,6 +433,7 @@ impl Config {
             buffer_size: 5,
             allow_only_pq: true,
             tls_domain: None,
+            ech: EchBootstrap::Disabled,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -456,8 +458,16 @@ impl Config {
         self.state.lock().allow_only_pq = allow_only_pq;
     }
 
-    pub fn set_enable_ech_bootstrap(&self, tls_domain: Option<String>) {
+    pub fn set_tls_domain(&self, tls_domain: Option<String>) {
         self.state.lock().tls_domain = tls_domain;
+    }
+
+    pub fn set_enable_ech_bootstrap(&self, enable_ech: bool) {
+        self.state.lock().ech = if enable_ech {
+            EchBootstrap::Enabled
+        } else {
+            EchBootstrap::Disabled
+        };
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -531,6 +541,10 @@ async fn connect_impl(
         .map_err(|e| EnsError::InternalError {
             reason: format!("tls_domain is incorrect: {e:?}"),
         })?;
+    let tls = TlsOptions {
+        domain: tls_domain,
+        ech: config.ech,
+    };
 
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
@@ -568,7 +582,7 @@ async fn connect_impl(
     });
 
     client
-        .start_monitor_on_port(vpn.ip(), vpn.port(), tls_domain, authentication, backoff)
+        .start_monitor_on_port(vpn.ip(), vpn.port(), tls, authentication, backoff)
         .await;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
@@ -1851,7 +1865,7 @@ mod tests {
 
         let runtime = get_runtime().unwrap();
         let upstream = runtime.block_on(spawn_plain_server());
-        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, EchMode::Off);
+        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, None, EchMode::Off);
 
         let callback = RecordedCallback::default();
         let config = Config::new();
@@ -1883,15 +1897,15 @@ mod tests {
         let stub = GoEchStub::spawn(
             upstream.port,
             ECH_PUBLIC_NAME,
-            EchMode::On {
-                tls_domain: TLS_DOMAIN,
-            },
+            Some(TLS_DOMAIN),
+            EchMode::On,
         );
 
         let callback = RecordedCallback::default();
         let config = Config::new();
         config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
-        config.set_enable_ech_bootstrap(Some(TLS_DOMAIN.to_owned()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
         let _connection =
             connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
 
@@ -1919,5 +1933,38 @@ mod tests {
         wait_for(|| !callback.notifications.lock().is_empty());
 
         assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+    }
+
+    #[test_log::test]
+    fn plain_tls_leaks_tls_domain_on_wire() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            EchMode::Off,
+        );
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(
+            stub.wait_for_handshakes(1),
+            vec![Handshake {
+                accepted: false,
+                sni_seen: Some(TLS_DOMAIN.to_owned()),
+                outer_sni: Some(TLS_DOMAIN.to_owned()),
+            }]
+        );
     }
 }

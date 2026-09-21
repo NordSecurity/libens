@@ -181,11 +181,11 @@ impl ErrorNotificationService {
         &mut self,
         vpn_ip: IpAddr,
         ens_port: u16,
-        tls_domain: Option<DnsName<'static>>,
+        tls: TlsOptions,
         authentication: ClientAuthentication,
         backoff: impl Backoff,
     ) {
-        info!("Will start ENS monitoring on {vpn_ip}:{ens_port}, tls_domain: {tls_domain:?}");
+        info!("Will start ENS monitoring for {vpn_ip}:{ens_port} ({tls:?})");
         self.stop().await;
 
         let (quit_tx, quit_rx): (watch::Sender<bool>, watch::Receiver<bool>) =
@@ -206,7 +206,7 @@ impl ErrorNotificationService {
             // This future is too big for keeping it on the stack
             if let Err(e) = Box::pin(task(
                 &vpn_uri,
-                tls_domain,
+                tls,
                 authentication,
                 pool.clone(),
                 tx,
@@ -363,7 +363,7 @@ pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &str,
-    tls_domain: Option<DnsName<'static>>,
+    tls: TlsOptions,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
     tx: Sender<Event>,
@@ -407,7 +407,7 @@ async fn task(
 
         let external_channel = match Box::pin(open_channel(
             vpn_uri,
-            tls_domain.as_ref(),
+            &tls,
             pool.clone(),
             &tx,
             allow_only_mlkem,
@@ -486,7 +486,7 @@ async fn task(
 
 async fn open_channel(
     vpn_uri: &str,
-    tls_domain: Option<&DnsName<'static>>,
+    tls: &TlsOptions,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
     allow_only_mlkem: bool,
@@ -496,7 +496,7 @@ async fn open_channel(
 ) -> Result<Channel, Error> {
     let attempt = create_external_channel(
         vpn_uri,
-        tls_domain.cloned(),
+        tls.clone(),
         pool,
         allow_only_mlkem,
         root_certificate,
@@ -556,7 +556,7 @@ fn authentication_interceptor(
 
 async fn bootstrap_ech(
     uri: Uri,
-    expected_tls_hostname: ServerName<'static>,
+    tls: &TlsOptions,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     root_certificate: &[u8],
@@ -572,6 +572,9 @@ async fn bootstrap_ech(
         });
     };
 
+    let expected_tls_hostname = tls.server_name(host).map_err(|e| Error::Internal {
+        reason: e.to_string(),
+    })?;
     let socket = pool.new_external_tcp_v4(None).unwrap();
     let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
@@ -606,32 +609,33 @@ async fn bootstrap_ech(
 
 async fn create_external_channel(
     vpn_uri: &str,
-    tls_domain: Option<DnsName<'static>>,
+    tls: TlsOptions,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
     user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
-    let bootstrapped_ech_config_list = if let Some(tls_domain) = &tls_domain {
-        let retry_configs = bootstrap_ech(
-            vpn_uri.parse().unwrap(),
-            ServerName::DnsName(tls_domain.to_owned()),
-            pool.clone(),
-            allow_only_mlkem,
-            &root_certificate,
-        )
-        .await?;
-        if retry_configs.is_some() {
-            info!("ECH bootstrapping success");
+    let bootstrapped_ech_config_list = match tls.ech {
+        EchBootstrap::Enabled => {
+            let retry_configs = bootstrap_ech(
+                vpn_uri.parse().unwrap(),
+                &tls,
+                pool.clone(),
+                allow_only_mlkem,
+                &root_certificate,
+            )
+            .await?;
+            if retry_configs.is_some() {
+                info!("ECH bootstrapping success");
+            }
+            retry_configs
         }
-        retry_configs
-    } else {
-        None
+        EchBootstrap::Disabled => None,
     };
 
     let socket_factory = move |uri: Uri| {
-        let tls_domain = tls_domain.clone();
+        let tls = tls.clone();
         let pool = pool.clone();
         let root_certificate = root_certificate.clone();
         let bootstrapped_ech_config_list = bootstrapped_ech_config_list.clone();
@@ -650,12 +654,7 @@ async fn create_external_channel(
             };
 
             let socket = pool.new_external_tcp_v4(None)?;
-            let domain = if let Some(tls_domain) = &tls_domain {
-                ServerName::DnsName(tls_domain.to_owned())
-            } else {
-                tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
-            };
+            let domain = tls.server_name(host)?;
 
             if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
@@ -970,6 +969,44 @@ enum EchMode {
     UseEchConfigList(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EchBootstrap {
+    Enabled,
+    #[default]
+    Disabled,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsOptions {
+    pub(crate) domain: Option<DnsName<'static>>,
+    pub(crate) ech: EchBootstrap,
+}
+
+impl TlsOptions {
+    pub fn new(config: &crate::ConfigState) -> Result<Self, EnsError> {
+        let tls_domain: Option<DnsName> = config
+            .tls_domain
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|e| EnsError::InternalError {
+                reason: format!("tls_domain is incorrect: {e:?}"),
+            })?;
+        Ok(TlsOptions {
+            domain: tls_domain,
+            ech: config.ech,
+        })
+    }
+    fn server_name(&self, host: &str) -> std::io::Result<ServerName<'static>> {
+        if let Some(domain) = &self.domain {
+            return Ok(ServerName::DnsName(domain.clone()));
+        }
+
+        ServerName::try_from(host.to_owned())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    }
+}
+
 fn make_tls_connector(
     allow_only_mlkem: bool,
     root_certificate: &[u8],
@@ -1267,7 +1304,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
-            None,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1356,7 +1393,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
-            None,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1460,7 +1497,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
-            None,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
@@ -1560,7 +1597,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             port_rx.await.unwrap(),
-            None,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )

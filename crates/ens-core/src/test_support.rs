@@ -72,14 +72,14 @@ pub async fn spawn_plain_server() -> ServerConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchMode {
-    On { tls_domain: &'static str },
+    On,
     Off,
 }
 
 impl EchMode {
     fn flag(self) -> &'static str {
         match self {
-            EchMode::On { .. } => "on",
+            EchMode::On => "on",
             EchMode::Off => "off",
         }
     }
@@ -106,7 +106,12 @@ pub struct GoEchStub {
 }
 
 impl GoEchStub {
-    pub fn spawn(upstream_port: u16, public_name: &str, ech: EchMode) -> Self {
+    pub fn spawn(
+        upstream_port: u16,
+        public_name: &str,
+        tls_domain: Option<&str>,
+        ech: EchMode,
+    ) -> Self {
         let upstream = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, upstream_port));
         let mut command = ProcessCommand::new("go");
         command
@@ -115,7 +120,7 @@ impl GoEchStub {
             .args(["-public-name", public_name])
             .args(["-ech", ech.flag()])
             .arg("-v");
-        if let EchMode::On { tls_domain } = ech {
+        if let Some(tls_domain) = tls_domain {
             command.args(["-tls-domain", tls_domain]);
         }
         if let Some(path) = std::env::var_os(ECH_STUB_KEYLOG_ENV) {

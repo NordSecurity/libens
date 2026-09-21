@@ -128,6 +128,7 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
+            client::Error::EchBootstrappingFailed => todo!(),
         }
     }
 }
@@ -1881,7 +1882,7 @@ mod tests {
         assert_eq!(
             stub.wait_for_handshakes(1),
             vec![Handshake {
-                accepted: false,
+                ech_accepted: false,
                 sni_seen: None,
                 outer_sni: None,
             }]
@@ -1915,7 +1916,7 @@ mod tests {
         assert!(callback.disconnects.lock().is_empty());
 
         let bootstrap = &handshakes[0];
-        assert!(!bootstrap.accepted);
+        assert!(!bootstrap.ech_accepted);
         let cover_name = bootstrap.outer_sni.clone().unwrap();
         assert_ne!(cover_name, ECH_PUBLIC_NAME);
         assert_eq!(bootstrap.sni_seen, Some(cover_name));
@@ -1923,7 +1924,7 @@ mod tests {
         assert_eq!(
             handshakes[1],
             Handshake {
-                accepted: true,
+                ech_accepted: true,
                 sni_seen: Some(TLS_DOMAIN.to_owned()),
                 outer_sni: Some(ECH_PUBLIC_NAME.to_owned()),
             }
@@ -1933,6 +1934,41 @@ mod tests {
         wait_for(|| !callback.notifications.lock().is_empty());
 
         assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+    }
+
+    #[test_log::test]
+    fn ech_bootstrap_keeps_tls_domain_off_wire() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            EchMode::On,
+        );
+        let relay = runtime.block_on(TcpRelay::spawn(stub.port()));
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
+        let _connection =
+            connect_local(relay.port, test_auth(&upstream), callback.clone(), config).unwrap();
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        let handshakes = stub.wait_for_handshakes(2);
+        assert_eq!(handshakes.len(), 2, "handshakes: {handshakes:?}");
+        assert!(handshakes[1].ech_accepted);
+        assert_eq!(handshakes[1].sni_seen, Some(TLS_DOMAIN.to_owned()));
+
+        let wire = relay.wire();
+        assert!(wire.contains(ECH_PUBLIC_NAME));
+        assert!(!wire.contains(TLS_DOMAIN));
     }
 
     #[test_log::test]
@@ -1947,13 +1983,14 @@ mod tests {
             Some(TLS_DOMAIN),
             EchMode::Off,
         );
+        let relay = runtime.block_on(TcpRelay::spawn(stub.port()));
 
         let callback = RecordedCallback::default();
         let config = Config::new();
         config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
         config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
         let _connection =
-            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+            connect_local(relay.port, test_auth(&upstream), callback.clone(), config).unwrap();
 
         upstream.send_blocking(maintenance(MAINTENANCE_INFO));
         wait_for(|| !callback.notifications.lock().is_empty());
@@ -1961,10 +1998,11 @@ mod tests {
         assert_eq!(
             stub.wait_for_handshakes(1),
             vec![Handshake {
-                accepted: false,
+                ech_accepted: false,
                 sni_seen: Some(TLS_DOMAIN.to_owned()),
                 outer_sni: Some(TLS_DOMAIN.to_owned()),
             }]
         );
+        assert!(relay.wire().contains(TLS_DOMAIN));
     }
 }

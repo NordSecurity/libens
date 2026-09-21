@@ -42,6 +42,7 @@ built = { version = "0.8.0", features = ["chrono", "git2"] }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
+bstr = { version = "1.13.1", default-features = false }
 ens-stub = { path = "../ens-stub" }
 rcgen = { version = "0.14.7", default-features = false, features = ["pem", "aws_lc_rs"]}
 rstest = { version = "0.26.1", default-features = false }

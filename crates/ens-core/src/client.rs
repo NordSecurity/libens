@@ -76,6 +76,8 @@ pub enum Error {
     Internal { reason: String },
     #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
     UntrustedCertificate { vpn_uri: String, reason: String },
+    #[error("ECH bootstrapping failed")]
+    EchBootstrappingFailed,
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -626,9 +628,10 @@ async fn create_external_channel(
                 &root_certificate,
             )
             .await?;
-            if retry_configs.is_some() {
-                info!("ECH bootstrapping success");
+            if retry_configs.is_none() {
+                return Err(Error::EchBootstrappingFailed);
             }
+            info!("ECH bootstrapping success");
             retry_configs
         }
         EchBootstrap::Disabled => None,

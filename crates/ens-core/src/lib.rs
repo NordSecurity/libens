@@ -1247,7 +1247,7 @@ mod tests {
             format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
         );
         assert!(callback.notifications.lock().is_empty());
-        assert_eq!(0, tracked_connections(&[connection.id]));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);

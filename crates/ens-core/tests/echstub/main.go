@@ -30,6 +30,7 @@ const (
 	aeadAes128Gcm        = 0x0001
 	aeadAes256Gcm        = 0x0002
 	aeadChaCha20Poly1305 = 0x0003
+	aeadExportOnly       = 0xffff
 	echMaxNameLength     = 0
 
 	recordHeaderLen         = 5
@@ -118,10 +119,11 @@ func main() {
 	var correctEchConfig []byte
 	echList := noName
 	if *ech == echOn || *ech == echInvalid {
-		key, config := makeECHConfig(*publicName)
-		correctEchConfig = append([]byte{}, config...)
+		key, pub := makeECHKey()
+		correctEchConfig = makeECHConfig(*publicName, pub, supportedAeads)
+		config := correctEchConfig
 		if *ech == echInvalid {
-			config[0] = ^config[0]
+			config = makeECHConfig(*publicName, pub, []uint16{aeadExportOnly})
 		}
 		cfg.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{{
 			Config:      config,
@@ -226,26 +228,27 @@ func makeCerts(publicName, tlsDomain string) ([]byte, tls.Certificate) {
 	return caDER, tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
 }
 
-func makeECHConfig(publicName string) ([]byte, []byte) {
+var supportedAeads = []uint16{aeadAes128Gcm, aeadAes256Gcm, aeadChaCha20Poly1305}
+
+func makeECHKey() ([]byte, []byte) {
 	key, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		fatal("crypto setup failed", err)
 	}
-	pub := key.PublicKey().Bytes()
 
+	return key.Bytes(), key.PublicKey().Bytes()
+}
+
+func makeECHConfig(publicName string, pub []byte, aeads []uint16) []byte {
 	var contents []byte
 	contents = append(contents, echConfigID)
 	contents = binary.BigEndian.AppendUint16(contents, kemX25519HkdfSha256)
 	contents = binary.BigEndian.AppendUint16(contents, uint16(len(pub)))
 	contents = append(contents, pub...)
-	suites := []uint16{
-		kdfHkdfSha256, aeadAes128Gcm,
-		kdfHkdfSha256, aeadAes256Gcm,
-		kdfHkdfSha256, aeadChaCha20Poly1305,
-	}
-	contents = binary.BigEndian.AppendUint16(contents, uint16(2*len(suites)))
-	for _, s := range suites {
-		contents = binary.BigEndian.AppendUint16(contents, s)
+	contents = binary.BigEndian.AppendUint16(contents, uint16(4*len(aeads)))
+	for _, aead := range aeads {
+		contents = binary.BigEndian.AppendUint16(contents, kdfHkdfSha256)
+		contents = binary.BigEndian.AppendUint16(contents, aead)
 	}
 	contents = append(contents, echMaxNameLength)
 	contents = append(contents, byte(len(publicName)))
@@ -257,7 +260,7 @@ func makeECHConfig(publicName string) ([]byte, []byte) {
 	config = binary.BigEndian.AppendUint16(config, uint16(len(contents)))
 	config = append(config, contents...)
 
-	return key.Bytes(), config
+	return config
 }
 
 func echConfigList(config []byte) []byte {

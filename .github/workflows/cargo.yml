@@ -13,6 +13,7 @@ env:
   NIGHTLY_VERSION: "nightly-2025-12-01"
   COVERAGE_DIR: coverage
   COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub
+  ECH_STUB_DIR: crates/ens-core/tests/echstub
 
 permissions:
   contents: read
@@ -103,8 +104,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: crates/ens-core/tests/echstub/go.mod
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
           cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -152,8 +156,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: crates/ens-core/tests/echstub/go.mod
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
           cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-linux
@@ -174,8 +181,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: crates/ens-core/tests/echstub/go.mod
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
           cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-release-linux
@@ -191,8 +201,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: crates/ens-core/tests/echstub/go.mod
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
           cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:

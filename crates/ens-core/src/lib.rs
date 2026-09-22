@@ -1927,7 +1927,7 @@ mod tests {
 
         let handshakes = stub.wait_for_handshakes(2);
         assert_eq!(handshakes.len(), 2, "handshakes: {handshakes:?}");
-        assert_eq!(upstream.streams(), 1);
+        wait_for(|| upstream.streams() == 1);
         assert!(callback.disconnects.lock().is_empty());
 
         let bootstrap = &handshakes[0];

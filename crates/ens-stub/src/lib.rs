@@ -250,12 +250,7 @@ pub async fn spawn_server(
     let public_key = vpn_server_private_key.public();
 
     let (command_tx, command_rx) = unbounded();
-    let stub = GrpcStub(Arc::new(StubState {
-        command_rx,
-        streams: AtomicUsize::new(0),
-        challenges: Mutex::new(HashSet::default()),
-        vpn_server_private_key,
-    }));
+    let stub = GrpcStub::new(command_rx, vpn_server_private_key);
 
     let interceptor = CheckAuthenticationInterceptor {
         stub: stub.clone(),
@@ -308,6 +303,15 @@ struct StubState {
 struct GrpcStub(Arc<StubState>);
 
 impl GrpcStub {
+    fn new(command_rx: AsyncReceiver<Command>, vpn_server_private_key: SecretKey) -> Self {
+        Self(Arc::new(StubState {
+            command_rx,
+            streams: AtomicUsize::new(0),
+            challenges: Mutex::new(HashSet::default()),
+            vpn_server_private_key,
+        }))
+    }
+
     fn take_challenge(&self, challenge: &Uuid) -> bool {
         self.0.challenges.lock().take(challenge).is_some()
     }
@@ -534,12 +538,7 @@ mod tests {
 
     fn stub() -> GrpcStub {
         let (_command_tx, command_rx) = unbounded();
-        GrpcStub(Arc::new(StubState {
-            command_rx,
-            streams: AtomicUsize::new(0),
-            challenges: Mutex::new(HashSet::default()),
-            vpn_server_private_key: SecretKey::gen(),
-        }))
+        GrpcStub::new(command_rx, SecretKey::gen())
     }
 
     fn interceptor(

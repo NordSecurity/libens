@@ -318,6 +318,7 @@ impl TryFrom<Authentication> for ClientAuthentication {
 trait ErrorsExt {
     fn is_auth_rejection(&self) -> bool;
     fn is_ech_offer_rejection(&self) -> bool;
+    fn is_untrusted_cert(&self) -> bool;
 }
 
 impl ErrorsExt for Status {
@@ -326,6 +327,10 @@ impl ErrorsExt for Status {
     }
 
     fn is_ech_offer_rejection(&self) -> bool {
+        false
+    }
+
+    fn is_untrusted_cert(&self) -> bool {
         false
     }
 }
@@ -337,6 +342,10 @@ impl ErrorsExt for Error {
 
     fn is_ech_offer_rejection(&self) -> bool {
         matches!(self, Error::EchBootstrappingRejected)
+    }
+
+    fn is_untrusted_cert(&self) -> bool {
+        matches!(self, Error::UntrustedCertificate { .. })
     }
 }
 
@@ -378,6 +387,12 @@ async fn publish_ech_offer_rejection(
     error!("ECH offer for ENS at '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the ECH offer");
+    publish_disconnect(tx, reason).await;
+}
+
+async fn publish_untrusted_cert(tx: &Sender<Event>, error: &impl std::fmt::Display) {
+    let reason = error.to_string();
+    error!("{reason}");
     publish_disconnect(tx, reason).await;
 }
 
@@ -431,6 +446,11 @@ async fn task(
                             break 'outer;
                         }
 
+                        if e.is_untrusted_cert() {
+                            publish_untrusted_cert(&tx, &e).await;
+                            break 'outer;
+                        }
+
                         warn!("ENS task transient failure: {e} source: {:?}", e.source());
                         if *quit_rx.borrow() == true {
                             break 'outer;
@@ -441,21 +461,19 @@ async fn task(
             };
         }
 
-        let external_channel = match Box::pin(open_channel(
-            vpn_uri,
-            &tls,
-            pool.clone(),
-            &tx,
-            allow_only_mlkem,
-            root_certificate.clone(),
-            keepalive,
-            user_agent.clone(),
-        ))
-        .await
-        {
-            Err(Error::UntrustedCertificate { .. }) => break 'outer,
-            attempt => handle_error!(attempt, backoff),
-        };
+        let external_channel = handle_error!(
+            Box::pin(open_channel(
+                vpn_uri,
+                &tls,
+                pool.clone(),
+                allow_only_mlkem,
+                root_certificate.clone(),
+                keepalive,
+                user_agent.clone(),
+            ))
+            .await,
+            backoff
+        );
 
         let headers = handle_error!(
             prepare_connection_headers(&authentication, &external_channel).await,
@@ -516,7 +534,7 @@ async fn task(
         }
         restart!(&mut backoff);
     }
-    debug!("ENS monitor for '{vpn_uri}' terminates");
+    info!("ENS monitor for '{vpn_uri}' terminates");
     Ok(())
 }
 
@@ -524,7 +542,6 @@ async fn open_channel(
     vpn_uri: &Uri,
     tls: &TlsOptions,
     pool: Arc<SocketPool>,
-    tx: &Sender<Event>,
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
@@ -541,16 +558,19 @@ async fn open_channel(
     )
     .await;
 
-    let Some(rejection) = attempt.as_ref().err().and_then(certificate_rejection) else {
+    let Err(err) = attempt else {
         return attempt;
+    };
+
+    let Some(rejection) = certificate_rejection(&err) else {
+        return Err(err);
     };
 
     let untrusted = Error::UntrustedCertificate {
         vpn_uri: vpn_uri.to_string(),
         reason: rejection.to_string(),
     };
-    error!("{untrusted}");
-    publish_disconnect(tx, untrusted.to_string()).await;
+    error!("opening channel failed with: {untrusted}");
 
     Err(untrusted)
 }
@@ -625,18 +645,35 @@ async fn bootstrap_ech(
         )?;
 
         let tls_stream = tls_connector.connect(domain, tcp_stream).await;
-        if let Err(e) = &tls_stream {
+        if let Err(e) = tls_stream {
             fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
                 e.get_ref()?.downcast_ref::<rustls::Error>()
             }
 
-            if let Some(rustls::Error::PeerIncompatible(
-                rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
-            )) = as_rustls_error(&e)
-            {
-                use rustls::internal::msgs::codec::Codec;
-
-                return Ok(Some(retry_configs.get_encoding()));
+            match as_rustls_error(&e) {
+                // This is a successful ECH bootstrap.
+                Some(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(
+                        retry_configs,
+                    )),
+                )) => {
+                    use rustls::internal::msgs::codec::Codec;
+                    return Ok(Some(retry_configs.get_encoding()));
+                }
+                // App asked for ECH bootstrapping but the server is not returning
+                // fresh retry configs, so it's not possible to complete the bootstrap.
+                Some(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(None),
+                )) => return Ok(None),
+                // Server presented an invalid certificate, which is not a transient
+                // connection failure, so we will not automatically retry.
+                Some(rustls::Error::InvalidCertificate(_)) => {
+                    return Err(Error::UntrustedCertificate {
+                        vpn_uri: uri.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+                _ => return Err(e.into()),
             }
         }
     }
@@ -1137,7 +1174,10 @@ async fn prepare_connection_headers(
 pub mod tests {
     use std::{
         net::Ipv4Addr,
-        sync::{atomic::AtomicUsize, LazyLock},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            LazyLock,
+        },
         time::{Duration, Instant},
     };
 
@@ -1176,6 +1216,9 @@ pub mod tests {
     const TEST_USER_AGENT: HeaderValue = HeaderValue::from_static("foo bar baz");
     const ECH_PUBLIC_NAME: &str = "cover.example.com";
     const TLS_DOMAIN: &str = "secret.example.com";
+    const FAILED_HANDSHAKES: usize = 3;
+    const BACKOFF: Duration = Duration::from_millis(100);
+    const EVENT_DEADLINE: Duration = Duration::from_secs(10);
 
     #[derive(Clone)]
     pub enum TestAuthConfig {
@@ -1565,105 +1608,217 @@ pub mod tests {
         let _collected_errors = collect_errors(3, &mut rx).await;
     }
 
+    struct EchTestbed {
+        upstream: ServerConfig,
+        stub: GoEchStub,
+        relay: Arc<TcpRelay>,
+    }
+
+    async fn spawn_ech_testbed(ech: EchBootstrap) -> EchTestbed {
+        let upstream = spawn_plain_server().await;
+        let stub_ech = match ech {
+            EchBootstrap::Enabled => StubEchMode::On,
+            EchBootstrap::Disabled => StubEchMode::Off,
+        };
+        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, Some(TLS_DOMAIN), stub_ech);
+        let relay = Arc::new(TcpRelay::spawn(stub.port()).await);
+
+        EchTestbed {
+            upstream,
+            stub,
+            relay,
+        }
+    }
+
+    impl EchTestbed {
+        async fn start_monitor(
+            &self,
+            ech: EchBootstrap,
+            root_certificate: &[u8],
+            backoff: impl Backoff,
+        ) -> (ErrorNotificationService, Receiver<Event>) {
+            let allow_only_mlkem = true;
+            let (mut ens, rx) = ErrorNotificationService::new(
+                NonZeroUsize::new(10).unwrap(),
+                make_socket_pool(),
+                allow_only_mlkem,
+                Some(root_certificate.to_vec()),
+                KeepaliveConfig::default(),
+                TEST_USER_AGENT,
+            );
+
+            let tls = TlsOptions {
+                domain: Some(TLS_DOMAIN.try_into().unwrap()),
+                ech,
+            };
+            ens.start_monitor_on_port(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                self.relay.port,
+                tls,
+                client_authentication(&SecretKey::gen(), self.upstream.public_key),
+                backoff,
+            )
+            .await
+            .unwrap();
+
+            (ens, rx)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StubBackoffCalls {
+        get_backoff: AtomicUsize,
+        next_backoff: AtomicUsize,
+        reset: AtomicUsize,
+    }
+
+    // Preconfigure backoff mock to track the call counts of all fns
+    fn counting_backoff(
+        on_wait: impl Fn(usize) + Send + 'static,
+    ) -> (
+        telio_utils::exponential_backoff::MockBackoff,
+        Arc<StubBackoffCalls>,
+    ) {
+        let calls = Arc::new(StubBackoffCalls::default());
+        let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
+
+        let counted = calls.clone();
+        backoff.expect_get_backoff().returning(move || {
+            on_wait(counted.get_backoff.fetch_add(1, Ordering::SeqCst) + 1);
+            BACKOFF
+        });
+
+        let counted = calls.clone();
+        backoff.expect_next_backoff().returning(move || {
+            counted.next_backoff.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let counted = calls.clone();
+        backoff.expect_reset().returning(move || {
+            counted.reset.fetch_add(1, Ordering::SeqCst);
+        });
+
+        (backoff, calls)
+    }
+
+    fn forward_after(relay: &Arc<TcpRelay>, failed_handshakes: usize) -> impl Fn(usize) + Send {
+        let relay = relay.clone();
+        move |wait| {
+            if wait == failed_handshakes {
+                relay.set_mode(RelayMode::Forward);
+            }
+        }
+    }
+
+    async fn spawn_handshake_closer() -> u16 {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut first_byte = [0u8];
+                let _ = socket.read(&mut first_byte).await;
+            }
+        });
+
+        port
+    }
+
+    async fn recv_disconnect_reason(rx: &mut Receiver<Event>) -> String {
+        match rx.recv().await {
+            Some(Event::Disconnect(Some(reason))) => reason,
+            other => panic!("Instead of disconnect, received: {other:?}"),
+        }
+    }
+
+    async fn assert_reconnects(
+        testbed: &EchTestbed,
+        rx: &mut Receiver<Event>,
+        calls: &StubBackoffCalls,
+    ) {
+        let emitted = ConnectionError {
+            code: EnsProtoError::Unknown as i32,
+            additional_info: None,
+        };
+        testbed.upstream.send(Command::Send(emitted.clone())).await;
+
+        let received = timeout(EVENT_DEADLINE, recv_connection_error(rx))
+            .await
+            .unwrap();
+        assert_eq!(received, emitted);
+
+        assert_eq!(testbed.upstream.streams(), 1);
+        assert_eq!(
+            calls.get_backoff_calls.load(Ordering::SeqCst),
+            FAILED_HANDSHAKES
+        );
+        assert_eq!(
+            calls.next_backoff_calls.load(Ordering::SeqCst),
+            FAILED_HANDSHAKES
+        );
+        assert_eq!(calls.reset_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[rstest]
     #[tokio::test]
     #[test_log::test]
     async fn backoff_while_server_refuses_first_handshakes(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        const REFUSED_HANDSHAKES: usize = 3;
-        const BACKOFF: Duration = Duration::from_millis(100);
-        const RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
+        let testbed = spawn_ech_testbed(ech).await;
+        testbed.relay.set_mode(RelayMode::Refuse);
 
-        let client_private_key = SecretKey::gen();
-        let server_config = spawn_plain_server().await;
-        let stub_ech = match ech {
-            EchBootstrap::Enabled => StubEchMode::On,
-            EchBootstrap::Disabled => StubEchMode::Off,
-        };
-        let stub = GoEchStub::spawn(
-            server_config.port,
-            ECH_PUBLIC_NAME,
-            Some(TLS_DOMAIN),
-            stub_ech,
-        );
-        let relay = Arc::new(TcpRelay::spawn(stub.port()).await);
-        relay.set_mode(RelayMode::Refuse);
+        let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
 
-        let waits = Arc::new(AtomicUsize::new(0));
-        let advances = Arc::new(AtomicUsize::new(0));
-        let resets = Arc::new(AtomicUsize::new(0));
+        assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
 
-        let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
-        {
-            let waits = waits.clone();
-            let relay = relay.clone();
-            backoff.expect_get_backoff().returning(move || {
-                let handshake = waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                if handshake == REFUSED_HANDSHAKES {
-                    relay.set_mode(RelayMode::Forward);
-                }
-                BACKOFF
-            });
-        }
-        {
-            let advances = advances.clone();
-            backoff.expect_next_backoff().returning(move || {
-                advances.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
-        }
-        {
-            let resets = resets.clone();
-            backoff.expect_reset().returning(move || {
-                resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
-        }
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn backoff_while_server_cuts_first_handshakes_short(
+        #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
+    ) {
+        let testbed = spawn_ech_testbed(ech).await;
+        let closer = spawn_handshake_closer().await;
+        testbed.relay.set_mode(RelayMode::Redirect(closer));
 
-        let allow_only_mlkem = true;
-        let (mut ens, mut rx) = ErrorNotificationService::new(
-            NonZeroUsize::new(10).unwrap(),
-            make_socket_pool(),
-            allow_only_mlkem,
-            Some(stub.ca_der().to_vec()),
-            KeepaliveConfig::default(),
-            TEST_USER_AGENT,
-        );
+        let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
 
-        let tls = TlsOptions {
-            domain: Some(TLS_DOMAIN.try_into().unwrap()),
-            ech,
-        };
-        ens.start_monitor_on_port(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            relay.port,
-            tls,
-            client_authentication(&client_private_key, server_config.public_key),
-            backoff,
-        )
-        .await
-        .unwrap();
+        assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
 
-        let emitted = ConnectionError {
-            code: EnsProtoError::Unknown as i32,
-            additional_info: None,
-        };
-        server_config.send(Command::Send(emitted.clone())).await;
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn untrusted_certificate_ends_the_session(
+        #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
+    ) {
+        let testbed = spawn_ech_testbed(ech).await;
+        let unrelated_ca = TlsConfig::new();
 
-        let received = timeout(RECONNECT_DEADLINE, recv_connection_error(&mut rx))
+        let (backoff, calls) = counting_backoff(|_| ());
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, unrelated_ca.ca_cert.der(), backoff)
+            .await;
+
+        let reason = timeout(EVENT_DEADLINE, recv_disconnect_reason(&mut rx))
             .await
             .unwrap();
-        assert_eq!(received, emitted);
-
-        assert_eq!(server_config.streams(), 1);
-        assert_eq!(
-            waits.load(std::sync::atomic::Ordering::SeqCst),
-            REFUSED_HANDSHAKES
-        );
-        assert_eq!(
-            advances.load(std::sync::atomic::Ordering::SeqCst),
-            REFUSED_HANDSHAKES
-        );
-        assert_eq!(resets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(reason.contains("untrusted certificate"), "{reason}");
+        assert!(reason.contains("UnknownIssuer"), "{reason}");
+        assert_eq!(testbed.upstream.streams(), 0);
+        assert_eq!(calls.get_backoff.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

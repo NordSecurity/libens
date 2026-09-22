@@ -128,14 +128,16 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
-            client::Error::EchBootstrappingFailed(e) => {
+            client::Error::EchBootstrappingFailed(e) => Self::InternalError {
+                reason: format!("ECH bootstrap failed: {e:?}"),
+            },
+            rejected @ client::Error::EchBootstrappingRejected => {
                 // NOTE: this should never happen, the ECH offer rejection should
                 // be exposed as a disconnect
                 Self::InternalError {
-                    reason: format!("ech bootstrap failed: {e:?}"),
+                    reason: rejected.to_string(),
                 }
             }
-            client::Error::EchBootstrappingRejected => todo!(),
         }
     }
 }
@@ -947,6 +949,12 @@ mod tests {
         ids.iter()
             .filter(|id| state.active_connections.contains_key(*id))
             .count()
+    }
+
+    #[test]
+    fn ech_rejection_converts_to_internal_error() {
+        let rejected = EnsError::from(client::Error::EchBootstrappingRejected);
+        assert_matches!(rejected, EnsError::InternalError { reason } if reason.contains("ECH"));
     }
 
     #[test_log::test]
@@ -1821,7 +1829,7 @@ mod tests {
         .unwrap();
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
-        assert!(reason.contains("UnknownIssuer"));
+        assert!(reason.contains("UnknownIssuer"), "{reason}");
         assert_eq!(server_config.streams(), 0);
         assert!(callback.notifications.lock().is_empty());
 

@@ -128,7 +128,13 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
-            client::Error::EchBootstrappingFailed => todo!(),
+            client::Error::EchBootstrappingFailed => {
+                // NOTE: this should never happen, the ECH offer rejection should
+                // be exposed as a disconnect
+                Self::InternalError {
+                    reason: "ech bootstrap offer rejected by the ENS server".to_owned(),
+                }
+            }
         }
     }
 }
@@ -2004,5 +2010,40 @@ mod tests {
             }]
         );
         assert!(relay.wire().contains(TLS_DOMAIN));
+    }
+
+    #[test_log::test]
+    fn ech_offer_ignored_by_plain_server_triggers_disconnect() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            EchMode::Off,
+        );
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        let handshakes = stub.wait_for_handshakes(1);
+        assert!(!handshakes[0].ech_accepted);
+        assert_ne!(handshakes[0].sni_seen, Some(TLS_DOMAIN.to_owned()));
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        let rejected = client::Error::EchBootstrappingRejected.to_string();
+        assert!(reason.contains(&rejected));
+
+        assert_eq!(upstream.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
     }
 }

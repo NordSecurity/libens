@@ -306,19 +306,28 @@ impl TryFrom<Authentication> for ClientAuthentication {
     }
 }
 
-trait AuthRejection {
+trait ErrorsExt {
     fn is_auth_rejection(&self) -> bool;
+    fn is_ech_offer_rejection(&self) -> bool;
 }
 
-impl AuthRejection for Status {
+impl ErrorsExt for Status {
     fn is_auth_rejection(&self) -> bool {
         matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
     }
+
+    fn is_ech_offer_rejection(&self) -> bool {
+        false
+    }
 }
 
-impl AuthRejection for Error {
+impl ErrorsExt for Error {
     fn is_auth_rejection(&self) -> bool {
         matches!(self, Error::Status(status) if status.is_auth_rejection())
+    }
+
+    fn is_ech_offer_rejection(&self) -> bool {
+        matches!(self, Error::EchBootstrappingFailed)
     }
 }
 
@@ -349,6 +358,17 @@ async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl 
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the authentication");
+    publish_disconnect(tx, reason).await;
+}
+
+async fn publish_ech_offer_rejection(
+    tx: &Sender<Event>,
+    vpn_uri: &str,
+    error: &impl std::fmt::Display,
+) {
+    error!("ECH offer for ENS at '{vpn_uri}' was rejected: {error}");
+
+    let reason = format!("'{vpn_uri}' rejected the ECH offer");
     publish_disconnect(tx, reason).await;
 }
 
@@ -394,6 +414,11 @@ async fn task(
                     Err(e) => {
                         if e.is_auth_rejection() {
                             publish_auth_rejection(&tx, vpn_uri, &e).await;
+                            break 'outer;
+                        }
+
+                        if e.is_ech_offer_rejection() {
+                            publish_ech_offer_rejection(&tx, vpn_uri, &e).await;
                             break 'outer;
                         }
 

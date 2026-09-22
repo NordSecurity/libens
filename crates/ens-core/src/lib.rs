@@ -128,13 +128,14 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
-            client::Error::EchBootstrappingFailed => {
+            client::Error::EchBootstrappingFailed(e) => {
                 // NOTE: this should never happen, the ECH offer rejection should
                 // be exposed as a disconnect
                 Self::InternalError {
-                    reason: "ech bootstrap offer rejected by the ENS server".to_owned(),
+                    reason: format!("ech bootstrap failed: {e:?}"),
                 }
             }
+            client::Error::EchBootstrappingRejected => todo!(),
         }
     }
 }
@@ -590,7 +591,7 @@ async fn connect_impl(
 
     client
         .start_monitor_on_port(vpn.ip(), vpn.port(), tls, authentication, backoff)
-        .await;
+        .await?;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
 
@@ -1235,7 +1236,7 @@ mod tests {
 
         assert_eq!(
             reason,
-            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+            format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
         );
         assert!(callback.notifications.lock().is_empty());
         assert_eq!(0, tracked_connections(&[connection.id]));
@@ -1271,7 +1272,7 @@ mod tests {
 
         assert_eq!(
             reason,
-            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+            format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
         );
         assert!(callback.notifications.lock().is_empty());
         assert_eq!(0, tracked_connections(&[connection.id]));
@@ -1683,7 +1684,7 @@ mod tests {
         assert_eq!(
             *callback.disconnects.lock(),
             vec![Some(format!(
-                "'http://127.0.0.1:{vpn_port}' rejected the authentication"
+                "'http://127.0.0.1:{vpn_port}/' rejected the authentication"
             ))]
         );
 

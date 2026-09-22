@@ -76,8 +76,13 @@ pub enum Error {
     Internal { reason: String },
     #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
     UntrustedCertificate { vpn_uri: String, reason: String },
+    /// It was possible to connect with random hostname but to retry_configs
+    /// have been returned by the server
     #[error("ECH bootstrapping failed")]
-    EchBootstrappingFailed,
+    EchBootstrappingFailed(#[from] std::io::Error), // TODO: add details
+
+    #[error("ECH bootstrapping rejected")]
+    EchBootstrappingRejected,
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -186,7 +191,7 @@ impl ErrorNotificationService {
         tls: TlsOptions,
         authentication: ClientAuthentication,
         backoff: impl Backoff,
-    ) {
+    ) -> Result<(), Error> {
         info!("Will start ENS monitoring for {vpn_ip}:{ens_port} ({tls:?})");
         self.stop().await;
 
@@ -195,7 +200,9 @@ impl ErrorNotificationService {
 
         // Needs to be http and not https, otherwise grpc will add another layer of https
         // on top of our own custom one
-        let vpn_uri = format!("http://{vpn_ip}:{ens_port}");
+
+        let vpn_uri =
+            Uri::from_str(&format!("http://{vpn_ip}:{ens_port}")).map_err(http::Error::from)?;
 
         let pool = self.socket_pool.clone();
         let tx = self.tx.clone();
@@ -226,6 +233,8 @@ impl ErrorNotificationService {
         });
 
         self.quit = Some((quit_tx, join_handle));
+
+        Ok(())
     }
 
     /// Stop ENS
@@ -327,7 +336,7 @@ impl ErrorsExt for Error {
     }
 
     fn is_ech_offer_rejection(&self) -> bool {
-        matches!(self, Error::EchBootstrappingFailed)
+        matches!(self, Error::EchBootstrappingRejected)
     }
 }
 
@@ -354,7 +363,7 @@ fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
     None
 }
 
-async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
+async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &Uri, error: &impl std::fmt::Display) {
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the authentication");
@@ -363,7 +372,7 @@ async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl 
 
 async fn publish_ech_offer_rejection(
     tx: &Sender<Event>,
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     error: &impl std::fmt::Display,
 ) {
     error!("ECH offer for ENS at '{vpn_uri}' was rejected: {error}");
@@ -378,13 +387,13 @@ async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
     }
 }
 
-pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
+pub(crate) fn stream_closed_reason(vpn_uri: &Uri) -> String {
     format!("'{vpn_uri}' closed the grpc stream")
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn task(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     tls: TlsOptions,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
@@ -482,7 +491,7 @@ async fn task(
                     backoff.reset();
                     if let Err(e) = tx.try_send(Event::Notification {
                         connection_error,
-                        vpn_uri: vpn_uri.to_owned(),
+                        vpn_uri: vpn_uri.to_string(),
                     }) {
                         warn!("Failed to publish newly received error notification: {e}");
                     }
@@ -512,7 +521,7 @@ async fn task(
 }
 
 async fn open_channel(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     tls: &TlsOptions,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
@@ -532,13 +541,13 @@ async fn open_channel(
     )
     .await;
 
-    let Some(tls) = attempt.as_ref().err().and_then(certificate_rejection) else {
+    let Some(rejection) = attempt.as_ref().err().and_then(certificate_rejection) else {
         return attempt;
     };
 
     let untrusted = Error::UntrustedCertificate {
-        vpn_uri: vpn_uri.to_owned(),
-        reason: tls.to_string(),
+        vpn_uri: vpn_uri.to_string(),
+        reason: rejection.to_string(),
     };
     error!("{untrusted}");
     publish_disconnect(tx, untrusted.to_string()).await;
@@ -582,7 +591,7 @@ fn authentication_interceptor(
 }
 
 async fn bootstrap_ech(
-    uri: Uri,
+    uri: &Uri,
     tls: &TlsOptions,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
@@ -602,19 +611,19 @@ async fn bootstrap_ech(
     let expected_tls_hostname = tls.server_name(host).map_err(|e| Error::Internal {
         reason: e.to_string(),
     })?;
-    let socket = pool.new_external_tcp_v4(None).unwrap();
+    let socket = pool.new_external_tcp_v4(None)?;
     let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        .unwrap();
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    if let Some(resolved) = lookup_host((host, port)).await.unwrap().next() {
-        let tcp_stream = socket.connect(resolved).await.unwrap();
+    if let Some(resolved) = lookup_host((host, port)).await?.next() {
+        let tcp_stream = socket.connect(resolved).await?;
+
         let tls_connector = make_tls_connector(
             allow_only_mlkem,
             root_certificate,
             EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
-        )
-        .unwrap();
+        )?;
+
         let tls_stream = tls_connector.connect(domain, tcp_stream).await;
         if let Err(e) = &tls_stream {
             fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
@@ -635,7 +644,7 @@ async fn bootstrap_ech(
 }
 
 async fn create_external_channel(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     tls: TlsOptions,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
@@ -646,7 +655,7 @@ async fn create_external_channel(
     let bootstrapped_ech_config_list = match tls.ech {
         EchBootstrap::Enabled => {
             let retry_configs = bootstrap_ech(
-                vpn_uri.parse().unwrap(),
+                vpn_uri,
                 &tls,
                 pool.clone(),
                 allow_only_mlkem,
@@ -654,7 +663,7 @@ async fn create_external_channel(
             )
             .await?;
             if retry_configs.is_none() {
-                return Err(Error::EchBootstrappingFailed);
+                return Err(Error::EchBootstrappingRejected);
             }
             info!("ECH bootstrapping success");
             retry_configs
@@ -703,7 +712,7 @@ async fn create_external_channel(
         }
     };
 
-    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?.user_agent(user_agent)?;
+    let endpoint = Endpoint::try_from(vpn_uri.to_string())?.user_agent(user_agent)?;
 
     let endpoint = if let Some(interval) = keepalive.interval {
         endpoint.http2_keep_alive_interval(interval)
@@ -870,7 +879,7 @@ pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError
     buf.extend(u16::try_from(key.len())?.to_be_bytes()); // public key
     buf.extend(key);
 
-    // `HpkeSymmetricCipherSuite`
+    // `HpkeSymetricCipherSuite`
     buf.extend(4u16.to_be_bytes()); // len + 4
 
     buf.extend(u16::from(hpke.suite().sym.kdf_id).to_be_bytes()); // kdf_id
@@ -898,7 +907,13 @@ pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError
     Ok(buf)
 }
 
-pub fn generate_random_domain() -> String {
+fn generate_random_ech_config_list() -> Result<EchConfigListBytes<'static>, TryFromIntError> {
+    let domain = generate_random_domain();
+    let ech_config_list = random_key_config(&domain)?;
+    Ok(EchConfigListBytes::from(ech_config_list))
+}
+
+fn generate_random_domain() -> String {
     // Most popular English words according to https://en.wikipedia.org/wiki/Most_common_words_in_English
     //
     const NOUNS: &[&str] = &[
@@ -1045,21 +1060,19 @@ fn make_tls_connector(
     let (mode, expected_tls_hostname) = match ech_mode {
         EchMode::None => (None, None),
         EchMode::BootstrapWithExpectedServerName(server_name) => {
-            let domain = generate_random_domain();
-            let ech_config_list = random_key_config(&domain);
-            let ech_config_list = EchConfigListBytes::from(ech_config_list);
-            let hpke_suites = ALL_SUPPORTED_SUITES;
-            // TODO: is that hpke correct?
-            let ech_config: EchConfig = EchConfig::new(ech_config_list, hpke_suites).unwrap();
+            let ech_config: EchConfig =
+                EchConfig::new(generate_random_ech_config_list(), ALL_SUPPORTED_SUITES).unwrap();
             (
                 Some(rustls::client::EchMode::Enable(random_ech_config)),
                 Some(server_name),
             )
         }
         EchMode::UseEchConfigList(ech_config_bytes) => {
-            let hpke_suites = ALL_SUPPORTED_SUITES;
-            let ech_config: EchConfig =
-                EchConfig::new(EchConfigListBytes::from(ech_config_bytes), hpke_suites).unwrap();
+            let ech_config: EchConfig = EchConfig::new(
+                EchConfigListBytes::from(ech_config_bytes),
+                ALL_SUPPORTED_SUITES,
+            )
+            .unwrap();
             (Some(rustls::client::EchMode::Enable(ech_config)), None)
         }
     };
@@ -1146,7 +1159,10 @@ pub mod tests {
     use ens_stub::{ExpectedAuth, TlsConfig};
 
     use crate::{
-        test_support::{Command, RelayMode, ServerConfig, TcpRelay},
+        test_support::{
+            spawn_plain_server, Command, EchMode as StubEchMode, GoEchStub, RelayMode,
+            ServerConfig, TcpRelay,
+        },
         CredentialsKind, Keys, STATE,
     };
 
@@ -1158,6 +1174,8 @@ pub mod tests {
         LazyLock::new(|| vec!["localhost".to_string(), "127.0.0.1".to_string()]);
 
     const TEST_USER_AGENT: HeaderValue = HeaderValue::from_static("foo bar baz");
+    const ECH_PUBLIC_NAME: &str = "cover.example.com";
+    const TLS_DOMAIN: &str = "secret.example.com";
 
     #[derive(Clone)]
     pub enum TestAuthConfig {
@@ -1250,7 +1268,7 @@ pub mod tests {
     }
 
     pub fn closed_reason(vpn_port: u16) -> String {
-        stream_closed_reason(&format!("http://127.0.0.1:{vpn_port}"))
+        stream_closed_reason(&Uri::from_str(&format!("http://127.0.0.1:{vpn_port}")).unwrap())
     }
 
     /// The user agent that `init` installed. Tests going through the public
@@ -1336,7 +1354,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         server_config
             .send(Command::Send(ConnectionError {
@@ -1425,7 +1444,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         server_config
             .send(Command::Send(ConnectionError {
@@ -1529,7 +1549,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
-        .await;
+        .await
+        .unwrap();
 
         for e in errors_to_emit.clone() {
             server_config.send(Command::Send(e)).await;
@@ -1542,6 +1563,107 @@ pub mod tests {
             server_config.send(Command::Send(e)).await;
         }
         let _collected_errors = collect_errors(3, &mut rx).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn backoff_while_server_refuses_first_handshakes(
+        #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
+    ) {
+        const REFUSED_HANDSHAKES: usize = 3;
+        const BACKOFF: Duration = Duration::from_millis(100);
+        const RECONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+        let client_private_key = SecretKey::gen();
+        let server_config = spawn_plain_server().await;
+        let stub_ech = match ech {
+            EchBootstrap::Enabled => StubEchMode::On,
+            EchBootstrap::Disabled => StubEchMode::Off,
+        };
+        let stub = GoEchStub::spawn(
+            server_config.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            stub_ech,
+        );
+        let relay = Arc::new(TcpRelay::spawn(stub.port()).await);
+        relay.set_mode(RelayMode::Refuse);
+
+        let waits = Arc::new(AtomicUsize::new(0));
+        let advances = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+
+        let mut backoff = telio_utils::exponential_backoff::MockBackoff::new();
+        {
+            let waits = waits.clone();
+            let relay = relay.clone();
+            backoff.expect_get_backoff().returning(move || {
+                let handshake = waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if handshake == REFUSED_HANDSHAKES {
+                    relay.set_mode(RelayMode::Forward);
+                }
+                BACKOFF
+            });
+        }
+        {
+            let advances = advances.clone();
+            backoff.expect_next_backoff().returning(move || {
+                advances.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        {
+            let resets = resets.clone();
+            backoff.expect_reset().returning(move || {
+                resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            NonZeroUsize::new(10).unwrap(),
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(stub.ca_der().to_vec()),
+            KeepaliveConfig::default(),
+            TEST_USER_AGENT,
+        );
+
+        let tls = TlsOptions {
+            domain: Some(TLS_DOMAIN.try_into().unwrap()),
+            ech,
+        };
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            relay.port,
+            tls,
+            client_authentication(&client_private_key, server_config.public_key),
+            backoff,
+        )
+        .await
+        .unwrap();
+
+        let emitted = ConnectionError {
+            code: EnsProtoError::Unknown as i32,
+            additional_info: None,
+        };
+        server_config.send(Command::Send(emitted.clone())).await;
+
+        let received = timeout(RECONNECT_DEADLINE, recv_connection_error(&mut rx))
+            .await
+            .unwrap();
+        assert_eq!(received, emitted);
+
+        assert_eq!(server_config.streams(), 1);
+        assert_eq!(
+            waits.load(std::sync::atomic::Ordering::SeqCst),
+            REFUSED_HANDSHAKES
+        );
+        assert_eq!(
+            advances.load(std::sync::atomic::Ordering::SeqCst),
+            REFUSED_HANDSHAKES
+        );
+        assert_eq!(resets.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1629,7 +1751,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         // Wait a bit for the background task to attempt TLS handshake and fail
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

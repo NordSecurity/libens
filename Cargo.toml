@@ -12,6 +12,7 @@ members = [
     ".",
     "cli",
     "crates/ens-core",
+    "crates/ens-stub",
 ]
 
 [lib]

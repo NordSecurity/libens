@@ -926,14 +926,13 @@ name = "ens-core"
 version = "0.0.1"
 dependencies = [
  "assert_matches",
- "async-channel",
  "base64 0.23.1",
  "blake3",
  "built",
  "crypto_box",
+ "ens-stub",
  "hex",
  "http",
- "http-auth-basic",
  "hyper-util",
  "llt-proto",
  "log",
@@ -950,12 +949,37 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tonic",
  "tower",
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "ens-stub"
+version = "0.0.1"
+dependencies = [
+ "async-channel",
+ "base64 0.23.1",
+ "blake3",
+ "clap",
+ "env_logger",
+ "http",
+ "http-auth-basic",
+ "llt-proto",
+ "log",
+ "parking_lot",
+ "rand 0.9.5",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "telio-crypto",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   NIGHTLY_VERSION: "nightly-2025-12-01"
   COVERAGE_DIR: coverage
-  COVERAGE_ARGS: --all --all-features --exclude ens-cli
+  COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub
 
 permissions:
   contents: read
@@ -49,7 +49,7 @@ jobs:
         with:
           key: clippy-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --all-targets --all-features --color always --package libens --package ens-core -- --deny warnings
+      - run: cargo clippy --all-targets --all-features --color always --package libens --package ens-core --package ens-stub -- --deny warnings
 
   cargo-deny:
     name: cargo deny

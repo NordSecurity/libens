@@ -75,6 +75,7 @@ pub async fn spawn_plain_server() -> ServerConfig {
 pub enum EchMode {
     On,
     Off,
+    Invalid,
 }
 
 impl EchMode {
@@ -82,6 +83,7 @@ impl EchMode {
         match self {
             EchMode::On => "on",
             EchMode::Off => "off",
+            EchMode::Invalid => "invalid",
         }
     }
 }

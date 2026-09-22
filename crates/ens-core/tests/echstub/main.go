@@ -48,6 +48,9 @@ const (
 	noName       = "-"
 	echOn        = "on"
 	echOff       = "off"
+	echInvalid   = "invalid"
+
+	invalidEchConnections = 6
 
 	usage = `echstub: TLS terminator with server-side ECH for libens tests.
 
@@ -78,7 +81,7 @@ func main() {
 	upstream := flag.String("upstream", "", "plaintext upstream host:port")
 	publicName := flag.String("public-name", "", "ECHConfig public_name")
 	tlsDomain := flag.String("tls-domain", "", "inner name the leaf certificate also covers")
-	ech := flag.String("ech", echOn, "on|off")
+	ech := flag.String("ech", echOn, "on|off|invalid, when invalid the first 6 connections will offer invalid ech bytes")
 	verbose := flag.Bool("v", false, "debug logging on stderr")
 	keyLog := flag.String("keylog", "", "append TLS secrets in NSS key log format to this file")
 	flag.Usage = func() {
@@ -86,7 +89,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *upstream == "" || *publicName == "" || (*ech != echOn && *ech != echOff) {
+	if *upstream == "" || *publicName == "" || (*ech != echOn && *ech != echOff && *ech != echInvalid) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -112,15 +115,22 @@ func main() {
 		slog.Info("writing TLS secrets", "path", *keyLog)
 	}
 
+	var correctEchConfig []byte
 	echList := noName
-	if *ech == echOn {
+	if *ech == echOn || *ech == echInvalid {
 		key, config := makeECHConfig(*publicName)
+		correctEchConfig = append([]byte{}, config...)
+		if *ech == echInvalid {
+			config[0] = ^config[0]
+		}
 		cfg.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{{
 			Config:      config,
 			PrivateKey:  key,
 			SendAsRetry: true,
 		}}
-		echList = base64.StdEncoding.EncodeToString(echConfigList(config))
+		echConfigListBytes := echConfigList(config)
+
+		echList = base64.StdEncoding.EncodeToString(echConfigListBytes)
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)
@@ -143,7 +153,21 @@ func main() {
 		if err != nil {
 			fatal("accept failed", err)
 		}
-		go serve(conn, cfg, *upstream, slog.With("conn", connections.Add(1)))
+		id := connections.Add(1)
+		// Bootstrapped ECH makes two connections per attempt, so 6 here, means
+		// 3 pairs of:
+		// - connection with random domain to get ech config bytes from Go server
+		// - connection with ech config bytes from server that fails because the
+		//   ech config bytes are invalid
+		// And finally, from 7th connection onwards the ech config bytes are
+		// correct so the next two connections will complete ech bootstrap.
+		//
+		// Choosing 3x2==6 here makes it match the `assert_reconnects` helper
+		// in rust tests
+		if id > invalidEchConnections {
+			cfg.EncryptedClientHelloKeys[0].Config = correctEchConfig
+		}
+		go serve(conn, cfg, *upstream, slog.With("conn", id))
 	}
 }
 

@@ -1098,7 +1098,8 @@ fn make_tls_connector(
         EchMode::None => (None, None),
         EchMode::BootstrapWithExpectedServerName(server_name) => {
             let ech_config: EchConfig =
-                EchConfig::new(generate_random_ech_config_list(), ALL_SUPPORTED_SUITES).unwrap();
+                EchConfig::new(generate_random_ech_config_list(), ALL_SUPPORTED_SUITES)
+                    .map_err(std::io::Error::other)?;
             (
                 Some(rustls::client::EchMode::Enable(random_ech_config)),
                 Some(server_name),
@@ -1109,7 +1110,7 @@ fn make_tls_connector(
                 EchConfigListBytes::from(ech_config_bytes),
                 ALL_SUPPORTED_SUITES,
             )
-            .unwrap();
+            .map_err(std::io::Error::other)?;
             (Some(rustls::client::EchMode::Enable(ech_config)), None)
         }
     };
@@ -1614,10 +1615,16 @@ pub mod tests {
         relay: Arc<TcpRelay>,
     }
 
-    async fn spawn_ech_testbed(ech: EchBootstrap) -> EchTestbed {
+    async fn spawn_ech_testbed(ech: EchBootstrap, invalid_ech_bytes: bool) -> EchTestbed {
         let upstream = spawn_plain_server().await;
         let stub_ech = match ech {
-            EchBootstrap::Enabled => StubEchMode::On,
+            EchBootstrap::Enabled => {
+                if invalid_ech_bytes {
+                    StubEchMode::Invalid
+                } else {
+                    StubEchMode::On
+                }
+            }
             EchBootstrap::Disabled => StubEchMode::Off,
         };
         let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, Some(TLS_DOMAIN), stub_ech);
@@ -1763,13 +1770,28 @@ pub mod tests {
         assert_eq!(calls.reset_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    #[test_log::test]
+    async fn invalid_ech_bytes_reconnects() {
+        let ech = EchBootstrap::Enabled;
+        let invalid_ech_bytes = true;
+        let testbed = spawn_ech_testbed(ech, invalid_ech_bytes).await;
+
+        let (backoff, calls) = counting_backoff(|_| {});
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
+
+        assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
+
     #[rstest]
     #[tokio::test]
     #[test_log::test]
     async fn backoff_while_server_refuses_first_handshakes(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech).await;
+        let testbed = spawn_ech_testbed(ech, false).await;
         testbed.relay.set_mode(RelayMode::Refuse);
 
         let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
@@ -1786,7 +1808,7 @@ pub mod tests {
     async fn backoff_while_server_cuts_first_handshakes_short(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech).await;
+        let testbed = spawn_ech_testbed(ech, false).await;
         let closer = spawn_handshake_closer().await;
         testbed.relay.set_mode(RelayMode::Redirect(closer));
 
@@ -1804,7 +1826,7 @@ pub mod tests {
     async fn untrusted_certificate_ends_the_session(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech).await;
+        let testbed = spawn_ech_testbed(ech, false).await;
         let unrelated_ca = TlsConfig::new();
 
         let (backoff, calls) = counting_backoff(|_| ());

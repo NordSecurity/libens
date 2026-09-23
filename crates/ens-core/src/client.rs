@@ -76,13 +76,30 @@ pub enum Error {
     Internal { reason: String },
     #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
     UntrustedCertificate { vpn_uri: String, reason: String },
-    /// It was possible to connect with random hostname but to retry_configs
-    /// have been returned by the server
+    /// The bootstrap handshake failed before the server sent `retry_configs`.
+    /// `transient` tells whether a reconnect can help
     #[error("ECH bootstrapping failed")]
-    EchBootstrappingFailed(#[from] std::io::Error), // TODO: add details
-
+    EchBootstrappingFailed {
+        #[source]
+        source: std::io::Error,
+        transient: bool,
+    },
     #[error("ECH bootstrapping rejected")]
     EchBootstrappingRejected,
+}
+
+fn ech_bootstrapping_failed_transient(source: std::io::Error) -> Error {
+    Error::EchBootstrappingFailed {
+        source,
+        transient: true,
+    }
+}
+
+fn ech_bootstrapping_failed_persistent(source: std::io::Error) -> Error {
+    Error::EchBootstrappingFailed {
+        source,
+        transient: false,
+    }
 }
 
 /// Configuration of the keep alive messages sent over the ENS connection
@@ -319,6 +336,7 @@ trait ErrorsExt {
     fn is_auth_rejection(&self) -> bool;
     fn is_ech_offer_rejection(&self) -> bool;
     fn is_untrusted_cert(&self) -> bool;
+    fn is_persistent(&self) -> bool;
 }
 
 impl ErrorsExt for Status {
@@ -331,6 +349,10 @@ impl ErrorsExt for Status {
     }
 
     fn is_untrusted_cert(&self) -> bool {
+        false
+    }
+
+    fn is_persistent(&self) -> bool {
         false
     }
 }
@@ -346,6 +368,16 @@ impl ErrorsExt for Error {
 
     fn is_untrusted_cert(&self) -> bool {
         matches!(self, Error::UntrustedCertificate { .. })
+    }
+
+    fn is_persistent(&self) -> bool {
+        matches!(
+            self,
+            Error::EchBootstrappingFailed {
+                transient: false,
+                ..
+            }
+        )
     }
 }
 
@@ -448,6 +480,11 @@ async fn task(
 
                         if e.is_untrusted_cert() {
                             publish_untrusted_cert(&tx, &e).await;
+                            break 'outer;
+                        }
+
+                        if e.is_persistent() {
+                            publish_disconnect(&tx, format!("persistent error: {e:?}")).await;
                             break 'outer;
                         }
 
@@ -631,20 +668,38 @@ async fn bootstrap_ech(
     let expected_tls_hostname = tls.server_name(host).map_err(|e| Error::Internal {
         reason: e.to_string(),
     })?;
-    let socket = pool.new_external_tcp_v4(None)?;
-    let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let socket = pool
+        .new_external_tcp_v4(None)
+        .map_err(ech_bootstrapping_failed_transient)?;
+    let domain =
+        tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
+            Error::Internal {
+                reason: format!("malformed server name: {e}"),
+            }
+        })?;
+    // .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    if let Some(resolved) = lookup_host((host, port)).await?.next() {
-        let tcp_stream = socket.connect(resolved).await?;
+    if let Some(resolved) = lookup_host((host, port))
+        .await
+        .map_err(ech_bootstrapping_failed_transient)?
+        .next()
+    {
+        let tcp_stream = socket
+            .connect(resolved)
+            .await
+            .map_err(ech_bootstrapping_failed_transient)?;
 
         let tls_connector = make_tls_connector(
             allow_only_mlkem,
             root_certificate,
             EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
-        )?;
+        )
+        .map_err(ech_bootstrapping_failed_transient)?;
 
-        let tls_stream = tls_connector.connect(domain, tcp_stream).await;
+        let tls_stream = tls_connector
+            .connect(domain, tcp_stream)
+            .await
+            .inspect_err(|e| info!("tls_connector.connect err: {e}"));
         if let Err(e) = tls_stream {
             fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
                 e.get_ref()?.downcast_ref::<rustls::Error>()
@@ -673,7 +728,11 @@ async fn bootstrap_ech(
                         reason: e.to_string(),
                     });
                 }
-                _ => return Err(e.into()),
+                Some(rustls::Error::InvalidMessage(_)) => {
+                    // return Err(Error::EchBootstrappingRejected);
+                    return Err(ech_bootstrapping_failed_persistent(e));
+                }
+                _ => return Err(ech_bootstrapping_failed_transient(e)),
             }
         }
     }
@@ -691,6 +750,7 @@ async fn create_external_channel(
 ) -> Result<Channel, Error> {
     let bootstrapped_ech_config_list = match tls.ech {
         EchBootstrap::Enabled => {
+            info!("bootstrap start");
             let retry_configs = bootstrap_ech(
                 vpn_uri,
                 &tls,
@@ -699,9 +759,23 @@ async fn create_external_channel(
                 &root_certificate,
             )
             .await?;
-            if retry_configs.is_none() {
+            info!("bootstrap end: {retry_configs:?}");
+            if dbg!(&retry_configs).is_none() {
                 return Err(Error::EchBootstrappingRejected);
             }
+            if let Some(retry_configs_bytes) = &retry_configs {
+                let ech_config: Result<EchConfig, rustls::Error> = dbg!(EchConfig::new(
+                    EchConfigListBytes::from(retry_configs_bytes.clone()),
+                    ALL_SUPPORTED_SUITES,
+                ));
+                if let Err(rustls::Error::InvalidEncryptedClientHello(ech_error)) = ech_config {
+                    warn!("ECH bootstrapping failed due to invalid client hello: {ech_error:?}");
+                    return Err(Error::EchBootstrappingRejected);
+                }
+                // TODO: pass the parsed ech_config down, instead of re-parsing it
+                // once again further down the call stack
+            }
+
             info!("ECH bootstrapping success");
             retry_configs
         }
@@ -1106,10 +1180,10 @@ fn make_tls_connector(
             )
         }
         EchMode::UseEchConfigList(ech_config_bytes) => {
-            let ech_config: EchConfig = EchConfig::new(
+            let ech_config: EchConfig = dbg!(EchConfig::new(
                 EchConfigListBytes::from(ech_config_bytes),
                 ALL_SUPPORTED_SUITES,
-            )
+            ))
             .map_err(std::io::Error::other)?;
             (Some(rustls::client::EchMode::Enable(ech_config)), None)
         }
@@ -1201,8 +1275,8 @@ pub mod tests {
 
     use crate::{
         test_support::{
-            spawn_plain_server, Command, EchMode as StubEchMode, GoEchStub, RelayMode,
-            ServerConfig, TcpRelay,
+            spawn_plain_server, BadRetryLasts, Command, EchMode as StubEchMode, GoEchStub,
+            RelayMode, RetryConfig, ServerConfig, TcpRelay,
         },
         CredentialsKind, Keys, STATE,
     };
@@ -1615,18 +1689,15 @@ pub mod tests {
         relay: Arc<TcpRelay>,
     }
 
-    async fn spawn_ech_testbed(ech: EchBootstrap, invalid_ech_bytes: bool) -> EchTestbed {
-        let upstream = spawn_plain_server().await;
-        let stub_ech = match ech {
-            EchBootstrap::Enabled => {
-                if invalid_ech_bytes {
-                    StubEchMode::Invalid
-                } else {
-                    StubEchMode::On
-                }
-            }
+    fn stub_ech(ech: EchBootstrap) -> StubEchMode {
+        match ech {
+            EchBootstrap::Enabled => StubEchMode::On,
             EchBootstrap::Disabled => StubEchMode::Off,
-        };
+        }
+    }
+
+    async fn spawn_ech_testbed(stub_ech: StubEchMode) -> EchTestbed {
+        let upstream = spawn_plain_server().await;
         let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, Some(TLS_DOMAIN), stub_ech);
         let relay = Arc::new(TcpRelay::spawn(stub.port()).await);
 
@@ -1772,10 +1843,13 @@ pub mod tests {
 
     #[tokio::test]
     #[test_log::test]
-    async fn invalid_ech_bytes_reconnects() {
+    async fn malformed_server_ech_key_reconnects() {
         let ech = EchBootstrap::Enabled;
-        let invalid_ech_bytes = true;
-        let testbed = spawn_ech_testbed(ech, invalid_ech_bytes).await;
+        let testbed = spawn_ech_testbed(StubEchMode::BadRetry {
+            kind: RetryConfig::Malformed,
+            lasts: BadRetryLasts::Connections(FAILED_HANDSHAKES),
+        })
+        .await;
 
         let (backoff, calls) = counting_backoff(|_| {});
         let (_ens, mut rx) = testbed
@@ -1791,7 +1865,7 @@ pub mod tests {
     async fn backoff_while_server_refuses_first_handshakes(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech, false).await;
+        let testbed = spawn_ech_testbed(stub_ech(ech)).await;
         testbed.relay.set_mode(RelayMode::Refuse);
 
         let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
@@ -1808,7 +1882,7 @@ pub mod tests {
     async fn backoff_while_server_cuts_first_handshakes_short(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech, false).await;
+        let testbed = spawn_ech_testbed(stub_ech(ech)).await;
         let closer = spawn_handshake_closer().await;
         testbed.relay.set_mode(RelayMode::Redirect(closer));
 
@@ -1826,8 +1900,8 @@ pub mod tests {
     async fn untrusted_certificate_ends_the_session(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
     ) {
-        let testbed = spawn_ech_testbed(ech, false).await;
-        let unrelated_ca = TlsConfig::new();
+        let testbed = spawn_ech_testbed(stub_ech(ech)).await;
+        let unrelated_ca = TlsConfig::new().unwrap();
 
         let (backoff, calls) = counting_backoff(|_| ());
         let (_ens, mut rx) = testbed

@@ -4,6 +4,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -17,21 +18,24 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	echVersion           = 0xfe0d
-	echConfigID          = 1
-	kemX25519HkdfSha256  = 0x0020
-	kdfHkdfSha256        = 0x0001
-	aeadAes128Gcm        = 0x0001
-	aeadAes256Gcm        = 0x0002
-	aeadChaCha20Poly1305 = 0x0003
-	aeadExportOnly       = 0xffff
-	echMaxNameLength     = 0
+	echVersion            = 0xfe0d
+	echConfigID           = 1
+	kemX25519HkdfSha256   = 0x0020
+	kemMlkem768X25519     = 0x647a
+	kdfHkdfSha256         = 0x0001
+	aeadAes128Gcm         = 0x0001
+	aeadAes256Gcm         = 0x0002
+	aeadChaCha20Poly1305  = 0x0003
+	aeadExportOnly        = 0xffff
+	echMaxNameLength      = 0
+	echConfigLengthOffset = 2
 
 	recordHeaderLen         = 5
 	recordTypeHandshake     = 22
@@ -49,9 +53,15 @@ const (
 	noName       = "-"
 	echOn        = "on"
 	echOff       = "off"
-	echInvalid   = "invalid"
 
-	invalidEchConnections = 6
+	retryGood           = "good"
+	retryUnusableAead   = "unusable-aead"
+	retryPqKem          = "pq-kem"
+	retryUnknownVersion = "unknown-version"
+	retryBadPublicName  = "bad-public-name"
+	retryMalformed      = "malformed"
+	badPublicName       = "not a name"
+	badForever          = 0
 
 	usage = `echstub: TLS terminator with server-side ECH for libens tests.
 
@@ -59,6 +69,14 @@ Listens on 127.0.0.1, terminates TLS with a fresh CA and leaf (SANs: 127.0.0.1
 and the public name), then forwards plaintext to -upstream. With -ech on it
 serves one X25519 ECHConfig and sends it as retry_configs when the client
 offers ECH with a different key.
+
+-retry replaces that config for the first -bad-connections connections
+(0 means forever):
+  unusable-aead    export-only AEAD, rustls finds no compatible suite
+  pq-kem           MLKEM768-X25519 KEM, rustls HPKE has no PQ KEM
+  unknown-version  version 0xfe0e, skipped by both Go and rustls
+  bad-public-name  public_name is not a DNS name, rustls cannot parse the list
+  malformed        corrupt length, Go aborts every ECH handshake
 
 Line protocol on stdout, one line per event:
   ready <port> <ca_der_b64> <ech_config_list_b64|->
@@ -82,7 +100,9 @@ func main() {
 	upstream := flag.String("upstream", "", "plaintext upstream host:port")
 	publicName := flag.String("public-name", "", "ECHConfig public_name")
 	tlsDomain := flag.String("tls-domain", "", "inner name the leaf certificate also covers")
-	ech := flag.String("ech", echOn, "on|off|invalid, when invalid the first 6 connections will offer invalid ech bytes")
+	ech := flag.String("ech", echOn, "on|off")
+	retry := flag.String("retry", retryGood, "good|unusable-aead|pq-kem|unknown-version|bad-public-name|malformed")
+	badConnections := flag.Uint64("bad-connections", badForever, "connections served with the -retry config before switching to the good one, 0 means forever")
 	verbose := flag.Bool("v", false, "debug logging on stderr")
 	keyLog := flag.String("keylog", "", "append TLS secrets in NSS key log format to this file")
 	flag.Usage = func() {
@@ -90,7 +110,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *upstream == "" || *publicName == "" || (*ech != echOn && *ech != echOff && *ech != echInvalid) {
+	if *upstream == "" || *publicName == "" || (*ech != echOn && *ech != echOff) || !slices.Contains(retryKinds, *retry) {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -116,23 +136,15 @@ func main() {
 		slog.Info("writing TLS secrets", "path", *keyLog)
 	}
 
-	var correctEchConfig []byte
+	var keys *echKeys
 	echList := noName
-	if *ech == echOn || *ech == echInvalid {
-		key, pub := makeECHKey()
-		correctEchConfig = makeECHConfig(*publicName, pub, supportedAeads)
-		config := correctEchConfig
-		if *ech == echInvalid {
-			config = makeECHConfig(*publicName, pub, []uint16{aeadExportOnly})
+	if *ech == echOn {
+		keys = &echKeys{
+			good:           makeRetryKey(retryGood, *publicName),
+			bad:            makeRetryKey(*retry, *publicName),
+			badConnections: *badConnections,
 		}
-		cfg.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{{
-			Config:      config,
-			PrivateKey:  key,
-			SendAsRetry: true,
-		}}
-		echConfigListBytes := echConfigList(config)
-
-		echList = base64.StdEncoding.EncodeToString(echConfigListBytes)
+		echList = base64.StdEncoding.EncodeToString(echConfigList(keys.good.Config))
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)
@@ -140,7 +152,7 @@ func main() {
 		fatal("cannot listen", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	slog.Info("listening", "port", port, "ech", *ech, "public_name", *publicName, "upstream", *upstream)
+	slog.Info("listening", "port", port, "ech", *ech, "retry", *retry, "bad_connections", *badConnections, "public_name", *publicName, "upstream", *upstream)
 	report("ready %d %s %s", port, base64.StdEncoding.EncodeToString(caDER), echList)
 
 	go func() {
@@ -156,20 +168,12 @@ func main() {
 			fatal("accept failed", err)
 		}
 		id := connections.Add(1)
-		// Bootstrapped ECH makes two connections per attempt, so 6 here, means
-		// 3 pairs of:
-		// - connection with random domain to get ech config bytes from Go server
-		// - connection with ech config bytes from server that fails because the
-		//   ech config bytes are invalid
-		// And finally, from 7th connection onwards the ech config bytes are
-		// correct so the next two connections will complete ech bootstrap.
-		//
-		// Choosing 3x2==6 here makes it match the `assert_reconnects` helper
-		// in rust tests
-		if id > invalidEchConnections {
-			cfg.EncryptedClientHelloKeys[0].Config = correctEchConfig
+		perConn := cfg
+		if keys != nil {
+			perConn = cfg.Clone()
+			perConn.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{keys.forConnection(id)}
 		}
-		go serve(conn, cfg, *upstream, slog.With("conn", id))
+		go serve(conn, perConn, *upstream, slog.With("conn", id))
 	}
 }
 
@@ -230,6 +234,55 @@ func makeCerts(publicName, tlsDomain string) ([]byte, tls.Certificate) {
 
 var supportedAeads = []uint16{aeadAes128Gcm, aeadAes256Gcm, aeadChaCha20Poly1305}
 
+var retryKinds = []string{
+	retryGood,
+	retryUnusableAead,
+	retryPqKem,
+	retryUnknownVersion,
+	retryBadPublicName,
+	retryMalformed,
+}
+
+type echKeys struct {
+	good           tls.EncryptedClientHelloKey
+	bad            tls.EncryptedClientHelloKey
+	badConnections uint64
+}
+
+func (k *echKeys) forConnection(id uint64) tls.EncryptedClientHelloKey {
+	if k.badConnections == badForever || id <= k.badConnections {
+		return k.bad
+	}
+	return k.good
+}
+
+func makeRetryKey(kind, publicName string) tls.EncryptedClientHelloKey {
+	version, kem, name, aeads := uint16(echVersion), uint16(kemX25519HkdfSha256), publicName, supportedAeads
+	priv, pub := makeECHKey()
+	switch kind {
+	case retryUnusableAead:
+		aeads = []uint16{aeadExportOnly}
+	case retryPqKem:
+		kem = kemMlkem768X25519
+		priv, pub = makeHybridKey()
+	case retryUnknownVersion:
+		version = echVersion + 1
+	case retryBadPublicName:
+		name = badPublicName
+	}
+
+	config := makeECHConfig(version, kem, name, pub, aeads)
+	if kind == retryMalformed {
+		config[echConfigLengthOffset] = ^config[echConfigLengthOffset]
+	}
+
+	return tls.EncryptedClientHelloKey{
+		Config:      config,
+		PrivateKey:  priv,
+		SendAsRetry: true,
+	}
+}
+
 func makeECHKey() ([]byte, []byte) {
 	key, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -239,10 +292,23 @@ func makeECHKey() ([]byte, []byte) {
 	return key.Bytes(), key.PublicKey().Bytes()
 }
 
-func makeECHConfig(publicName string, pub []byte, aeads []uint16) []byte {
+func makeHybridKey() ([]byte, []byte) {
+	key, err := hpke.MLKEM768X25519().GenerateKey()
+	if err != nil {
+		fatal("crypto setup failed", err)
+	}
+	priv, err := key.Bytes()
+	if err != nil {
+		fatal("crypto setup failed", err)
+	}
+
+	return priv, key.PublicKey().Bytes()
+}
+
+func makeECHConfig(version, kem uint16, publicName string, pub []byte, aeads []uint16) []byte {
 	var contents []byte
 	contents = append(contents, echConfigID)
-	contents = binary.BigEndian.AppendUint16(contents, kemX25519HkdfSha256)
+	contents = binary.BigEndian.AppendUint16(contents, kem)
 	contents = binary.BigEndian.AppendUint16(contents, uint16(len(pub)))
 	contents = append(contents, pub...)
 	contents = binary.BigEndian.AppendUint16(contents, uint16(4*len(aeads)))
@@ -256,7 +322,7 @@ func makeECHConfig(publicName string, pub []byte, aeads []uint16) []byte {
 	contents = binary.BigEndian.AppendUint16(contents, 0)
 
 	var config []byte
-	config = binary.BigEndian.AppendUint16(config, echVersion)
+	config = binary.BigEndian.AppendUint16(config, version)
 	config = binary.BigEndian.AppendUint16(config, uint16(len(contents)))
 	config = append(config, contents...)
 

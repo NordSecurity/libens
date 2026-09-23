@@ -128,8 +128,8 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
-            client::Error::EchBootstrappingFailed(e) => Self::InternalError {
-                reason: format!("ECH bootstrap failed: {e:?}"),
+            client::Error::EchBootstrappingFailed { source, transient } => Self::TransportError {
+                reason: format!("ECH bootstrap failed (transient: {transient}): {source:?}"),
             },
             rejected @ client::Error::EchBootstrappingRejected => {
                 // NOTE: this should never happen, the ECH offer rejection should
@@ -862,9 +862,9 @@ mod tests {
             connect_local, connect_to_port, connect_to_test_server,
             connect_to_test_server_with_auth, connect_to_test_server_with_config, error,
             maintenance, spawn_plain_server, spawn_server, test_auth, wait_for,
-            wait_for_disconnect_reason, Command, EchMode, GoEchStub, Handshake, PanicAt,
-            RecordedCallback, RelayMode, ServerConfig, TcpRelay, CALLBACK_PANIC_MESSAGE,
-            SHUTDOWN_REASON,
+            wait_for_disconnect_reason, BadRetryLasts, Command, EchMode, GoEchStub, Handshake,
+            PanicAt, RecordedCallback, RelayMode, RetryConfig, ServerConfig, TcpRelay,
+            CALLBACK_PANIC_MESSAGE, SHUTDOWN_REASON,
         },
     };
 
@@ -2019,6 +2019,42 @@ mod tests {
             }]
         );
         assert!(relay.wire().contains(TLS_DOMAIN));
+    }
+
+    #[rstest]
+    #[case(RetryConfig::UnusableAead)]
+    #[case(RetryConfig::PqKem)]
+    #[case(RetryConfig::UnknownVersion)]
+    #[case(RetryConfig::BadPublicName)]
+    #[test_log::test]
+    fn ech_retry_config_client_cannot_use_triggers_disconnect(#[case] kind: RetryConfig) {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            EchMode::BadRetry {
+                kind,
+                lasts: BadRetryLasts::Forever,
+            },
+        );
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        wait_for(|| !callback.disconnects.lock().is_empty());
+        assert_eq!(upstream.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
     }
 
     #[test_log::test]

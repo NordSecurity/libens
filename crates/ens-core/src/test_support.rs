@@ -47,6 +47,7 @@ const ECH_STUB_START_TIMEOUT: Duration = Duration::from_secs(120);
 const ECH_STUB_READY: &str = "ready";
 const ECH_STUB_HANDSHAKE: &str = "handshake";
 const ECH_STUB_NONE: &str = "-";
+const ECH_STUB_BAD_FOREVER: usize = 0;
 const ECH_STUB_KEYLOG_ENV: &str = "ECH_STUB_KEYLOG";
 const ECH_STUB_LOG_TARGET: &str = "echstub";
 const SLOG_TIME_KEY: &str = "time=";
@@ -71,20 +72,61 @@ pub async fn spawn_plain_server() -> ServerConfig {
         .unwrap()
 }
 
+/// Retry config the stub serves instead of the good one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryConfig {
+    UnusableAead,
+    PqKem,
+    UnknownVersion,
+    BadPublicName,
+    Malformed,
+}
+
+impl RetryConfig {
+    fn flag(self) -> &'static str {
+        match self {
+            RetryConfig::UnusableAead => "unusable-aead",
+            RetryConfig::PqKem => "pq-kem",
+            RetryConfig::UnknownVersion => "unknown-version",
+            RetryConfig::BadPublicName => "bad-public-name",
+            RetryConfig::Malformed => "malformed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadRetryLasts {
+    Forever,
+    Connections(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EchMode {
     On,
     Off,
-    Invalid,
+    BadRetry {
+        kind: RetryConfig,
+        lasts: BadRetryLasts,
+    },
 }
 
 impl EchMode {
-    fn flag(self) -> &'static str {
+    fn args(self) -> Vec<String> {
+        let mut args = vec!["-ech".to_owned()];
         match self {
-            EchMode::On => "on",
-            EchMode::Off => "off",
-            EchMode::Invalid => "invalid",
+            EchMode::On => args.push("on".to_owned()),
+            EchMode::Off => args.push("off".to_owned()),
+            EchMode::BadRetry { kind, lasts } => {
+                let connections = match lasts {
+                    BadRetryLasts::Forever => ECH_STUB_BAD_FOREVER,
+                    BadRetryLasts::Connections(n) => n,
+                };
+                args.push("on".to_owned());
+                args.extend(["-retry".to_owned(), kind.flag().to_owned()]);
+                args.extend(["-bad-connections".to_owned(), connections.to_string()]);
+            }
         }
+        args
     }
 }
 
@@ -121,7 +163,7 @@ impl GoEchStub {
             .args(["run", "."])
             .args(["-upstream", &upstream.to_string()])
             .args(["-public-name", public_name])
-            .args(["-ech", ech.flag()])
+            .args(ech.args())
             .arg("-v");
         if let Some(tls_domain) = tls_domain {
             command.args(["-tls-domain", tls_domain]);
@@ -136,7 +178,7 @@ impl GoEchStub {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("ECH tests need go 1.24+ on PATH: {e}"));
+            .unwrap_or_else(|e| panic!("ECH tests need go 1.27+ on PATH: {e}"));
 
         // Spawned from the test thread so libtest captures the forwarded lines
         let stderr = child.stderr.take().unwrap();

@@ -43,6 +43,14 @@ enum Command {
         /// Duration of the connection
         #[clap(short, long, default_value_t = 15)]
         duration: u64,
+
+        /// Domain the server certificate is verified against. Sent as SNI, inner SNI with --ech
+        #[clap(long)]
+        tls_domain: Option<String>,
+
+        /// Bootstrap ECH from the server's retry configs
+        #[clap(long)]
+        ech: bool,
     },
     List {
         filter: Option<Filter>,
@@ -201,6 +209,8 @@ fn main() {
             kind,
             token,
             duration,
+            tls_domain,
+            ech,
         } => {
             let service_credentials = ens::runtime::get_runtime()
                 .unwrap()
@@ -249,7 +259,11 @@ fn main() {
             drop(api_client);
             debug!("api client destroyed");
 
-            let connection = connect(vpn, None, auth, callback, Arc::new(Config::new())).unwrap();
+            let config = Config::new();
+            config.set_tls_domain(tls_domain);
+            config.set_enable_ech_bootstrap(ech);
+
+            let connection = connect(vpn, None, auth, callback, Arc::new(config)).unwrap();
 
             get_runtime().unwrap().block_on(async {
                 let _ = timeout(Duration::from_secs(duration), disconnected.notified()).await;

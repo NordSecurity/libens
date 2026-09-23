@@ -133,3 +133,7 @@ cargo run -p ens-cli -- connect 185.16.207.58:993 --kind nord-lynx --duration 60
 
 Notifications and disconnects are logged to stderr. The process exits once the
 server disconnects, or after `--duration` seconds, default 15.
+
+## Trademarks
+
+*libens is not affiliated with gRPC®. gRPC® is a registered trademark owned by The Linux Foundation*

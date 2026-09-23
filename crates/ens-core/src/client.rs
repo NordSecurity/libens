@@ -730,24 +730,21 @@ async fn create_external_channel(
             )
             .await?;
             info!("bootstrap end: {retry_configs:?}");
-            if dbg!(&retry_configs).is_none() {
+            let Some(retry_configs_bytes) = retry_configs else {
                 return Err(Error::EchBootstrappingRejected);
-            }
-            if let Some(retry_configs_bytes) = &retry_configs {
-                let ech_config: Result<EchConfig, rustls::Error> = dbg!(EchConfig::new(
-                    EchConfigListBytes::from(retry_configs_bytes.clone()),
-                    ALL_SUPPORTED_SUITES,
-                ));
-                if let Err(rustls::Error::InvalidEncryptedClientHello(ech_error)) = ech_config {
-                    warn!("ECH bootstrapping failed due to invalid client hello: {ech_error:?}");
-                    return Err(Error::EchBootstrappingRejected);
-                }
-                // TODO: pass the parsed ech_config down, instead of re-parsing it
-                // once again further down the call stack
-            }
+            };
+
+            let ech_config = EchConfig::new(
+                EchConfigListBytes::from(retry_configs_bytes),
+                ALL_SUPPORTED_SUITES,
+            )
+            .map_err(|e| {
+                warn!("ECH bootstrapping failed, invalid retry configs: {e:?}");
+                Error::EchBootstrappingRejected
+            })?;
 
             info!("ECH bootstrapping success");
-            retry_configs
+            Some(ech_config)
         }
         EchBootstrap::Disabled => None,
     };
@@ -1090,7 +1087,7 @@ fn generate_random_domain() -> String {
 enum EchMode {
     None,
     BootstrapWithExpectedServerName(ServerName<'static>),
-    UseEchConfigList(Vec<u8>),
+    UseEchConfigList(EchConfig),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1151,12 +1148,7 @@ fn make_tls_connector(
                 Some(server_name),
             )
         }
-        EchMode::UseEchConfigList(ech_config_bytes) => {
-            let ech_config: EchConfig = dbg!(EchConfig::new(
-                EchConfigListBytes::from(ech_config_bytes),
-                ALL_SUPPORTED_SUITES,
-            ))
-            .map_err(std::io::Error::other)?;
+        EchMode::UseEchConfigList(ech_config) => {
             (Some(rustls::client::EchMode::Enable(ech_config)), None)
         }
     };

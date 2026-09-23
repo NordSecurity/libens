@@ -907,6 +907,8 @@ mod tests {
     const REJECTION_MESSAGE: &str = "token revoked";
     const ECH_PUBLIC_NAME: &str = "cover.example.com";
     const TLS_DOMAIN: &str = "secret.example.com";
+    const ECH_HANDSHAKES_PER_CONNECTION: usize = 2;
+    const ECH_CONNECTIONS: usize = 2;
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 
     const OLD_SERVER_INFO: &str = "bar";
@@ -1921,6 +1923,57 @@ mod tests {
         wait_for(|| !callback.notifications.lock().is_empty());
 
         assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+    }
+
+    #[test_log::test]
+    fn ech_bootstrap_repeats_after_stream_error() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(
+            upstream.port,
+            ECH_PUBLIC_NAME,
+            Some(TLS_DOMAIN),
+            EchMode::On,
+        );
+
+        let callback = RecordedCallback::default();
+        let config = fast_backoff();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        wait_for(|| upstream.streams() == 1);
+        upstream.send_blocking(Command::Error(Status::internal(REJECTION_MESSAGE)));
+        wait_for(|| upstream.streams() == ECH_CONNECTIONS);
+
+        let handshakes = stub.wait_for_handshakes(ECH_HANDSHAKES_PER_CONNECTION * ECH_CONNECTIONS);
+        assert_eq!(
+            handshakes.len(),
+            ECH_HANDSHAKES_PER_CONNECTION * ECH_CONNECTIONS
+        );
+
+        for connection in handshakes.chunks(ECH_HANDSHAKES_PER_CONNECTION) {
+            assert!(!connection[0].ech_accepted);
+            assert_ne!(connection[0].outer_sni.as_deref(), Some(ECH_PUBLIC_NAME));
+            assert_eq!(
+                connection[1],
+                Handshake {
+                    ech_accepted: true,
+                    sni_seen: Some(TLS_DOMAIN.to_owned()),
+                    outer_sni: Some(ECH_PUBLIC_NAME.to_owned()),
+                }
+            );
+        }
+
+        upstream.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+        assert!(callback.disconnects.lock().is_empty());
     }
 
     #[test_log::test]

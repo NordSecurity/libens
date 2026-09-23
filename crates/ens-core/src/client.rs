@@ -332,44 +332,17 @@ impl TryFrom<Authentication> for ClientAuthentication {
     }
 }
 
-trait ErrorsExt {
-    fn is_auth_rejection(&self) -> bool;
-    fn is_ech_offer_rejection(&self) -> bool;
-    fn is_untrusted_cert(&self) -> bool;
+trait IsPersistentError: std::fmt::Display {
     fn is_persistent(&self) -> bool;
 }
 
-impl ErrorsExt for Status {
-    fn is_auth_rejection(&self) -> bool {
-        matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
-    }
-
-    fn is_ech_offer_rejection(&self) -> bool {
-        false
-    }
-
-    fn is_untrusted_cert(&self) -> bool {
-        false
-    }
-
+impl IsPersistentError for Status {
     fn is_persistent(&self) -> bool {
-        false
+        matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
     }
 }
 
-impl ErrorsExt for Error {
-    fn is_auth_rejection(&self) -> bool {
-        matches!(self, Error::Status(status) if status.is_auth_rejection())
-    }
-
-    fn is_ech_offer_rejection(&self) -> bool {
-        matches!(self, Error::EchBootstrappingRejected)
-    }
-
-    fn is_untrusted_cert(&self) -> bool {
-        matches!(self, Error::UntrustedCertificate { .. })
-    }
-
+impl IsPersistentError for Error {
     fn is_persistent(&self) -> bool {
         matches!(
             self,
@@ -377,7 +350,9 @@ impl ErrorsExt for Error {
                 transient: false,
                 ..
             }
-        )
+        ) || matches!(self, Error::Status(status) if status.is_persistent())
+            || matches!(self, Error::EchBootstrappingRejected)
+            || matches!(self, Error::UntrustedCertificate { .. })
     }
 }
 
@@ -404,37 +379,17 @@ fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
     None
 }
 
-async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &Uri, error: &impl std::fmt::Display) {
-    error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
-
-    let reason = format!("'{vpn_uri}' rejected the authentication");
-    publish_disconnect(tx, reason).await;
-}
-
-async fn publish_ech_offer_rejection(
-    tx: &Sender<Event>,
-    vpn_uri: &Uri,
-    error: &impl std::fmt::Display,
-) {
-    error!("ECH offer for ENS at '{vpn_uri}' was rejected: {error}");
-
-    let reason = format!("'{vpn_uri}' rejected the ECH offer");
-    publish_disconnect(tx, reason).await;
-}
-
-async fn publish_untrusted_cert(tx: &Sender<Event>, error: &impl std::fmt::Display) {
-    let reason = error.to_string();
-    error!("{reason}");
-    publish_disconnect(tx, reason).await;
-}
-
 async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
     if let Err(e) = tx.send(Event::Disconnect(Some(reason))).await {
         warn!("Failed to publish disconnect: {e}");
     }
 }
 
-pub(crate) fn stream_closed_reason(vpn_uri: &Uri) -> String {
+async fn publish_persistent_error(tx: &Sender<Event>, e: impl IsPersistentError) {
+    publish_disconnect(tx, format!("persistent error {e}")).await;
+}
+
+pub fn stream_closed_reason(vpn_uri: &Uri) -> String {
     format!("'{vpn_uri}' closed the grpc stream")
 }
 
@@ -468,23 +423,8 @@ async fn task(
                 match $value {
                     Ok(v) => v,
                     Err(e) => {
-                        if e.is_auth_rejection() {
-                            publish_auth_rejection(&tx, vpn_uri, &e).await;
-                            break 'outer;
-                        }
-
-                        if e.is_ech_offer_rejection() {
-                            publish_ech_offer_rejection(&tx, vpn_uri, &e).await;
-                            break 'outer;
-                        }
-
-                        if e.is_untrusted_cert() {
-                            publish_untrusted_cert(&tx, &e).await;
-                            break 'outer;
-                        }
-
                         if e.is_persistent() {
-                            publish_disconnect(&tx, format!("persistent error: {e:?}")).await;
+                            publish_persistent_error(&tx, e).await;
                             break 'outer;
                         }
 
@@ -553,12 +493,11 @@ async fn task(
                 }
                 Ok(None) => {
                     let msg = stream_closed_reason(vpn_uri);
-                    debug!("{msg}");
                     publish_disconnect(&tx, msg).await;
                     break 'outer;
                 }
-                Err(e) if e.is_auth_rejection() => {
-                    publish_auth_rejection(&tx, vpn_uri, &e).await;
+                Err(e) if e.is_persistent() => {
+                    publish_persistent_error(&tx, e).await;
                     break 'outer;
                 }
                 Err(e) => {

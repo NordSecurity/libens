@@ -313,6 +313,7 @@ fn parse_handshake(mut fields: SplitWhitespace) -> Handshake {
 
     Handshake {
         ech_accepted,
+        outer_sni,
         sni_seen,
     }
 }

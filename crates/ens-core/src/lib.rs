@@ -544,18 +544,7 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
-    let tls_domain: Option<DnsName> = config
-        .tls_domain
-        .map(|d| d.try_into())
-        .transpose()
-        .map_err(|e| EnsError::InternalError {
-            reason: format!("tls_domain is incorrect: {e:?}"),
-        })?;
-    let tls = TlsOptions {
-        domain: tls_domain,
-        ech: config.ech,
-    };
-
+    let tls = TlsOptions::new(&config)?;
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
     let callback = GuardedCallback::new(callback);
@@ -571,19 +560,8 @@ async fn connect_impl(
         .user_agent
         .clone();
 
-    let (mut client, mut receiver) = ErrorNotificationService::new(
-        config
-            .buffer_size
-            .try_into()
-            .map_err(|e| EnsError::UnknownError {
-                reason: format!("buffer_size has to be non zero: {e}"),
-            })?,
-        socket_pool,
-        config.allow_only_pq,
-        config.root_certificate_override,
-        config.keepalive,
-        user_agent,
-    );
+    let (mut client, mut receiver) =
+        ErrorNotificationService::from_config(&config, socket_pool, user_agent)?;
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
         let ret = ExponentialBackoff::fallback();

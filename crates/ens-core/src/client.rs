@@ -1,5 +1,10 @@
 use std::{
-    error::Error as _, net::IpAddr, num::NonZeroUsize, str::FromStr, sync::Arc, time::Duration,
+    error::Error as _,
+    net::IpAddr,
+    num::{NonZeroUsize, TryFromIntError},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
 };
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
@@ -160,7 +165,33 @@ impl Drop for ErrorNotificationService {
 
 impl ErrorNotificationService {
     /// Create new instance with `buffer_size` used for the error notifications channel
-    pub fn new(
+    pub fn from_config(
+        config: &crate::ConfigState,
+        socket_pool: Arc<SocketPool>,
+        user_agent: HeaderValue,
+    ) -> Result<(Self, Receiver<Event>), EnsError> {
+        let buffer_size = config
+            .buffer_size
+            .try_into()
+            .map_err(|e| EnsError::UnknownError {
+                reason: format!("buffer_size has to be non zero: {e}"),
+            })?;
+
+        let allow_only_mlkem = config.allow_only_pq;
+        let root_certificate_override = config.root_certificate_override.clone();
+        let keepalive = config.keepalive;
+
+        Ok(Self::new(
+            buffer_size,
+            socket_pool,
+            allow_only_mlkem,
+            root_certificate_override,
+            keepalive,
+            user_agent,
+        ))
+    }
+
+    fn new(
         buffer_size: NonZeroUsize,
         socket_pool: Arc<SocketPool>,
         allow_only_mlkem: bool,
@@ -1110,9 +1141,11 @@ fn make_tls_connector(
     let (mode, expected_tls_hostname) = match ech_mode {
         EchMode::None => (None, None),
         EchMode::BootstrapWithExpectedServerName(server_name) => {
-            let ech_config: EchConfig =
-                EchConfig::new(generate_random_ech_config_list(), ALL_SUPPORTED_SUITES)
-                    .map_err(std::io::Error::other)?;
+            let random_ech_config = EchConfig::new(
+                generate_random_ech_config_list().map_err(std::io::Error::other)?,
+                ALL_SUPPORTED_SUITES,
+            )
+            .map_err(std::io::Error::other)?;
             (
                 Some(rustls::client::EchMode::Enable(random_ech_config)),
                 Some(server_name),
@@ -1769,15 +1802,9 @@ pub mod tests {
         assert_eq!(received, emitted);
 
         assert_eq!(testbed.upstream.streams(), 1);
-        assert_eq!(
-            calls.get_backoff_calls.load(Ordering::SeqCst),
-            FAILED_HANDSHAKES
-        );
-        assert_eq!(
-            calls.next_backoff_calls.load(Ordering::SeqCst),
-            FAILED_HANDSHAKES
-        );
-        assert_eq!(calls.reset_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.get_backoff.load(Ordering::SeqCst), FAILED_HANDSHAKES);
+        assert_eq!(calls.next_backoff.load(Ordering::SeqCst), FAILED_HANDSHAKES);
+        assert_eq!(calls.reset.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

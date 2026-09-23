@@ -192,8 +192,10 @@ callback interface ProtectCallback {
     void protect(i32 socket_fd);
 };
 
+/// Settings for `connect`. `connect` copies them, so changes apply only to
+/// connections created afterwards.
 interface Config {
-    constructor();  
+    constructor();
     
     /// Capacity of the internal queue holding error notifications before they
     /// are passed to the `ErrorNotificationCallback`. Must be non zero.

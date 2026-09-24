@@ -883,6 +883,7 @@ mod tests {
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
     use rstest::rstest;
+    use std::net::Ipv4Addr;
     use std::sync::Once;
     use std::time::Instant;
     use telio_crypto::SecretKey;
@@ -940,6 +941,8 @@ mod tests {
     const REJECTION_MESSAGE: &str = "token revoked";
     const ECH_PUBLIC_NAME: &str = "cover.example.com";
     const TLS_DOMAIN: &str = "secret.example.com";
+    const INVALID_TLS_DOMAIN: &str = "not a name";
+    const INVALID_TLS_DOMAIN_REASON: &str = "tls_domain is incorrect";
     const ECH_HANDSHAKES_PER_CONNECTION: usize = 2;
     const ECH_CONNECTIONS: usize = 2;
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
@@ -962,6 +965,38 @@ mod tests {
         ids.iter()
             .filter(|id| state.active_connections.contains_key(*id))
             .count()
+    }
+
+    #[test_log::test]
+    fn connect_with_invalid_tls_domain_returns_internal_error() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let connection = connect_local(
+            upstream.port,
+            test_auth(&upstream),
+            RecordedCallback::default(),
+            config,
+        );
+
+        assert_matches!(connection, Err(EnsError::InternalError{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+        assert_eq!(upstream.streams(), 0);
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_with_invalid_tls_domain_returns_internal_error() {
+        run_init();
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let vpn = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let bootstrapped = bootstrap_ech(vpn, Arc::new(config));
+
+        assert_matches!(bootstrapped, Err(EnsError::InternalError{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
     }
 
     #[test]

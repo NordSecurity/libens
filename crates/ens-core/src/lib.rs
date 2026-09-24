@@ -2084,6 +2084,8 @@ mod tests {
     #[case(RetryConfig::PqKem)]
     #[case(RetryConfig::UnknownVersion)]
     #[case(RetryConfig::BadPublicName)]
+    #[case(RetryConfig::TruncatedKem)]
+    #[case(RetryConfig::TruncatedKey)]
     #[test_log::test]
     fn ech_retry_config_client_cannot_use_triggers_disconnect(#[case] kind: RetryConfig) {
         run_init();

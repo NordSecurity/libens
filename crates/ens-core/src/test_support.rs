@@ -81,6 +81,8 @@ pub enum RetryConfig {
     BadPublicName,
     Malformed,
     Stale,
+    TruncatedKem,
+    TruncatedKey,
 }
 
 impl RetryConfig {
@@ -92,6 +94,8 @@ impl RetryConfig {
             RetryConfig::BadPublicName => "bad-public-name",
             RetryConfig::Malformed => "malformed",
             RetryConfig::Stale => "stale",
+            RetryConfig::TruncatedKem => "truncated-kem",
+            RetryConfig::TruncatedKey => "truncated-key",
         }
     }
 }

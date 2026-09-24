@@ -36,6 +36,10 @@ const (
 	aeadExportOnly        = 0xffff
 	echMaxNameLength      = 0
 	echConfigLengthOffset = 2
+	// config_id and half of kem_id
+	truncatedKemLength = 2
+	// config_id, kem_id, public_key length and one byte of public_key
+	truncatedKeyLength = 6
 
 	recordHeaderLen         = 5
 	recordTypeHandshake     = 22
@@ -61,6 +65,8 @@ const (
 	retryBadPublicName  = "bad-public-name"
 	retryMalformed      = "malformed"
 	retryStale          = "stale"
+	retryTruncatedKem   = "truncated-kem"
+	retryTruncatedKey   = "truncated-key"
 	badPublicName       = "not a name"
 	badForever          = 0
 
@@ -79,6 +85,8 @@ offers ECH with a different key.
   bad-public-name  public_name is not a DNS name, rustls cannot parse the list
   malformed        corrupt length, Go aborts every ECH handshake
   stale            valid key replaced by the good one, as after key rotation
+  truncated-kem    length ends inside kem_id, Go ignores it, rustls can't parse
+  truncated-key    length ends inside public_key, Go ignores it, rustls can't parse
 
 Line protocol on stdout, one line per event:
   ready <port> <ca_der_b64> <ech_config_list_b64|->
@@ -103,7 +111,7 @@ func main() {
 	publicName := flag.String("public-name", "", "ECHConfig public_name")
 	tlsDomain := flag.String("tls-domain", "", "inner name the leaf certificate also covers")
 	ech := flag.String("ech", echOn, "on|off")
-	retry := flag.String("retry", retryGood, "good|unusable-aead|pq-kem|unknown-version|bad-public-name|malformed|stale")
+	retry := flag.String("retry", retryGood, "good|unusable-aead|pq-kem|unknown-version|bad-public-name|malformed|stale|truncated-kem|truncated-key")
 	badConnections := flag.Uint64("bad-connections", badForever, "connections served with the -retry config before switching to the good one, 0 means forever")
 	verbose := flag.Bool("v", false, "debug logging on stderr")
 	keyLog := flag.String("keylog", "", "append TLS secrets in NSS key log format to this file")
@@ -244,6 +252,8 @@ var retryKinds = []string{
 	retryBadPublicName,
 	retryMalformed,
 	retryStale,
+	retryTruncatedKem,
+	retryTruncatedKey,
 }
 
 type echKeys struct {
@@ -282,6 +292,12 @@ func makeRetryKey(kind, publicName string) tls.EncryptedClientHelloKey {
 	config := makeECHConfig(version, kem, name, pub, aeads)
 	if kind == retryMalformed {
 		config[echConfigLengthOffset] = ^config[echConfigLengthOffset]
+	}
+	if kind == retryTruncatedKem {
+		binary.BigEndian.PutUint16(config[echConfigLengthOffset:], truncatedKemLength)
+	}
+	if kind == retryTruncatedKey {
+		binary.BigEndian.PutUint16(config[echConfigLengthOffset:], truncatedKeyLength)
 	}
 
 	return tls.EncryptedClientHelloKey{

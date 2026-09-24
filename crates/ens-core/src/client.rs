@@ -83,28 +83,29 @@ pub enum Error {
     #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]
     UntrustedCertificate { vpn_uri: String, reason: String },
     /// The bootstrap handshake failed before the server sent `retry_configs`.
-    /// `transient` tells whether a reconnect can help
     #[error("ECH bootstrapping failed")]
     EchBootstrappingFailed {
         #[source]
         source: std::io::Error,
-        transient: bool,
+        persistence: Persistence,
     },
     #[error("ECH bootstrapping rejected")]
     EchBootstrappingRejected,
 }
 
-fn ech_bootstrapping_failed_transient(source: std::io::Error) -> Error {
-    Error::EchBootstrappingFailed {
-        source,
-        transient: true,
-    }
+/// Tells whether a reconnect can help
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persistence {
+    Transient,
+    Persistent,
 }
 
-fn ech_bootstrapping_failed_persistent(source: std::io::Error) -> Error {
-    Error::EchBootstrappingFailed {
-        source,
-        transient: false,
+impl Persistence {
+    fn error(self, source: std::io::Error) -> Error {
+        Error::EchBootstrappingFailed {
+            source,
+            persistence: self,
+        }
     }
 }
 
@@ -411,7 +412,7 @@ impl IsPersistentError for Error {
         matches!(
             self,
             Error::EchBootstrappingFailed {
-                transient: false,
+                persistence: Persistence::Persistent,
                 ..
             }
         ) || matches!(self, Error::Status(status) if status.is_persistent())
@@ -667,7 +668,7 @@ async fn bootstrap_ech(
 
     tokio::time::timeout(bootstrap_ech_timeout, bootstrap)
         .await
-        .map_err(|e| ech_bootstrapping_failed_transient(e.into()))?
+        .map_err(|e| Persistence::Transient.error(e.into()))?
 }
 
 async fn bootstrap_ech_handshake(
@@ -693,7 +694,7 @@ async fn bootstrap_ech_handshake(
     })?;
     let socket = pool
         .new_external_tcp_v4(None)
-        .map_err(ech_bootstrapping_failed_transient)?;
+        .map_err(|e| Persistence::Transient.error(e))?;
     let domain =
         tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
             Error::Internal {
@@ -703,20 +704,20 @@ async fn bootstrap_ech_handshake(
 
     if let Some(resolved) = lookup_host((host, port))
         .await
-        .map_err(ech_bootstrapping_failed_transient)?
+        .map_err(|e| Persistence::Transient.error(e))?
         .next()
     {
         let tcp_stream = socket
             .connect(resolved)
             .await
-            .map_err(ech_bootstrapping_failed_transient)?;
+            .map_err(|e| Persistence::Transient.error(e))?;
 
         let tls_connector = make_tls_connector(
             allow_only_mlkem,
             root_certificate,
             EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
         )
-        .map_err(ech_bootstrapping_failed_transient)?;
+        .map_err(|e| Persistence::Transient.error(e))?;
 
         let tls_stream = tls_connector
             .connect(domain, tcp_stream)
@@ -757,13 +758,13 @@ async fn bootstrap_ech_handshake(
                     | InvalidMessage::MissingData(_)
                     | InvalidMessage::TrailingData(_),
                 )) => {
-                    return Err(ech_bootstrapping_failed_persistent(e));
+                    return Err(Persistence::Persistent.error(e));
                 }
                 // Things like captive portals can inject invalid (from the
                 // point of view of TLS) bytes, but are not necessarily
                 // persistent errors - user can log into the captive portal
                 // and gain access to the internet, etc...
-                _ => return Err(ech_bootstrapping_failed_transient(e)),
+                _ => return Err(Persistence::Transient.error(e)),
             }
         }
     }

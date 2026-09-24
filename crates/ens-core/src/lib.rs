@@ -128,8 +128,11 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
-            client::Error::EchBootstrappingFailed { source, transient } => Self::TransportError {
-                reason: format!("ECH bootstrap failed (transient: {transient}): {source:?}"),
+            client::Error::EchBootstrappingFailed {
+                source,
+                persistence,
+            } => Self::TransportError {
+                reason: format!("ECH bootstrap failed ({persistence:?}): {source:?}"),
             },
             rejected @ client::Error::EchBootstrappingRejected => {
                 // NOTE: this should never happen, the ECH offer rejection should

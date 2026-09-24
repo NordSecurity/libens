@@ -666,7 +666,6 @@ async fn bootstrap_ech(
                 reason: format!("malformed server name: {e}"),
             }
         })?;
-    // .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     if let Some(resolved) = lookup_host((host, port))
         .await
@@ -794,7 +793,7 @@ async fn create_external_channel(
                 let tcp_stream = socket.connect(resolved).await?;
                 let mode = match bootstrapped_ech_config_list {
                     Some(bootstrapped_ech_config_list) => {
-                        EchMode::UseEchConfigList(bootstrapped_ech_config_list)
+                        EchMode::UseEchConfigList(bootstrapped_ech_config_list, domain.clone())
                     }
                     None => EchMode::None,
                 };
@@ -880,13 +879,12 @@ fn make_trusted_root_cert_verifier(
                 hex::encode(hash)
             );
 
-            // In case of ECH bootstrap we need to switch the hostname. The
-            // RFC compliant behaviour of rustls is to pass in here the random
-            // public domain that we sent in the initial TLS connection. The
-            // server will return certificate that doesn't include that domain
-            // but will include the secret domain that we also know. Which is
-            // why we switch, so that verification is done against the secret
-            // domain.
+            // When the server rejects ECH, rustls passes the outer public_name
+            // here (the random one during bootstrap, the server's one
+            // otherwise). Our servers have no certificate for it, so verify
+            // against the real domain. This covers both the initial bootstrap
+            // and a case when the crypto keys change on the server between the
+            // bootstrap and the actual tls/grpc connection.
             let verification = self.inner.verify_server_cert(
                 end_entity,
                 intermediates,
@@ -1106,7 +1104,7 @@ fn generate_random_domain() -> String {
 enum EchMode {
     None,
     BootstrapWithExpectedServerName(ServerName<'static>),
-    UseEchConfigList(EchConfig),
+    UseEchConfigList(EchConfig, ServerName<'static>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1167,9 +1165,10 @@ fn make_tls_connector(
                 Some(server_name),
             )
         }
-        EchMode::UseEchConfigList(ech_config) => {
-            (Some(rustls::client::EchMode::Enable(ech_config)), None)
-        }
+        EchMode::UseEchConfigList(ech_config, expected_tls_hostname) => (
+            Some(rustls::client::EchMode::Enable(ech_config)),
+            Some(expected_tls_hostname),
+        ),
     };
 
     let tls_config = ClientConfig::builder_with_provider(provider.clone());
@@ -1834,6 +1833,35 @@ pub mod tests {
             .await;
 
         assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn rotated_server_ech_key_rebootstraps() {
+        let ech = EchBootstrap::Enabled;
+        let testbed = spawn_ech_testbed(StubEchMode::BadRetry {
+            kind: RetryConfig::Stale,
+            lasts: BadRetryLasts::Connections(1),
+        })
+        .await;
+
+        let (backoff, calls) = counting_backoff(|_| {});
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
+
+        let emitted = ConnectionError {
+            code: EnsProtoError::Unknown as i32,
+            additional_info: None,
+        };
+        testbed.upstream.send(Command::Send(emitted.clone())).await;
+
+        let received = timeout(EVENT_DEADLINE, recv_connection_error(&mut rx))
+            .await
+            .unwrap();
+        assert_eq!(received, emitted);
+        assert_eq!(testbed.upstream.streams(), 1);
+        assert_eq!(calls.get_backoff.load(Ordering::SeqCst), 1);
     }
 
     #[rstest]

@@ -60,13 +60,14 @@ const (
 	retryUnknownVersion = "unknown-version"
 	retryBadPublicName  = "bad-public-name"
 	retryMalformed      = "malformed"
+	retryStale          = "stale"
 	badPublicName       = "not a name"
 	badForever          = 0
 
 	usage = `echstub: TLS terminator with server-side ECH for libens tests.
 
 Listens on 127.0.0.1, terminates TLS with a fresh CA and leaf (SANs: 127.0.0.1
-and the public name), then forwards plaintext to -upstream. With -ech on it
+and -tls-domain), then forwards plaintext to -upstream. With -ech on it
 serves one X25519 ECHConfig and sends it as retry_configs when the client
 offers ECH with a different key.
 
@@ -77,6 +78,7 @@ offers ECH with a different key.
   unknown-version  version 0xfe0e, skipped by both Go and rustls
   bad-public-name  public_name is not a DNS name, rustls cannot parse the list
   malformed        corrupt length, Go aborts every ECH handshake
+  stale            valid key replaced by the good one, as after key rotation
 
 Line protocol on stdout, one line per event:
   ready <port> <ca_der_b64> <ech_config_list_b64|->
@@ -101,7 +103,7 @@ func main() {
 	publicName := flag.String("public-name", "", "ECHConfig public_name")
 	tlsDomain := flag.String("tls-domain", "", "inner name the leaf certificate also covers")
 	ech := flag.String("ech", echOn, "on|off")
-	retry := flag.String("retry", retryGood, "good|unusable-aead|pq-kem|unknown-version|bad-public-name|malformed")
+	retry := flag.String("retry", retryGood, "good|unusable-aead|pq-kem|unknown-version|bad-public-name|malformed|stale")
 	badConnections := flag.Uint64("bad-connections", badForever, "connections served with the -retry config before switching to the good one, 0 means forever")
 	verbose := flag.Bool("v", false, "debug logging on stderr")
 	keyLog := flag.String("keylog", "", "append TLS secrets in NSS key log format to this file")
@@ -210,7 +212,7 @@ func makeCerts(publicName, tlsDomain string) ([]byte, tls.Certificate) {
 	if err != nil {
 		fatal("crypto setup failed", err)
 	}
-	dnsNames := []string{publicName}
+	var dnsNames []string
 	if tlsDomain != "" {
 		dnsNames = append(dnsNames, tlsDomain)
 	}
@@ -241,6 +243,7 @@ var retryKinds = []string{
 	retryUnknownVersion,
 	retryBadPublicName,
 	retryMalformed,
+	retryStale,
 }
 
 type echKeys struct {
@@ -269,6 +272,11 @@ func makeRetryKey(kind, publicName string) tls.EncryptedClientHelloKey {
 		version = echVersion + 1
 	case retryBadPublicName:
 		name = badPublicName
+	case retryStale:
+		// Same format as the good config, but makeECHKey gave it a different
+		// random key. A client still using it after the switch to the good key
+		// is rejected, because the server can't decrypt its hello. This is
+		// what a client sees after the server rotates its key.
 	}
 
 	config := makeECHConfig(version, kem, name, pub, aeads)

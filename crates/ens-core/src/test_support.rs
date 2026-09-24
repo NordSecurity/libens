@@ -80,6 +80,7 @@ pub enum RetryConfig {
     UnknownVersion,
     BadPublicName,
     Malformed,
+    Stale,
 }
 
 impl RetryConfig {
@@ -90,6 +91,7 @@ impl RetryConfig {
             RetryConfig::UnknownVersion => "unknown-version",
             RetryConfig::BadPublicName => "bad-public-name",
             RetryConfig::Malformed => "malformed",
+            RetryConfig::Stale => "stale",
         }
     }
 }

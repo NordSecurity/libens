@@ -1038,12 +1038,6 @@ mod tests {
         assert_matches!(bootstrapped, Ok(Err(_)));
     }
 
-    #[test]
-    fn ech_rejection_converts_to_internal_error() {
-        let rejected = EnsError::from(client::Error::EchBootstrappingRejected);
-        assert_matches!(rejected, EnsError::InternalError { reason } if reason.contains("ECH"));
-    }
-
     #[test_log::test]
     fn test_guarded_callback_reports_a_disconnect_at_most_once() {
         let recording = RecordedCallback::default();

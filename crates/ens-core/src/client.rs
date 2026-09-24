@@ -987,7 +987,15 @@ fn make_trusted_root_cert_verifier(
     }))
 }
 
-pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError> {
+#[derive(Debug, thiserror::Error)]
+pub enum KeyConfigError {
+    #[error("Integer conversion failed: {0}")]
+    IntConversion(#[from] TryFromIntError),
+    #[error("Key generation failed: {0}")]
+    KeyGeneration(#[from] rustls::Error),
+}
+
+pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, KeyConfigError> {
     // take the first entry of supported suites
     let hpke = rustls::crypto::aws_lc_rs::hpke::DH_KEM_P256_HKDF_SHA256_AES_128;
 
@@ -1006,13 +1014,8 @@ pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError
     buf.extend([0u8]); // config_id
     buf.extend(u16::from(hpke.suite().kem).to_be_bytes()); // kem_id
 
-    let key = if let Ok((pubkey, _)) = hpke.generate_key_pair() {
-        pubkey.0
-    } else {
-        // In practice, this should never be triggered
-        const FALLBACK_PUBKEY:&[u8] = b"\x04\x8e\x6a\xeb\x94\xc7\x86\x27\x53\xcc\xce\x22\x70\x5f\xa5\x68\xa9\x3d\x82\x0e\x41\xf7\xb1\x75\xbd\xcd\x77\x40\x4a\xd3\x8b\x11\x70\x71\x61\x95\xd7\x5f\x52\xf9\xaa\xc0\x80\xb4\x6b\x8d\x3a\xb1\x5d\xc4\x3e\xea\xae\xf5\x64\xa6\xf0\xcb\x4e\xe3\xef\xf8\xa0\xef\x60";
-        FALLBACK_PUBKEY.to_vec()
-    };
+    let (pubkey, _) = hpke.generate_key_pair()?;
+    let key = pubkey.0;
 
     buf.extend(u16::try_from(key.len())?.to_be_bytes()); // public key
     buf.extend(key);
@@ -1045,7 +1048,7 @@ pub fn random_key_config(public_domain: &str) -> Result<Vec<u8>, TryFromIntError
     Ok(buf)
 }
 
-fn generate_random_ech_config_list() -> Result<EchConfigListBytes<'static>, TryFromIntError> {
+fn generate_random_ech_config_list() -> Result<EchConfigListBytes<'static>, KeyConfigError> {
     let domain = generate_random_domain();
     let ech_config_list = random_key_config(&domain)?;
     Ok(EchConfigListBytes::from(ech_config_list))
@@ -2260,7 +2263,6 @@ pub mod tests {
 
     #[test]
     fn test_cert_verification_rejects_invalid_request() {
-        // TODO: add tests for the handling of optional servername
         use rustls::{
             client::danger::ServerCertVerifier,
             internal::msgs::codec::{Codec, Reader},
@@ -2311,7 +2313,6 @@ pub mod tests {
 
     #[test]
     fn test_cert_verification_accepts_correct_request() {
-        // TODO: server name handling tests
         use rustls::{
             client::danger::ServerCertVerified,
             pki_types::{ServerName, UnixTime},

@@ -716,6 +716,14 @@ async fn bootstrap_ech(
                         reason: e.to_string(),
                     });
                 }
+                Some(rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType)) => {
+                    info!("<XXXXXX>");
+                    // Things like captive portals can inject invalid (from the
+                    // point of view of TLS) bytes, but are not necessarily
+                    // persistent errors - user can log into the captive portal
+                    // and gain access to the internet, etc...
+                    return Err(ech_bootstrapping_failed_transient(e));
+                }
                 Some(rustls::Error::InvalidMessage(_)) => {
                     // return Err(Error::EchBootstrappingRejected);
                     return Err(ech_bootstrapping_failed_persistent(e));
@@ -1788,6 +1796,28 @@ pub mod tests {
         port
     }
 
+    async fn spawn_junk_replier() -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const CAPTIVE_PORTAL_REPLY: &[u8] =
+            b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/\r\n\r\n";
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut first_byte = [0u8];
+                let _ = socket.read(&mut first_byte).await;
+                let _ = socket.write_all(CAPTIVE_PORTAL_REPLY).await;
+            }
+        });
+
+        port
+    }
+
     async fn recv_disconnect_reason(rx: &mut Receiver<Event>) -> String {
         match rx.recv().await {
             Some(Event::Disconnect(Some(reason))) => reason,
@@ -1890,6 +1920,24 @@ pub mod tests {
         let testbed = spawn_ech_testbed(stub_ech(ech)).await;
         let closer = spawn_handshake_closer().await;
         testbed.relay.set_mode(RelayMode::Redirect(closer));
+
+        let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
+
+        assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    #[test_log::test]
+    async fn backoff_while_server_replies_with_junk(
+        #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
+    ) {
+        let testbed = spawn_ech_testbed(stub_ech(ech)).await;
+        let junk = spawn_junk_replier().await;
+        testbed.relay.set_mode(RelayMode::Redirect(junk));
 
         let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
         let (_ens, mut rx) = testbed

@@ -8,7 +8,7 @@ use std::{
 };
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
-use telio_sockets::SocketPool;
+use telio_sockets::{External, SocketPool};
 use telio_utils::exponential_backoff::{self, Backoff};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -23,7 +23,7 @@ use rustls::{
     ClientConfig, InvalidMessage, RootCertStore,
 };
 use tokio::{
-    net::lookup_host,
+    net::{lookup_host, TcpStream},
     select,
     sync::{
         mpsc::{Receiver, Sender},
@@ -671,6 +671,10 @@ async fn bootstrap_ech(
         .map_err(|e| Persistence::Transient.error(e.into()))?
 }
 
+fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
+    e.get_ref()?.downcast_ref::<rustls::Error>()
+}
+
 async fn bootstrap_ech_handshake(
     uri: &Uri,
     tls: &TlsOptions,
@@ -678,23 +682,9 @@ async fn bootstrap_ech_handshake(
     allow_only_mlkem: bool,
     root_certificate: &[u8],
 ) -> Result<Option<Vec<u8>>, Error> {
-    let Some(host) = uri.host() else {
-        return Err(Error::Internal {
-            reason: MISSING_HOST_MSG.to_owned(),
-        });
-    };
-    let Some(port) = uri.port_u16() else {
-        return Err(Error::Internal {
-            reason: MISSING_PORT_MSG.to_owned(),
-        });
-    };
+    let (host, expected_tls_hostname, tcp_stream) =
+        connect_tcp(uri, &pool, tls).await.map_err(connect_error)?;
 
-    let expected_tls_hostname = tls.server_name(host).map_err(|e| Error::Internal {
-        reason: e.to_string(),
-    })?;
-    let socket = pool
-        .new_external_tcp_v4(None)
-        .map_err(|e| Persistence::Transient.error(e))?;
     let domain =
         tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
             Error::Internal {
@@ -702,70 +692,88 @@ async fn bootstrap_ech_handshake(
             }
         })?;
 
-    if let Some(resolved) = lookup_host((host, port))
-        .await
-        .map_err(|e| Persistence::Transient.error(e))?
-        .next()
-    {
-        let tcp_stream = socket
-            .connect(resolved)
-            .await
-            .map_err(|e| Persistence::Transient.error(e))?;
+    let tls_connector = make_tls_connector(
+        allow_only_mlkem,
+        root_certificate,
+        EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
+    )
+    .map_err(|e| Persistence::Transient.error(e))?;
 
-        let tls_connector = make_tls_connector(
-            allow_only_mlkem,
-            root_certificate,
-            EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
-        )
-        .map_err(|e| Persistence::Transient.error(e))?;
+    let Err(e) = tls_connector.connect(domain, tcp_stream).await else {
+        return Ok(None);
+    };
 
-        let tls_stream = tls_connector.connect(domain, tcp_stream).await;
-        if let Err(e) = tls_stream {
-            fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
-                e.get_ref()?.downcast_ref::<rustls::Error>()
-            }
-
-            match as_rustls_error(&e) {
-                // This is a successful ECH bootstrap.
-                Some(rustls::Error::PeerIncompatible(
-                    rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(
-                        retry_configs,
-                    )),
-                )) => {
-                    use rustls::internal::msgs::codec::Codec;
-                    return Ok(Some(retry_configs.get_encoding()));
-                }
-                // App asked for ECH bootstrapping but the server is not returning
-                // fresh retry configs, so it's not possible to complete the bootstrap.
-                Some(rustls::Error::PeerIncompatible(
-                    rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(None),
-                )) => return Ok(None),
-                // Server presented an invalid certificate, which is not a transient
-                // connection failure, so we will not automatically retry.
-                Some(rustls::Error::InvalidCertificate(_)) => {
-                    return Err(Error::UntrustedCertificate {
-                        vpn_uri: uri.to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-                // Server sent retry_configs that can't be parsed.
-                Some(rustls::Error::InvalidMessage(
-                    InvalidMessage::InvalidServerName
-                    | InvalidMessage::MessageTooShort
-                    | InvalidMessage::MissingData(_)
-                    | InvalidMessage::TrailingData(_),
-                )) => {
-                    return Err(Persistence::Persistent.error(e));
-                }
-                // Things like captive portals can inject invalid (from the
-                // point of view of TLS) bytes, but are not necessarily
-                // persistent errors - user can log into the captive portal
-                // and gain access to the internet, etc...
-                _ => return Err(Persistence::Transient.error(e)),
-            }
+    match as_rustls_error(&e) {
+        // This is a successful ECH bootstrap.
+        Some(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+        )) => {
+            use rustls::internal::msgs::codec::Codec;
+            Ok(Some(retry_configs.get_encoding()))
         }
+        // App asked for ECH bootstrapping but the server is not returning
+        // fresh retry configs, so it's not possible to complete the bootstrap.
+        Some(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(None),
+        )) => Ok(None),
+        // Server presented an invalid certificate, which is not a transient
+        // connection failure, so we will not automatically retry.
+        Some(rustls::Error::InvalidCertificate(_)) => Err(Error::UntrustedCertificate {
+            vpn_uri: uri.to_string(),
+            reason: e.to_string(),
+        }),
+        // Server sent retry_configs that can't be parsed.
+        Some(rustls::Error::InvalidMessage(
+            InvalidMessage::InvalidServerName
+            | InvalidMessage::MessageTooShort
+            | InvalidMessage::MissingData(_)
+            | InvalidMessage::TrailingData(_),
+        )) => Err(Persistence::Persistent.error(e)),
+        // Things like captive portals can inject invalid (from the
+        // point of view of TLS) bytes, but are not necessarily
+        // persistent errors - user can log into the captive portal
+        // and gain access to the internet, etc...
+        _ => Err(Persistence::Transient.error(e)),
     }
-    Ok(None)
+}
+
+fn connect_error(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        return Error::Internal {
+            reason: e.to_string(),
+        };
+    }
+
+    Persistence::Transient.error(e)
+}
+
+async fn connect_tcp<'a>(
+    uri: &'a Uri,
+    pool: &SocketPool,
+    tls: &TlsOptions,
+) -> std::io::Result<(&'a str, ServerName<'static>, External<TcpStream>)> {
+    let Some(host) = uri.host() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            MISSING_HOST_MSG,
+        ));
+    };
+    let Some(port) = uri.port_u16() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            MISSING_PORT_MSG,
+        ));
+    };
+
+    let server_name = tls.server_name(host)?;
+    let socket = pool.new_external_tcp_v4(None)?;
+    let Some(resolved) = lookup_host((host, port)).await?.next() else {
+        return Err(std::io::Error::other(format!(
+            "None of the IPs resolved from {host} accepted ENS over TLS"
+        )));
+    };
+
+    Ok((host, server_name, socket.connect(resolved).await?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -816,38 +824,16 @@ async fn create_external_channel(
         let root_certificate = root_certificate.clone();
         let bootstrapped_ech_config_list = bootstrapped_ech_config_list.clone();
         async move {
-            let Some(host) = uri.host() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    MISSING_HOST_MSG,
-                ));
+            let (_, domain, tcp_stream) = connect_tcp(&uri, &pool, &tls).await?;
+            let mode = match bootstrapped_ech_config_list {
+                Some(bootstrapped_ech_config_list) => {
+                    EchMode::UseEchConfigList(bootstrapped_ech_config_list, domain.clone())
+                }
+                None => EchMode::None,
             };
-            let Some(port) = uri.port_u16() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    MISSING_PORT_MSG,
-                ));
-            };
-
-            let socket = pool.new_external_tcp_v4(None)?;
-            let domain = tls.server_name(host)?;
-
-            if let Some(resolved) = lookup_host((host, port)).await?.next() {
-                let tcp_stream = socket.connect(resolved).await?;
-                let mode = match bootstrapped_ech_config_list {
-                    Some(bootstrapped_ech_config_list) => {
-                        EchMode::UseEchConfigList(bootstrapped_ech_config_list, domain.clone())
-                    }
-                    None => EchMode::None,
-                };
-                let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate, mode)?;
-                let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
-                return Ok::<_, std::io::Error>(TokioIo::new(tls_stream));
-            }
-
-            Err(std::io::Error::other(format!(
-                "None of the IPs resolved from {host} accepted ENS over TLS"
-            )))
+            let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate, mode)?;
+            let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+            Ok::<_, std::io::Error>(TokioIo::new(tls_stream))
         }
     };
 

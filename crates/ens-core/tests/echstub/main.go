@@ -72,8 +72,8 @@ const (
 
 	usage = `echstub: TLS terminator with server-side ECH for libens tests.
 
-Listens on 127.0.0.1, terminates TLS with a fresh CA and leaf (SANs: 127.0.0.1
-and -tls-domain), then forwards plaintext to -upstream. With -ech on it
+Listens on 127.0.0.1, terminates TLS with a fresh CA and leaf (SANs: 127.0.0.1,
+-public-name and -tls-domain), then forwards plaintext to -upstream. With -ech on it
 serves one X25519 ECHConfig and sends it as retry_configs when the client
 offers ECH with a different key.
 
@@ -220,7 +220,7 @@ func makeCerts(publicName, tlsDomain string) ([]byte, tls.Certificate) {
 	if err != nil {
 		fatal("crypto setup failed", err)
 	}
-	var dnsNames []string
+	dnsNames := []string{publicName}
 	if tlsDomain != "" {
 		dnsNames = append(dnsNames, tlsDomain)
 	}

@@ -165,7 +165,7 @@ impl Drop for ErrorNotificationService {
 
 impl ErrorNotificationService {
     /// Create new instance with `buffer_size` used for the error notifications channel
-    pub fn from_config(
+    pub fn try_from_config(
         config: &crate::ConfigState,
         socket_pool: Arc<SocketPool>,
         user_agent: HeaderValue,

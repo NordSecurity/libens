@@ -561,7 +561,7 @@ async fn connect_impl(
         .clone();
 
     let (mut client, mut receiver) =
-        ErrorNotificationService::from_config(&config, socket_pool, user_agent)?;
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
         let ret = ExponentialBackoff::fallback();
@@ -676,7 +676,7 @@ async fn bootstrap_ech_impl(vpn: SocketAddr, config: ConfigState) -> Result<Opti
         .clone();
 
     let (client, _receiver) =
-        ErrorNotificationService::from_config(&config, socket_pool, user_agent)?;
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
 
     Ok(client.bootstrap_ech(vpn.ip(), vpn.port(), &tls).await?)
 }
@@ -1944,6 +1944,30 @@ mod tests {
                 outer_sni: None,
             }]
         );
+    }
+
+    #[test_log::test]
+    fn ech_bootstrap_rejects_cert_valid_only_for_public_name() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_plain_server());
+        let stub = GoEchStub::spawn(upstream.port, ECH_PUBLIC_NAME, None, EchMode::On);
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_root_certificate_override(Some(stub.ca_der().to_vec()));
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_enable_ech_bootstrap(true);
+        let _connection =
+            connect_local(stub.port(), test_auth(&upstream), callback.clone(), config).unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("untrusted certificate"));
+        assert!(reason.contains("not valid for name"));
+        assert_eq!(stub.wait_for_handshakes(1).len(), 1);
+        assert_eq!(upstream.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
     }
 
     #[test_log::test]

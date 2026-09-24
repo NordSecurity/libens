@@ -3,6 +3,7 @@ mod api;
 use base64::prelude::*;
 use std::{
     convert::Infallible,
+    error::Error,
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -17,8 +18,20 @@ use ens::{
     runtime::get_runtime,
 };
 use log::{debug, info};
+use rustls::{
+    ClientConfig, RootCertStore,
+    client::{EchConfig, EchMode, EchStatus},
+    crypto::aws_lc_rs::{default_provider, hpke::ALL_SUPPORTED_SUITES},
+    pki_types::{CertificateDer, EchConfigListBytes, ServerName},
+};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::api::{ApiClient, Server, Technology};
+
+const EXIT_ECH_BOOTSTRAP_FAILED: i32 = 1;
+const DEFAULT_ROOT_CERTIFICATE: &[u8] = include_bytes!("../../data/default_root_certificate.der");
+const H2_ALPN: &[u8] = b"h2";
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -51,6 +64,14 @@ enum Command {
         /// Bootstrap ECH from the server's retry configs
         #[clap(long)]
         ech: bool,
+    },
+    /// Run only the ECH bootstrap. Exits with non zero code on failure
+    EchBootstrap {
+        vpn: SocketAddr,
+
+        /// Domain the server certificate is verified against. Sent as inner SNI
+        #[clap(long)]
+        tls_domain: String,
     },
     List {
         filter: Option<Filter>,
@@ -271,6 +292,18 @@ fn main() {
 
             let _ = connection.shutdown().unwrap();
         }
+        Command::EchBootstrap { vpn, tls_domain } => {
+            let result = check_ech(vpn, tls_domain);
+            ens::deinit().unwrap();
+
+            let Err(e) = result else {
+                info!("ECH bootstrap succeeded");
+                return;
+            };
+
+            eprintln!("ECH bootstrap failed: {e}");
+            std::process::exit(EXIT_ECH_BOOTSTRAP_FAILED);
+        }
         Command::List { filter } => {
             let all_servers = get_runtime()
                 .unwrap()
@@ -332,6 +365,51 @@ fn main() {
     }
 
     ens::deinit().unwrap();
+}
+
+fn check_ech(vpn: SocketAddr, tls_domain: String) -> Result<(), Box<dyn Error>> {
+    let config = Config::new();
+    config.set_tls_domain(Some(tls_domain.clone()));
+
+    let Some(retry_configs) = ens::bootstrap_ech(vpn, Arc::new(config))? else {
+        return Err("server returned no retry configs".into());
+    };
+
+    let status = get_runtime()?.block_on(ech_handshake(vpn, tls_domain, retry_configs))?;
+    info!("ECH status: {status:?}");
+    if status != EchStatus::Accepted {
+        return Err(format!("ECH not accepted: {status:?}").into());
+    }
+
+    Ok(())
+}
+
+async fn ech_handshake(
+    vpn: SocketAddr,
+    tls_domain: String,
+    retry_configs: Vec<u8>,
+) -> Result<EchStatus, Box<dyn Error>> {
+    let ech_config = EchConfig::new(
+        EchConfigListBytes::from(retry_configs),
+        ALL_SUPPORTED_SUITES,
+    )?;
+
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from_slice(DEFAULT_ROOT_CERTIFICATE))?;
+
+    let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_ech(EchMode::Enable(ech_config))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![H2_ALPN.to_vec()];
+
+    let tcp_stream = TcpStream::connect(vpn).await?;
+    let domain = ServerName::try_from(tls_domain)?;
+    let tls_stream = TlsConnector::from(Arc::new(config))
+        .connect(domain, tcp_stream)
+        .await?;
+
+    Ok(tls_stream.get_ref().1.ech_status())
 }
 
 fn extract_server_public_key(s: &Server) -> Option<String> {

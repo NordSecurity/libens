@@ -285,6 +285,25 @@ impl ErrorNotificationService {
         Ok(())
     }
 
+    pub async fn bootstrap_ech(
+        &self,
+        vpn_ip: IpAddr,
+        ens_port: u16,
+        tls: &TlsOptions,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let vpn_uri =
+            Uri::from_str(&format!("http://{vpn_ip}:{ens_port}")).map_err(http::Error::from)?;
+
+        bootstrap_ech(
+            &vpn_uri,
+            tls,
+            self.socket_pool.clone(),
+            self.allow_only_mlkem,
+            &self.root_certificate,
+        )
+        .await
+    }
+
     /// Stop ENS
     pub async fn stop(&mut self) {
         if let Some(join_handle) = self.stop_old_monitor() {

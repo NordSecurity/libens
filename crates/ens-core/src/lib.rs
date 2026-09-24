@@ -648,6 +648,39 @@ async fn connect_impl(
     }))
 }
 
+/// Runs only the ECH bootstrap against `vpn`, regardless of the ECH setting in
+/// `config`. Returns the encoded retry configs, or `None` when the server
+/// didn't send any.
+#[allow(clippy::needless_pass_by_value)]
+pub fn bootstrap_ech(vpn: SocketAddr, config: Arc<Config>) -> Result<Option<Vec<u8>>> {
+    catch_panic_result(|| {
+        let config = config.state.lock().clone();
+
+        let handle = get_runtime()?;
+
+        block_in_place(|| handle.block_on(bootstrap_ech_impl(vpn, config)))
+    })
+}
+
+async fn bootstrap_ech_impl(vpn: SocketAddr, config: ConfigState) -> Result<Option<Vec<u8>>> {
+    let tls = TlsOptions::new(&config)?;
+    let socket_pool = make_socket_pool(None)?;
+
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| EnsError::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+
+    let (client, _receiver) =
+        ErrorNotificationService::from_config(&config, socket_pool, user_agent)?;
+
+    Ok(client.bootstrap_ech(vpn.ip(), vpn.port(), &tls).await?)
+}
+
 fn make_socket_protector(
     protect_cb: Option<Box<dyn ProtectCallback>>,
 ) -> Option<telio_sockets::Protect> {

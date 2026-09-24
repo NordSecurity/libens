@@ -1996,6 +1996,71 @@ pub mod tests {
         assert_eq!(calls.get_backoff.load(Ordering::SeqCst), 0);
     }
 
+    async fn spawn_blocked_handshake() -> (u16, oneshot::Receiver<tokio::net::TcpStream>) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(socket);
+        });
+
+        (port, accepted_rx)
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn stop_during_ech_bootstrap_closes_the_connection() {
+        use tokio::{io::AsyncReadExt as _, sync::mpsc::error::TryRecvError};
+
+        const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+        let (port, accepted) = spawn_blocked_handshake().await;
+
+        let allow_only_mlkem = true;
+        let (mut ens, mut rx) = ErrorNotificationService::new(
+            NonZeroUsize::new(10).unwrap(),
+            make_socket_pool(),
+            allow_only_mlkem,
+            Some(TlsConfig::new().unwrap().ca_cert.der().to_vec()),
+            KeepaliveConfig::default(),
+            TEST_USER_AGENT,
+        );
+
+        let (backoff, calls) = counting_backoff(|_| ());
+        let tls = TlsOptions {
+            domain: Some(TLS_DOMAIN.try_into().unwrap()),
+            ech: EchBootstrap::Enabled,
+        };
+        ens.start_monitor_on_port(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            tls,
+            client_authentication(&SecretKey::gen(), SecretKey::gen().public()),
+            backoff,
+        )
+        .await
+        .unwrap();
+
+        let mut socket = timeout(EVENT_DEADLINE, accepted).await.unwrap().unwrap();
+        let mut record_type = [0u8];
+        socket.read_exact(&mut record_type).await.unwrap();
+        assert_eq!(record_type[0], TLS_HANDSHAKE_RECORD);
+
+        timeout(EVENT_DEADLINE, ens.stop()).await.unwrap();
+
+        let mut rest = vec![];
+        let _ = timeout(EVENT_DEADLINE, socket.read_to_end(&mut rest))
+            .await
+            .unwrap();
+
+        assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(calls.get_backoff.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     #[test_log::test]
     async fn test_ens_fails_without_x25519mlkem768_support() {

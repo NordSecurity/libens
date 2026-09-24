@@ -20,7 +20,7 @@ use rustls::{
     client::{danger::ServerCertVerifier, EchConfig},
     crypto::{aws_lc_rs::hpke::ALL_SUPPORTED_SUITES, hpke::Hpke, CryptoProvider},
     pki_types::{CertificateDer, DnsName, EchConfigListBytes, ServerName},
-    ClientConfig, RootCertStore,
+    ClientConfig, InvalidMessage, RootCertStore,
 };
 use tokio::{
     net::lookup_host,
@@ -716,18 +716,19 @@ async fn bootstrap_ech(
                         reason: e.to_string(),
                     });
                 }
-                Some(rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType)) => {
-                    info!("<XXXXXX>");
-                    // Things like captive portals can inject invalid (from the
-                    // point of view of TLS) bytes, but are not necessarily
-                    // persistent errors - user can log into the captive portal
-                    // and gain access to the internet, etc...
-                    return Err(ech_bootstrapping_failed_transient(e));
-                }
-                Some(rustls::Error::InvalidMessage(_)) => {
-                    // return Err(Error::EchBootstrappingRejected);
+                // Server sent retry_configs that can't be parsed.
+                Some(rustls::Error::InvalidMessage(
+                    InvalidMessage::InvalidServerName
+                    | InvalidMessage::MessageTooShort
+                    | InvalidMessage::MissingData(_)
+                    | InvalidMessage::TrailingData(_),
+                )) => {
                     return Err(ech_bootstrapping_failed_persistent(e));
                 }
+                // Things like captive portals can inject invalid (from the
+                // point of view of TLS) bytes, but are not necessarily
+                // persistent errors - user can log into the captive portal
+                // and gain access to the internet, etc...
                 _ => return Err(ech_bootstrapping_failed_transient(e)),
             }
         }
@@ -1796,11 +1797,29 @@ pub mod tests {
         port
     }
 
-    async fn spawn_junk_replier() -> u16 {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    #[derive(Clone, Copy, Debug)]
+    enum Junk {
+        CaptivePortal,
+        UnknownVersion,
+        EmptyRecord,
+        OversizedRecord,
+    }
 
-        const CAPTIVE_PORTAL_REPLY: &[u8] =
-            b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/\r\n\r\n";
+    impl Junk {
+        fn bytes(self) -> &'static [u8] {
+            match self {
+                Junk::CaptivePortal => {
+                    b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/\r\n\r\n"
+                }
+                Junk::UnknownVersion => b"\x16\x00\x00\x00\x05hello",
+                Junk::EmptyRecord => b"\x16\x03\x03\x00\x00",
+                Junk::OversizedRecord => b"\x16\x03\x03\xff\xff",
+            }
+        }
+    }
+
+    async fn spawn_junk_replier(junk: Junk) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1811,7 +1830,7 @@ pub mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let mut first_byte = [0u8];
                 let _ = socket.read(&mut first_byte).await;
-                let _ = socket.write_all(CAPTIVE_PORTAL_REPLY).await;
+                let _ = socket.write_all(junk.bytes()).await;
             }
         });
 
@@ -1934,9 +1953,16 @@ pub mod tests {
     #[test_log::test]
     async fn backoff_while_server_replies_with_junk(
         #[values(EchBootstrap::Enabled, EchBootstrap::Disabled)] ech: EchBootstrap,
+        #[values(
+            Junk::CaptivePortal,
+            Junk::UnknownVersion,
+            Junk::EmptyRecord,
+            Junk::OversizedRecord
+        )]
+        junk: Junk,
     ) {
         let testbed = spawn_ech_testbed(stub_ech(ech)).await;
-        let junk = spawn_junk_replier().await;
+        let junk = spawn_junk_replier(junk).await;
         testbed.relay.set_mode(RelayMode::Redirect(junk));
 
         let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));

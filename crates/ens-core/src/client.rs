@@ -719,10 +719,7 @@ async fn bootstrap_ech_handshake(
         )
         .map_err(|e| Persistence::Transient.error(e))?;
 
-        let tls_stream = tls_connector
-            .connect(domain, tcp_stream)
-            .await
-            .inspect_err(|e| info!("tls_connector.connect err: {e}"));
+        let tls_stream = tls_connector.connect(domain, tcp_stream).await;
         if let Err(e) = tls_stream {
             fn as_rustls_error(e: &std::io::Error) -> Option<&rustls::Error> {
                 e.get_ref()?.downcast_ref::<rustls::Error>()
@@ -784,7 +781,6 @@ async fn create_external_channel(
 ) -> Result<Channel, Error> {
     let bootstrapped_ech_config_list = match tls.ech {
         EchBootstrap::Enabled => {
-            info!("bootstrap start");
             let retry_configs = bootstrap_ech(
                 vpn_uri,
                 &tls,
@@ -794,7 +790,7 @@ async fn create_external_channel(
                 bootstrap_ech_timeout,
             )
             .await?;
-            info!("bootstrap end: {retry_configs:?}");
+
             let Some(retry_configs_bytes) = retry_configs else {
                 return Err(Error::EchBootstrappingRejected);
             };

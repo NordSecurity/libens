@@ -255,6 +255,11 @@ interface Config {
     /// 0 resets it back to the default.
     /// [default 20s]
     void set_keepalive_timeout(u32? seconds);
+
+    /// Upper limit for the ECH bootstrap, in seconds. Setting it to 0 resets it
+    /// back to the default.
+    /// [default 30s]
+    void set_bootstrap_ech_timeout(u32 seconds);
 };
 
 namespace ens {

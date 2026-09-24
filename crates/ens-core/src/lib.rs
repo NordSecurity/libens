@@ -45,7 +45,7 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 use crate::{
     client::{
         EchBootstrap, ErrorNotificationService, KeepaliveConfig, TlsOptions,
-        DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
+        DEFAULT_BOOTSTRAP_ECH_TIMEOUT, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_message, catch_panic_result},
@@ -424,6 +424,7 @@ struct ConfigState {
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
 }
 
 pub struct Config {
@@ -453,6 +454,7 @@ impl Config {
                 interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
                 timeout: Some(DEFAULT_KEEPALIVE_TIMEOUT),
             },
+            bootstrap_ech_timeout: DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
         };
 
         Self {
@@ -498,6 +500,10 @@ impl Config {
 
     pub fn set_keepalive_timeout(&self, seconds: Option<u32>) {
         self.state.lock().keepalive.timeout = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_bootstrap_ech_timeout(&self, seconds: u32) {
+        self.state.lock().bootstrap_ech_timeout = Duration::from_secs(seconds.into());
     }
 }
 
@@ -946,6 +952,8 @@ mod tests {
     const ECH_HANDSHAKES_PER_CONNECTION: usize = 2;
     const ECH_CONNECTIONS: usize = 2;
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+    const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(10);
+    const BOOTSTRAP_ECH_TIMEOUT_SECONDS: u32 = 1;
 
     const OLD_SERVER_INFO: &str = "bar";
     const NEW_SERVER_INFO: &str = "baz";
@@ -997,6 +1005,34 @@ mod tests {
         let bootstrapped = bootstrap_ech(vpn, Arc::new(config));
 
         assert_matches!(bootstrapped, Err(EnsError::InternalError{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_against_silent_server_returns() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let vpn = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let mut accepted = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_bootstrap_ech_timeout(BOOTSTRAP_ECH_TIMEOUT_SECONDS);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(bootstrap_ech(vpn, Arc::new(config)));
+        });
+
+        let bootstrapped = done_rx.recv_timeout(BOOTSTRAP_DEADLINE);
+        assert_matches!(bootstrapped, Ok(Err(_)));
     }
 
     #[test]

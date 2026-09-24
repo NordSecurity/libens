@@ -55,6 +55,7 @@ const MISSING_HOST_MSG: &str = "missing host in vpn uri";
 const MISSING_PORT_MSG: &str = "missing port in vpn uri";
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+pub const DEFAULT_BOOTSTRAP_ECH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// ENS errors
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +137,7 @@ pub struct ErrorNotificationService {
     root_certificate: Vec<u8>,
     // Configuration of the keep alive messages sent over the ENS connection
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
     user_agent: HeaderValue,
 }
 
@@ -148,6 +150,7 @@ impl std::fmt::Debug for ErrorNotificationService {
             .field("allow_only_mlkem", &self.allow_only_mlkem)
             .field("root_certificate", &self.root_certificate)
             .field("keepalive", &self.keepalive)
+            .field("bootstrap_ech_timeout", &self.bootstrap_ech_timeout)
             .field("user_agent", &self.user_agent)
             .finish()
     }
@@ -180,6 +183,7 @@ impl ErrorNotificationService {
         let allow_only_mlkem = config.allow_only_pq;
         let root_certificate_override = config.root_certificate_override.clone();
         let keepalive = config.keepalive;
+        let bootstrap_ech_timeout = config.bootstrap_ech_timeout;
 
         Ok(Self::new(
             buffer_size,
@@ -187,6 +191,7 @@ impl ErrorNotificationService {
             allow_only_mlkem,
             root_certificate_override,
             keepalive,
+            bootstrap_ech_timeout,
             user_agent,
         ))
     }
@@ -197,6 +202,7 @@ impl ErrorNotificationService {
         allow_only_mlkem: bool,
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
+        mut bootstrap_ech_timeout: Duration,
         user_agent: HeaderValue,
     ) -> (Self, Receiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer_size.get());
@@ -216,6 +222,10 @@ impl ErrorNotificationService {
             warn!("Keepalive timeout set to 0, resetting to default");
             keepalive.timeout = Some(DEFAULT_KEEPALIVE_TIMEOUT);
         }
+        if bootstrap_ech_timeout == Duration::ZERO {
+            warn!("Bootstrap ECH timeout set to 0, resetting to default");
+            bootstrap_ech_timeout = DEFAULT_BOOTSTRAP_ECH_TIMEOUT;
+        }
 
         (
             Self {
@@ -226,6 +236,7 @@ impl ErrorNotificationService {
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
                 keepalive,
+                bootstrap_ech_timeout,
                 user_agent,
             },
             rx,
@@ -257,6 +268,7 @@ impl ErrorNotificationService {
         let allow_only_mlkem = self.allow_only_mlkem;
         let root_certificate = self.root_certificate.clone();
         let keepalive = self.keepalive;
+        let bootstrap_ech_timeout = self.bootstrap_ech_timeout;
         let user_agent = self.user_agent.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -272,6 +284,7 @@ impl ErrorNotificationService {
                 backoff,
                 root_certificate,
                 keepalive,
+                bootstrap_ech_timeout,
                 user_agent,
             ))
             .await
@@ -300,6 +313,7 @@ impl ErrorNotificationService {
             self.socket_pool.clone(),
             self.allow_only_mlkem,
             &self.root_certificate,
+            self.bootstrap_ech_timeout,
         )
         .await
     }
@@ -455,6 +469,7 @@ async fn task(
     mut backoff: impl Backoff,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
     user_agent: HeaderValue,
 ) -> Result<(), Error> {
     'outer: loop {
@@ -496,6 +511,7 @@ async fn task(
                 allow_only_mlkem,
                 root_certificate.clone(),
                 keepalive,
+                bootstrap_ech_timeout,
                 user_agent.clone(),
             ))
             .await,
@@ -564,6 +580,7 @@ async fn task(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_channel(
     vpn_uri: &Uri,
     tls: &TlsOptions,
@@ -571,6 +588,7 @@ async fn open_channel(
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
     user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
     let attempt = create_external_channel(
@@ -580,6 +598,7 @@ async fn open_channel(
         allow_only_mlkem,
         root_certificate,
         keepalive,
+        bootstrap_ech_timeout,
         user_agent,
     )
     .await;
@@ -637,6 +656,21 @@ fn authentication_interceptor(
 }
 
 async fn bootstrap_ech(
+    uri: &Uri,
+    tls: &TlsOptions,
+    pool: Arc<SocketPool>,
+    allow_only_mlkem: bool,
+    root_certificate: &[u8],
+    bootstrap_ech_timeout: Duration,
+) -> Result<Option<Vec<u8>>, Error> {
+    let bootstrap = bootstrap_ech_handshake(uri, tls, pool, allow_only_mlkem, root_certificate);
+
+    tokio::time::timeout(bootstrap_ech_timeout, bootstrap)
+        .await
+        .map_err(|e| ech_bootstrapping_failed_transient(e.into()))?
+}
+
+async fn bootstrap_ech_handshake(
     uri: &Uri,
     tls: &TlsOptions,
     pool: Arc<SocketPool>,
@@ -736,6 +770,7 @@ async fn bootstrap_ech(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_external_channel(
     vpn_uri: &Uri,
     tls: TlsOptions,
@@ -743,6 +778,7 @@ async fn create_external_channel(
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
     user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
     let bootstrapped_ech_config_list = match tls.ech {
@@ -754,6 +790,7 @@ async fn create_external_channel(
                 pool.clone(),
                 allow_only_mlkem,
                 &root_certificate,
+                bootstrap_ech_timeout,
             )
             .await?;
             info!("bootstrap end: {retry_configs:?}");
@@ -1285,6 +1322,7 @@ pub mod tests {
     const FAILED_HANDSHAKES: usize = 3;
     const BACKOFF: Duration = Duration::from_millis(100);
     const EVENT_DEADLINE: Duration = Duration::from_secs(10);
+    const BOOTSTRAP_ECH_TIMEOUT: Duration = Duration::from_secs(1);
 
     #[derive(Clone)]
     pub enum TestAuthConfig {
@@ -1453,6 +1491,7 @@ pub mod tests {
                 interval: Some(interval),
                 timeout: Some(timeout),
             },
+            DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
             TEST_USER_AGENT,
         );
 
@@ -1543,6 +1582,7 @@ pub mod tests {
                 interval: None,
                 timeout: keepalive_timeout.map(Duration::from_secs),
             },
+            DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
             TEST_USER_AGENT,
         );
 
@@ -1639,6 +1679,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
             TEST_USER_AGENT,
         );
 
@@ -1713,6 +1754,7 @@ pub mod tests {
                 allow_only_mlkem,
                 Some(root_certificate.to_vec()),
                 KeepaliveConfig::default(),
+                BOOTSTRAP_ECH_TIMEOUT,
                 TEST_USER_AGENT,
             );
 
@@ -1831,6 +1873,22 @@ pub mod tests {
                 let mut first_byte = [0u8];
                 let _ = socket.read(&mut first_byte).await;
                 let _ = socket.write_all(junk.bytes()).await;
+            }
+        });
+
+        port
+    }
+
+    async fn spawn_silent_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let mut accepted = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
             }
         });
 
@@ -1973,6 +2031,22 @@ pub mod tests {
         assert_reconnects(&testbed, &mut rx, &calls).await;
     }
 
+    #[tokio::test]
+    #[test_log::test]
+    async fn backoff_while_server_goes_silent_during_ech_bootstrap() {
+        let ech = EchBootstrap::Enabled;
+        let testbed = spawn_ech_testbed(stub_ech(ech)).await;
+        let silent = spawn_silent_server().await;
+        testbed.relay.set_mode(RelayMode::Redirect(silent));
+
+        let (backoff, calls) = counting_backoff(forward_after(&testbed.relay, FAILED_HANDSHAKES));
+        let (_ens, mut rx) = testbed
+            .start_monitor(ech, testbed.stub.ca_der(), backoff)
+            .await;
+
+        assert_reconnects(&testbed, &mut rx, &calls).await;
+    }
+
     #[rstest]
     #[tokio::test]
     #[test_log::test]
@@ -2027,6 +2101,7 @@ pub mod tests {
             allow_only_mlkem,
             Some(TlsConfig::new().unwrap().ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
+            DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
             TEST_USER_AGENT,
         );
 
@@ -2136,6 +2211,7 @@ pub mod tests {
             allow_only_mlkem,
             None,
             KeepaliveConfig::default(),
+            DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
             TEST_USER_AGENT,
         );
 

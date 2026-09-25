@@ -1255,7 +1255,6 @@ mod tests {
             global_user_agent(),
             make_auth(),
         ));
-        let vpn_port = server_config.port;
 
         let wrong_auth = make_auth().to_authentication(&server_config.public_key);
 
@@ -1265,10 +1264,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
 
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
-        );
+        assert!( reason.starts_with("persistent error code: 'The request does not have valid authentication credentials', message:") );
         assert!(callback.notifications.lock().is_empty());
         wait_for(|| tracked_connections(&[connection.id]) == 0);
 
@@ -1287,7 +1283,6 @@ mod tests {
             global_user_agent(),
             auth.clone(),
         ));
-        let vpn_port = server_config.port;
 
         let wrong_vpn_public_key = SecretKey::gen().public();
 
@@ -1303,7 +1298,7 @@ mod tests {
 
         assert_eq!(
             reason,
-            format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
+            "persistent error code: 'The request does not have valid authentication credentials', message: \"Challenge not authenticated\""
         );
         assert!(callback.notifications.lock().is_empty());
         wait_for(|| tracked_connections(&[connection.id]) == 0);
@@ -1711,13 +1706,12 @@ mod tests {
         server_config.send_blocking(Command::Error(Status::new(code, REJECTION_MESSAGE)));
         wait_for(|| !callback.disconnects.lock().is_empty());
 
-        let vpn_port = server_config.port;
-        assert_eq!(
-            *callback.disconnects.lock(),
-            vec![Some(format!(
-                "'http://127.0.0.1:{vpn_port}/' rejected the authentication"
-            ))]
-        );
+        let expected = match code {
+            Code::PermissionDenied => "persistent error code: 'The caller does not have permission to execute the specified operation', message: \"token revoked\"".to_owned(),
+            Code::Unauthenticated =>  "persistent error code: 'The request does not have valid authentication credentials', message: \"token revoked\"".to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(*callback.disconnects.lock(), vec![Some(expected)]);
 
         std::thread::sleep(RECONNECT_WINDOW);
         assert_eq!(server_config.streams(), 1);

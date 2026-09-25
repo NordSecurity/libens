@@ -331,19 +331,20 @@ impl TryFrom<Authentication> for ClientAuthentication {
     }
 }
 
-trait AuthRejection {
-    fn is_auth_rejection(&self) -> bool;
+trait IsPersistentError: std::fmt::Display {
+    fn is_persistent(&self) -> bool;
 }
 
-impl AuthRejection for Status {
-    fn is_auth_rejection(&self) -> bool {
+impl IsPersistentError for Status {
+    fn is_persistent(&self) -> bool {
         matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
     }
 }
 
-impl AuthRejection for Error {
-    fn is_auth_rejection(&self) -> bool {
-        matches!(self, Error::Status(status) if status.is_auth_rejection())
+impl IsPersistentError for Error {
+    fn is_persistent(&self) -> bool {
+        matches!(self, Error::Status(status) if status.is_persistent())
+            || matches!(self, Error::UntrustedCertificate { .. })
     }
 }
 
@@ -370,17 +371,14 @@ fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
     None
 }
 
-async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &Uri, error: &impl std::fmt::Display) {
-    error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
-
-    let reason = format!("'{vpn_uri}' rejected the authentication");
-    publish_disconnect(tx, reason).await;
-}
-
 async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
     if let Err(e) = tx.send(Event::Disconnect(Some(reason))).await {
         warn!("Failed to publish disconnect: {e}");
     }
+}
+
+async fn publish_persistent_error(tx: &Sender<Event>, e: impl IsPersistentError) {
+    publish_disconnect(tx, format!("persistent error {e}")).await;
 }
 
 pub(crate) fn stream_closed_reason(vpn_uri: &Uri) -> String {
@@ -417,8 +415,8 @@ async fn task(
                 match $value {
                     Ok(v) => v,
                     Err(e) => {
-                        if e.is_auth_rejection() {
-                            publish_auth_rejection(&tx, vpn_uri, &e).await;
+                        if e.is_persistent() {
+                            publish_persistent_error(&tx, e).await;
                             break 'outer;
                         }
 
@@ -432,21 +430,19 @@ async fn task(
             };
         }
 
-        let external_channel = match Box::pin(open_channel(
-            vpn_uri,
-            &tls,
-            pool.clone(),
-            &tx,
-            allow_only_pq,
-            root_certificate.clone(),
-            keepalive,
-            user_agent.clone(),
-        ))
-        .await
-        {
-            Err(Error::UntrustedCertificate { .. }) => break 'outer,
-            attempt => handle_error!(attempt, backoff),
-        };
+        let external_channel = handle_error!(
+            Box::pin(open_channel(
+                vpn_uri,
+                &tls,
+                pool.clone(),
+                allow_only_pq,
+                root_certificate.clone(),
+                keepalive,
+                user_agent.clone(),
+            ))
+            .await,
+            backoff
+        );
 
         let headers = handle_error!(
             prepare_connection_headers(&authentication, &external_channel).await,
@@ -492,8 +488,8 @@ async fn task(
                     publish_disconnect(&tx, msg).await;
                     break 'outer;
                 }
-                Err(e) if e.is_auth_rejection() => {
-                    publish_auth_rejection(&tx, vpn_uri, &e).await;
+                Err(e) if e.is_persistent() => {
+                    publish_persistent_error(&tx, e).await;
                     break 'outer;
                 }
                 Err(e) => {
@@ -515,7 +511,6 @@ async fn open_channel(
     vpn_uri: &Uri,
     tls: &TlsOptions,
     pool: Arc<SocketPool>,
-    tx: &Sender<Event>,
     allow_only_pq: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
@@ -532,16 +527,19 @@ async fn open_channel(
     )
     .await;
 
-    let Some(tls) = attempt.as_ref().err().and_then(certificate_rejection) else {
+    let Err(err) = attempt else {
         return attempt;
+    };
+
+    let Some(rejection) = certificate_rejection(&err) else {
+        return Err(err);
     };
 
     let untrusted = Error::UntrustedCertificate {
         vpn_uri: vpn_uri.to_string(),
-        reason: tls.to_string(),
+        reason: rejection.to_string(),
     };
-    error!("{untrusted}");
-    publish_disconnect(tx, untrusted.to_string()).await;
+    error!("opening channel failed with: {untrusted}");
 
     Err(untrusted)
 }

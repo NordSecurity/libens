@@ -44,7 +44,7 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 
 use crate::{
     client::{
-        ErrorNotificationService, KeepaliveConfig, DEFAULT_KEEPALIVE_INTERVAL,
+        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_KEEPALIVE_INTERVAL,
         DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
@@ -409,6 +409,7 @@ pub trait ProtectCallback: Send + Sync {
 struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
+    tls_domain: Option<String>,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
@@ -430,6 +431,7 @@ impl Config {
         let state = ConfigState {
             buffer_size: 5,
             allow_only_pq: true,
+            tls_domain: None,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -452,6 +454,10 @@ impl Config {
 
     pub fn set_allow_only_pq(&self, allow_only_pq: bool) {
         self.state.lock().allow_only_pq = allow_only_pq;
+    }
+
+    pub fn set_tls_domain(&self, tls_domain: Option<String>) {
+        self.state.lock().tls_domain = tls_domain;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -518,6 +524,7 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
+    let tls = TlsOptions::new(&config)?;
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
     let callback = GuardedCallback::new(callback);
@@ -533,19 +540,8 @@ async fn connect_impl(
         .user_agent
         .clone();
 
-    let (mut client, mut receiver) = ErrorNotificationService::new(
-        config
-            .buffer_size
-            .try_into()
-            .map_err(|e| EnsError::UnknownError {
-                reason: format!("buffer_size has to be non zero: {e}"),
-            })?,
-        socket_pool,
-        config.allow_only_pq,
-        config.root_certificate_override,
-        config.keepalive,
-        user_agent,
-    );
+    let (mut client, mut receiver) =
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
         let ret = ExponentialBackoff::fallback();
@@ -554,7 +550,7 @@ async fn connect_impl(
     });
 
     client
-        .start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff)
+        .start_monitor_on_port(vpn.ip(), vpn.port(), tls, authentication, backoff)
         .await?;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
@@ -888,6 +884,10 @@ mod tests {
 
     const MAINTENANCE_INFO: &str = "planned maintenance";
     const REJECTION_MESSAGE: &str = "token revoked";
+    const TLS_DOMAIN: &str = "secret.example.com";
+    const INVALID_TLS_DOMAIN: &str = "not a name";
+    const INVALID_TLS_DOMAIN_REASON: &str = "tls_domain is incorrect";
+    const STUB_CERTIFICATE_DOMAIN: &str = "localhost";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
 
     const OLD_SERVER_INFO: &str = "bar";
@@ -908,6 +908,76 @@ mod tests {
         ids.iter()
             .filter(|id| state.active_connections.contains_key(*id))
             .count()
+    }
+
+    #[test_log::test]
+    fn connect_with_invalid_tls_domain_returns_internal_error() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let connection = connect_local(
+            upstream.port,
+            test_auth(&upstream),
+            RecordedCallback::default(),
+            config,
+        );
+
+        assert_matches!(connection, Err(EnsError::InternalError{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+        assert_eq!(upstream.streams(), 0);
+    }
+
+    #[test_log::test]
+    fn connect_with_tls_domain_in_certificate() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_tls_domain(Some(STUB_CERTIFICATE_DOMAIN.to_owned()));
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+        assert!(callback.disconnects.lock().is_empty());
+    }
+
+    #[test_log::test]
+    fn connect_with_tls_domain_not_in_certificate_ends_the_session() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("untrusted certificate"));
+        assert!(reason.contains("not valid for name"));
+        assert_eq!(server_config.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
     }
 
     #[test_log::test]

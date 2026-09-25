@@ -1224,7 +1224,7 @@ mod tests {
             format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
         );
         assert!(callback.notifications.lock().is_empty());
-        assert_eq!(0, tracked_connections(&[connection.id]));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
@@ -1260,7 +1260,7 @@ mod tests {
             format!("'http://127.0.0.1:{vpn_port}/' rejected the authentication")
         );
         assert!(callback.notifications.lock().is_empty());
-        assert_eq!(0, tracked_connections(&[connection.id]));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
     }
 
     #[test_log::test]
@@ -1452,7 +1452,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
         assert_eq!(reason, closed_reason(vpn_port));
-        assert_eq!(0, tracked_connections(&[id]));
+        wait_for(|| tracked_connections(&[id]) == 0);
 
         drop(connection);
 

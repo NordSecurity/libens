@@ -84,7 +84,7 @@ final class EnsTests: XCTestCase {
             server, .withCredentials(credentials: credentials), callback)
         defer { try? connection.shutdown() }
 
-        let expected = "'http://127.0.0.1:\(server.handshake.port)' rejected the authentication"
+        let expected = "'http://127.0.0.1:\(server.handshake.port)/' rejected the authentication"
 
         wait(for: [callback.ended], timeout: EnsTests.callbackTimeout)
 

@@ -66,7 +66,7 @@ public class EnsTests
         using var connection = ConnectToStub(server, new Authentication.WithCredentials(
             new Credentials(server.Handshake.Username!, WrongPassword, CredentialsKind.OpenVpn)), callback);
 
-        var expected = $"'http://127.0.0.1:{server.Handshake.Port}' rejected the authentication";
+        var expected = $"'http://127.0.0.1:{server.Handshake.Port}/' rejected the authentication";
 
         Assert.Equal(expected, callback.WaitDisconnect());
         Assert.Equal(0, callback.NotificationCount);

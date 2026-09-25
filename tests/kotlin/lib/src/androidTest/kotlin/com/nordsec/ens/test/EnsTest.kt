@@ -125,7 +125,7 @@ class EnsTest {
             callback.awaitDisconnect()
 
             val expected =
-                "'http://127.0.0.1:${server.handshake.port}' rejected the authentication"
+                "'http://127.0.0.1:${server.handshake.port}/' rejected the authentication"
             assertEquals(expected, callback.disconnectReason)
             assertTrue(callback.notifications.isEmpty())
         } finally {

@@ -100,7 +100,7 @@ pub struct ErrorNotificationService {
     quit: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     tx: Sender<Event>,
     socket_pool: Arc<SocketPool>,
-    allow_only_mlkem: bool,
+    allow_only_pq: bool,
     // DER encoded root certificate to be use for verification of TLS
     root_certificate: Vec<u8>,
     // Configuration of the keep alive messages sent over the ENS connection
@@ -114,7 +114,7 @@ impl std::fmt::Debug for ErrorNotificationService {
             .field("quit", &self.quit)
             .field("tx", &self.tx)
             .field("socket_pool", &"<unknown>")
-            .field("allow_only_mlkem", &self.allow_only_mlkem)
+            .field("allow_only_pq", &self.allow_only_pq)
             .field("root_certificate", &self.root_certificate)
             .field("keepalive", &self.keepalive)
             .field("user_agent", &self.user_agent)
@@ -137,7 +137,7 @@ impl ErrorNotificationService {
     pub fn new(
         buffer_size: NonZeroUsize,
         socket_pool: Arc<SocketPool>,
-        allow_only_mlkem: bool,
+        allow_only_pq: bool,
         root_certificate_override: Option<Vec<u8>>,
         mut keepalive: KeepaliveConfig,
         user_agent: HeaderValue,
@@ -165,7 +165,7 @@ impl ErrorNotificationService {
                 quit: None,
                 tx,
                 socket_pool,
-                allow_only_mlkem,
+                allow_only_pq,
                 root_certificate: root_certificate_override
                     .unwrap_or_else(|| DEFAULT_ROOT_CERTIFICATE.to_vec()),
                 keepalive,
@@ -195,7 +195,7 @@ impl ErrorNotificationService {
 
         let pool = self.socket_pool.clone();
         let tx = self.tx.clone();
-        let allow_only_mlkem = self.allow_only_mlkem;
+        let allow_only_pq = self.allow_only_pq;
         let root_certificate = self.root_certificate.clone();
         let keepalive = self.keepalive;
         let user_agent = self.user_agent.clone();
@@ -208,7 +208,7 @@ impl ErrorNotificationService {
                 pool.clone(),
                 tx,
                 quit_rx,
-                allow_only_mlkem,
+                allow_only_pq,
                 backoff,
                 root_certificate,
                 keepalive,
@@ -366,7 +366,7 @@ async fn task(
     pool: Arc<SocketPool>,
     tx: Sender<Event>,
     mut quit_rx: watch::Receiver<bool>,
-    allow_only_mlkem: bool,
+    allow_only_pq: bool,
     mut backoff: impl Backoff,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
@@ -407,7 +407,7 @@ async fn task(
             vpn_uri,
             pool.clone(),
             &tx,
-            allow_only_mlkem,
+            allow_only_pq,
             root_certificate.clone(),
             keepalive,
             user_agent.clone(),
@@ -459,7 +459,6 @@ async fn task(
                 }
                 Ok(None) => {
                     let msg = stream_closed_reason(vpn_uri);
-                    debug!("{msg}");
                     publish_disconnect(&tx, msg).await;
                     break 'outer;
                 }
@@ -477,7 +476,7 @@ async fn task(
         }
         restart!(&mut backoff);
     }
-    debug!("ENS monitor for '{vpn_uri}' terminates");
+    info!("ENS monitor for '{vpn_uri}' terminates");
     Ok(())
 }
 
@@ -485,7 +484,7 @@ async fn open_channel(
     vpn_uri: &Uri,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
-    allow_only_mlkem: bool,
+    allow_only_pq: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
     user_agent: HeaderValue,
@@ -493,7 +492,7 @@ async fn open_channel(
     let attempt = create_external_channel(
         vpn_uri,
         pool,
-        allow_only_mlkem,
+        allow_only_pq,
         root_certificate,
         keepalive,
         user_agent,
@@ -552,7 +551,7 @@ fn authentication_interceptor(
 async fn create_external_channel(
     vpn_uri: &Uri,
     pool: Arc<SocketPool>,
-    allow_only_mlkem: bool,
+    allow_only_pq: bool,
     root_certificate: Vec<u8>,
     keepalive: KeepaliveConfig,
     user_agent: HeaderValue,
@@ -580,7 +579,7 @@ async fn create_external_channel(
 
             if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
-                let tls_connector = make_tls_connector(allow_only_mlkem, &root_certificate)?;
+                let tls_connector = make_tls_connector(allow_only_pq, &root_certificate)?;
                 let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
                 return Ok::<_, std::io::Error>(TokioIo::new(tls_stream));
             }
@@ -618,10 +617,10 @@ async fn create_external_channel(
         .await?)
 }
 
-fn make_crypto_provider(allow_only_mlkem: bool) -> Arc<CryptoProvider> {
+fn make_crypto_provider(allow_only_pq: bool) -> Arc<CryptoProvider> {
     let mut provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
 
-    if allow_only_mlkem {
+    if allow_only_pq {
         provider.kx_groups =
             vec![tokio_rustls::rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
     }
@@ -712,10 +711,10 @@ fn make_trusted_root_cert_verifier(
 }
 
 fn make_tls_connector(
-    allow_only_mlkem: bool,
+    allow_only_pq: bool,
     root_certificate: &[u8],
 ) -> std::io::Result<TlsConnector> {
-    let provider = make_crypto_provider(allow_only_mlkem);
+    let provider = make_crypto_provider(allow_only_pq);
 
     let mut tls_config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -961,11 +960,11 @@ pub mod tests {
         let interval = Duration::from_secs(interval);
         let timeout = Duration::from_secs(timeout);
 
-        let allow_only_mlkem = true;
+        let allow_only_pq = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
             NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
-            allow_only_mlkem,
+            allow_only_pq,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig {
                 interval: Some(interval),
@@ -1050,11 +1049,11 @@ pub mod tests {
         .await;
         let relay = TcpRelay::spawn(server_config.port).await;
 
-        let allow_only_mlkem = true;
+        let allow_only_pq = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
             NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
-            allow_only_mlkem,
+            allow_only_pq,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig {
                 interval: None,
@@ -1147,12 +1146,12 @@ pub mod tests {
         )
         .await;
 
-        let allow_only_mlkem = true;
+        let allow_only_pq = true;
 
         let (mut ens, mut rx) = ErrorNotificationService::new(
             NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
-            allow_only_mlkem,
+            allow_only_pq,
             Some(server_config.tls_config.ca_cert.der().to_vec()),
             KeepaliveConfig::default(),
             TEST_USER_AGENT,
@@ -1257,11 +1256,11 @@ pub mod tests {
             }
         });
 
-        let allow_only_mlkem = true;
+        let allow_only_pq = true;
         let (mut ens, mut rx) = ErrorNotificationService::new(
             NonZeroUsize::new(10).unwrap(),
             make_socket_pool(),
-            allow_only_mlkem,
+            allow_only_pq,
             None,
             KeepaliveConfig::default(),
             TEST_USER_AGENT,

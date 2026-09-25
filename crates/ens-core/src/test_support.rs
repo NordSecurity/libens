@@ -56,6 +56,7 @@ pub enum RelayMode {
     // Connections accepted afterwards forward normally.
     Silent,
 
+    // Connections are accepted and reset at once, so the port stays taken.
     Refuse,
 
     // Connections accepted afterwards go to this port instead of the server.
@@ -73,7 +74,7 @@ impl TcpRelay {
         let addr = listener.local_addr().unwrap();
         let (mode_tx, mode_rx) = watch::channel(RelayMode::Forward);
 
-        tokio::spawn(relay_loop(listener, addr, server_port, mode_rx));
+        tokio::spawn(relay_loop(listener, server_port, mode_rx));
 
         Self {
             port: addr.port(),
@@ -87,47 +88,48 @@ impl TcpRelay {
 }
 
 async fn relay_loop(
-    mut listener: TcpListener,
-    addr: SocketAddr,
+    listener: TcpListener,
     server_port: u16,
     mut mode_rx: watch::Receiver<RelayMode>,
 ) {
     loop {
-        loop {
-            let client = select! {
-                accepted = listener.accept() => accepted.unwrap().0,
-                _ = mode_rx.wait_for(|m| *m == RelayMode::Refuse) => break,
-            };
-            let mode_at_accept = *mode_rx.borrow();
-            let target_port = match mode_at_accept {
-                RelayMode::Redirect(port) => port,
-                _ => server_port,
-            };
-            let server = TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
-                .await
-                .unwrap();
-
-            let (client_rx, client_tx) = client.into_split();
-            let (server_rx, server_tx) = server.into_split();
-            tokio::spawn(run_pipe(
-                server_rx,
-                client_tx,
-                mode_at_accept,
-                mode_rx.clone(),
-            ));
-            tokio::spawn(run_pipe(
-                client_rx,
-                server_tx,
-                mode_at_accept,
-                mode_rx.clone(),
-            ));
+        let client = select! {
+            accepted = listener.accept() => accepted.unwrap().0,
+            changed = mode_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let mode_at_accept = *mode_rx.borrow();
+        if mode_at_accept == RelayMode::Refuse {
+            client.set_zero_linger().unwrap();
+            continue;
         }
 
-        drop(listener);
-        if mode_rx.wait_for(|m| *m != RelayMode::Refuse).await.is_err() {
-            return;
-        }
-        listener = TcpListener::bind(addr).await.unwrap();
+        let target_port = match mode_at_accept {
+            RelayMode::Redirect(port) => port,
+            _ => server_port,
+        };
+        let server = TcpStream::connect((Ipv4Addr::LOCALHOST, target_port))
+            .await
+            .unwrap();
+
+        let (client_rx, client_tx) = client.into_split();
+        let (server_rx, server_tx) = server.into_split();
+        tokio::spawn(run_pipe(
+            server_rx,
+            client_tx,
+            mode_at_accept,
+            mode_rx.clone(),
+        ));
+        tokio::spawn(run_pipe(
+            client_rx,
+            server_tx,
+            mode_at_accept,
+            mode_rx.clone(),
+        ));
     }
 }
 

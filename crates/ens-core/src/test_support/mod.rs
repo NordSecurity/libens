@@ -2,12 +2,15 @@
 #![allow(unused_imports)]
 #![allow(clippy::unnecessary_wraps)]
 
+mod tls;
+
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Once},
     time::{Duration, Instant},
 };
 
+use bstr::ByteSlice;
 use ens_core::{
     connect, Authentication, Config, Connection, ConnectionErrorNotification, EnsError,
     ErrorNotificationCallback, Hidden, KeyKind, Keys, LogCallback, LogLevel,
@@ -28,6 +31,7 @@ use tokio::{
 
 pub use ens_core::SHUTDOWN_REASON;
 pub use ens_stub::{Command, ServerConfig};
+pub use tls::*;
 
 const TEST_APP_VERSION: &str = "tests";
 const ANY_LOCAL_PORT: &str = "127.0.0.1:0";
@@ -63,9 +67,22 @@ pub enum RelayMode {
     Redirect(u16),
 }
 
+#[derive(Clone, Default)]
+pub struct Wire {
+    pub to_server: Vec<u8>,
+    pub to_client: Vec<u8>,
+}
+
+impl Wire {
+    pub fn contains(&self, needle: &str) -> bool {
+        self.to_server.contains_str(needle) || self.to_client.contains_str(needle)
+    }
+}
+
 pub struct TcpRelay {
     pub port: u16,
     mode_tx: watch::Sender<RelayMode>,
+    wire: Arc<Mutex<Wire>>,
 }
 
 impl TcpRelay {
@@ -73,17 +90,23 @@ impl TcpRelay {
         let listener = TcpListener::bind(ANY_LOCAL_PORT).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (mode_tx, mode_rx) = watch::channel(RelayMode::Forward);
+        let wire = Arc::new(Mutex::new(Wire::default()));
 
-        tokio::spawn(relay_loop(listener, server_port, mode_rx));
+        tokio::spawn(relay_loop(listener, server_port, mode_rx, wire.clone()));
 
         Self {
             port: addr.port(),
             mode_tx,
+            wire,
         }
     }
 
     pub fn set_mode(&self, mode: RelayMode) {
         self.mode_tx.send(mode).unwrap();
+    }
+
+    pub fn wire(&self) -> Wire {
+        self.wire.lock().clone()
     }
 }
 
@@ -91,6 +114,7 @@ async fn relay_loop(
     listener: TcpListener,
     server_port: u16,
     mut mode_rx: watch::Receiver<RelayMode>,
+    wire: Arc<Mutex<Wire>>,
 ) {
     loop {
         let client = select! {
@@ -123,14 +147,24 @@ async fn relay_loop(
             client_tx,
             mode_at_accept,
             mode_rx.clone(),
+            wire.clone(),
+            Direction::ToClient,
         ));
         tokio::spawn(run_pipe(
             client_rx,
             server_tx,
             mode_at_accept,
             mode_rx.clone(),
+            wire.clone(),
+            Direction::ToServer,
         ));
     }
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    ToServer,
+    ToClient,
 }
 
 async fn run_pipe(
@@ -138,6 +172,8 @@ async fn run_pipe(
     mut tx: OwnedWriteHalf,
     mode_at_accept: RelayMode,
     mut mode_rx: watch::Receiver<RelayMode>,
+    wire: Arc<Mutex<Wire>>,
+    direction: Direction,
 ) {
     let mut buf = [0u8; RELAY_BUFFER_SIZE];
     loop {
@@ -154,6 +190,15 @@ async fn run_pipe(
             mode_at_accept == RelayMode::Forward && *mode_rx.borrow() == RelayMode::Silent;
         if silenced {
             continue;
+        }
+
+        {
+            let mut wire = wire.lock();
+            let captured = match direction {
+                Direction::ToServer => &mut wire.to_server,
+                Direction::ToClient => &mut wire.to_client,
+            };
+            captured.extend_from_slice(&buf[..n]);
         }
 
         if tx.write_all(&buf[..n]).await.is_err() {

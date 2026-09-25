@@ -12,7 +12,9 @@ use http::{HeaderValue, Uri};
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
 use rustls::{
-    client::danger::ServerCertVerifier, crypto::CryptoProvider, pki_types::CertificateDer,
+    client::danger::ServerCertVerifier,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, DnsName, ServerName},
     ClientConfig, RootCertStore,
 };
 use tokio::{
@@ -134,7 +136,33 @@ impl Drop for ErrorNotificationService {
 
 impl ErrorNotificationService {
     /// Create new instance with `buffer_size` used for the error notifications channel
-    pub fn new(
+    pub fn try_from_config(
+        config: &crate::ConfigState,
+        socket_pool: Arc<SocketPool>,
+        user_agent: HeaderValue,
+    ) -> Result<(Self, Receiver<Event>), EnsError> {
+        let buffer_size = config
+            .buffer_size
+            .try_into()
+            .map_err(|e| EnsError::InvalidInput {
+                reason: format!("buffer_size has to be non zero: {e}"),
+            })?;
+
+        let allow_only_pq = config.allow_only_pq;
+        let root_certificate_override = config.root_certificate_override.clone();
+        let keepalive = config.keepalive;
+
+        Ok(Self::new(
+            buffer_size,
+            socket_pool,
+            allow_only_pq,
+            root_certificate_override,
+            keepalive,
+            user_agent,
+        ))
+    }
+
+    fn new(
         buffer_size: NonZeroUsize,
         socket_pool: Arc<SocketPool>,
         allow_only_pq: bool,
@@ -179,10 +207,11 @@ impl ErrorNotificationService {
         &mut self,
         vpn_ip: IpAddr,
         ens_port: u16,
+        tls: TlsOptions,
         authentication: ClientAuthentication,
         backoff: impl Backoff,
     ) -> Result<(), Error> {
-        info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
+        info!("Will start ENS monitoring for {vpn_ip}:{ens_port} ({tls:?})");
         self.stop().await;
 
         let (quit_tx, quit_rx): (watch::Sender<bool>, watch::Receiver<bool>) =
@@ -204,6 +233,7 @@ impl ErrorNotificationService {
             // This future is too big for keeping it on the stack
             if let Err(e) = Box::pin(task(
                 &vpn_uri,
+                tls,
                 authentication,
                 pool.clone(),
                 tx,
@@ -362,6 +392,7 @@ pub(crate) fn stream_closed_reason(vpn_uri: &Uri) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn task(
     vpn_uri: &Uri,
+    tls: TlsOptions,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
     tx: Sender<Event>,
@@ -405,6 +436,7 @@ async fn task(
 
         let external_channel = match Box::pin(open_channel(
             vpn_uri,
+            &tls,
             pool.clone(),
             &tx,
             allow_only_pq,
@@ -480,8 +512,10 @@ async fn task(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_channel(
     vpn_uri: &Uri,
+    tls: &TlsOptions,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
     allow_only_pq: bool,
@@ -491,6 +525,7 @@ async fn open_channel(
 ) -> Result<Channel, Error> {
     let attempt = create_external_channel(
         vpn_uri,
+        tls.clone(),
         pool,
         allow_only_pq,
         root_certificate,
@@ -550,6 +585,7 @@ fn authentication_interceptor(
 
 async fn create_external_channel(
     vpn_uri: &Uri,
+    tls: TlsOptions,
     pool: Arc<SocketPool>,
     allow_only_pq: bool,
     root_certificate: Vec<u8>,
@@ -557,6 +593,7 @@ async fn create_external_channel(
     user_agent: HeaderValue,
 ) -> Result<Channel, Error> {
     let socket_factory = move |uri: Uri| {
+        let tls = tls.clone();
         let pool = pool.clone();
         let root_certificate = root_certificate.clone();
         async move {
@@ -574,8 +611,7 @@ async fn create_external_channel(
             };
 
             let socket = pool.new_external_tcp_v4(None)?;
-            let domain = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let domain = tls.server_name(host)?;
 
             if let Some(resolved) = lookup_host((host, port)).await?.next() {
                 let tcp_stream = socket.connect(resolved).await?;
@@ -708,6 +744,33 @@ fn make_trusted_root_cert_verifier(
         .build()
         .map_err(std::io::Error::other)?;
     Ok(Arc::new(CertFingerprintLogger(verifier)))
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsOptions {
+    pub(crate) domain: Option<DnsName<'static>>,
+}
+
+impl TlsOptions {
+    pub fn new(config: &crate::ConfigState) -> Result<Self, EnsError> {
+        let tls_domain: Option<DnsName> = config
+            .tls_domain
+            .clone()
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|e| EnsError::InvalidInput {
+                reason: format!("tls_domain is incorrect: {e:?}"),
+            })?;
+        Ok(TlsOptions { domain: tls_domain })
+    }
+    fn server_name(&self, fallback_host: &str) -> std::io::Result<ServerName<'static>> {
+        if let Some(domain) = &self.domain {
+            return Ok(ServerName::DnsName(domain.clone()));
+        }
+
+        ServerName::try_from(fallback_host.to_owned())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    }
 }
 
 fn make_tls_connector(
@@ -976,6 +1039,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1065,6 +1129,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             relay.port,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
@@ -1169,6 +1234,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             server_config.port,
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
@@ -1269,6 +1335,7 @@ pub mod tests {
         ens.start_monitor_on_port(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             port_rx.await.unwrap(),
+            TlsOptions::default(),
             client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )

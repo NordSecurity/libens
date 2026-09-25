@@ -18,7 +18,7 @@ const (
 	maintenanceInfo       = "planned maintenance"
 	shutdownReason        = "shutdown"
 	wrongPassword         = "wrong"
-	authRejectionReason   = "'http://127.0.0.1:%d' rejected the authentication"
+	authRejectionReason   = "'http://127.0.0.1:%d/' rejected the authentication"
 )
 
 type recorder struct {

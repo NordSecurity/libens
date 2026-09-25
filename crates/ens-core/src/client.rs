@@ -179,7 +179,7 @@ impl ErrorNotificationService {
         ens_port: u16,
         authentication: ClientAuthentication,
         backoff: impl Backoff,
-    ) {
+    ) -> Result<(), Error> {
         info!("Will start ENS monitoring on {vpn_ip}:{ens_port}");
         self.stop().await;
 
@@ -188,7 +188,8 @@ impl ErrorNotificationService {
 
         // Needs to be http and not https, otherwise grpc will add another layer of https
         // on top of our own custom one
-        let vpn_uri = format!("http://{vpn_ip}:{ens_port}");
+        let vpn_uri =
+            Uri::from_str(&format!("http://{vpn_ip}:{ens_port}")).map_err(http::Error::from)?;
 
         let pool = self.socket_pool.clone();
         let tx = self.tx.clone();
@@ -218,6 +219,8 @@ impl ErrorNotificationService {
         });
 
         self.quit = Some((quit_tx, join_handle));
+
+        Ok(())
     }
 
     /// Stop ENS
@@ -337,7 +340,7 @@ fn certificate_rejection(error: &Error) -> Option<&rustls::Error> {
     None
 }
 
-async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &str, error: &impl std::fmt::Display) {
+async fn publish_auth_rejection(tx: &Sender<Event>, vpn_uri: &Uri, error: &impl std::fmt::Display) {
     error!("ENS authentication for '{vpn_uri}' was rejected: {error}");
 
     let reason = format!("'{vpn_uri}' rejected the authentication");
@@ -350,13 +353,13 @@ async fn publish_disconnect(tx: &Sender<Event>, reason: String) {
     }
 }
 
-pub(crate) fn stream_closed_reason(vpn_uri: &str) -> String {
+pub(crate) fn stream_closed_reason(vpn_uri: &Uri) -> String {
     format!("'{vpn_uri}' closed the grpc stream")
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn task(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     authentication: ClientAuthentication,
     pool: Arc<SocketPool>,
     tx: Sender<Event>,
@@ -447,7 +450,7 @@ async fn task(
                     backoff.reset();
                     if let Err(e) = tx.try_send(Event::Notification {
                         connection_error,
-                        vpn_uri: vpn_uri.to_owned(),
+                        vpn_uri: vpn_uri.to_string(),
                     }) {
                         warn!("Failed to publish newly received error notification: {e}");
                     }
@@ -477,7 +480,7 @@ async fn task(
 }
 
 async fn open_channel(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     pool: Arc<SocketPool>,
     tx: &Sender<Event>,
     allow_only_mlkem: bool,
@@ -500,7 +503,7 @@ async fn open_channel(
     };
 
     let untrusted = Error::UntrustedCertificate {
-        vpn_uri: vpn_uri.to_owned(),
+        vpn_uri: vpn_uri.to_string(),
         reason: tls.to_string(),
     };
     error!("{untrusted}");
@@ -545,7 +548,7 @@ fn authentication_interceptor(
 }
 
 async fn create_external_channel(
-    vpn_uri: &str,
+    vpn_uri: &Uri,
     pool: Arc<SocketPool>,
     allow_only_mlkem: bool,
     root_certificate: Vec<u8>,
@@ -586,7 +589,7 @@ async fn create_external_channel(
         }
     };
 
-    let endpoint = Endpoint::try_from(vpn_uri.to_owned())?.user_agent(user_agent)?;
+    let endpoint = Endpoint::from(vpn_uri.clone()).user_agent(user_agent)?;
 
     let endpoint = if let Some(interval) = keepalive.interval {
         endpoint.http2_keep_alive_interval(interval)
@@ -890,7 +893,7 @@ pub mod tests {
     }
 
     pub fn closed_reason(vpn_port: u16) -> String {
-        stream_closed_reason(&format!("http://127.0.0.1:{vpn_port}"))
+        stream_closed_reason(&Uri::from_str(&format!("http://127.0.0.1:{vpn_port}")).unwrap())
     }
 
     /// The user agent that `init` installed. Tests going through the public
@@ -975,7 +978,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         server_config
             .send(Command::Send(ConnectionError {
@@ -1063,7 +1067,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         server_config
             .send(Command::Send(ConnectionError {
@@ -1166,7 +1171,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_config.public_key),
             backoff,
         )
-        .await;
+        .await
+        .unwrap();
 
         for e in errors_to_emit.clone() {
             server_config.send(Command::Send(e)).await;
@@ -1265,7 +1271,8 @@ pub mod tests {
             client_authentication(&client_private_key, server_public_key),
             ExponentialBackoff::new(ExponentialBackoffBounds::default()).unwrap(),
         )
-        .await;
+        .await
+        .unwrap();
 
         // Wait a bit for the background task to attempt TLS handshake and fail
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

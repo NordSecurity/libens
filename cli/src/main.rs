@@ -21,7 +21,7 @@ use log::{debug, info};
 use rustls::{
     ClientConfig, RootCertStore,
     client::{EchConfig, EchMode, EchStatus},
-    crypto::aws_lc_rs::{default_provider, hpke::ALL_SUPPORTED_SUITES},
+    crypto::aws_lc_rs::{default_provider, hpke::ALL_SUPPORTED_SUITES, kx_group::X25519MLKEM768},
     pki_types::{CertificateDer, EchConfigListBytes, ServerName},
 };
 use tokio::net::TcpStream;
@@ -395,7 +395,10 @@ async fn ech_handshake(
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from_slice(DEFAULT_ROOT_CERTIFICATE))?;
 
-    let mut config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
+    let mut provider = default_provider();
+    provider.kx_groups = vec![X25519MLKEM768];
+
+    let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_ech(EchMode::Enable(ech_config))?
         .with_root_certificates(roots)
         .with_no_client_auth();

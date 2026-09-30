@@ -1942,13 +1942,6 @@ mod tests {
         );
     }
 
-    fn fast_backoff() -> Config {
-        let config = Config::new();
-        config.set_backoff_initial(BACKOFF_SECONDS);
-        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
-        config
-    }
-
     #[test_log::test]
     fn test_untrusted_certificate_on_connect_ends_the_session() {
         run_init();
@@ -1988,12 +1981,16 @@ mod tests {
         let relay = runtime.block_on(TcpRelay::spawn(trusted.port));
 
         let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
         let _connection = connect_to_port(
             relay.port,
             &trusted,
             test_auth(&trusted),
             callback.clone(),
-            fast_backoff(),
+            config,
         )
         .unwrap();
 

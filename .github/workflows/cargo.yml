@@ -10,6 +10,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_LOG: debug
   NIGHTLY_VERSION: "nightly-2025-12-01"
   COVERAGE_DIR: coverage
   COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub
@@ -151,7 +152,7 @@ jobs:
           key: test-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --all --all-features -- --test-threads 30
 
   cargo-test-release:
     name: cargo test (release)
@@ -169,7 +170,7 @@ jobs:
           key: test-release-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --all
-      - run: cargo test --release --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --release --all --all-features -- --test-threads 30
 
   cargo-test-windows:
     name: cargo test (windows)
@@ -187,4 +188,4 @@ jobs:
           key: test-windows
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --all --all-features -- --test-threads 30

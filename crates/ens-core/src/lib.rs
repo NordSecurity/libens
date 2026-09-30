@@ -44,8 +44,8 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 
 use crate::{
     client::{
-        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_KEEPALIVE_INTERVAL,
-        DEFAULT_KEEPALIVE_TIMEOUT,
+        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
+        DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_message, catch_panic_result},
@@ -132,6 +132,16 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
+            client::Error::EchBootstrappingFailed { source } => Self::TransportError {
+                reason: format!("ECH bootstrap failed: {source:?}"),
+            },
+            rejected @ client::Error::EchBootstrappingRejected => {
+                // NOTE: this should never happen, the ECH offer rejection should
+                // be exposed as a disconnect
+                Self::InternalError {
+                    reason: rejected.to_string(),
+                }
+            }
         }
     }
 }
@@ -414,9 +424,11 @@ struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
     tls_domain: Option<String>,
+    enable_ech: bool,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
 }
 
 pub struct Config {
@@ -436,6 +448,7 @@ impl Config {
             buffer_size: 5,
             allow_only_pq: true,
             tls_domain: None,
+            enable_ech: false,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -445,6 +458,7 @@ impl Config {
                 interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
                 timeout: Some(DEFAULT_KEEPALIVE_TIMEOUT),
             },
+            bootstrap_ech_timeout: DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
         };
 
         Self {
@@ -462,6 +476,10 @@ impl Config {
 
     pub fn set_tls_domain(&self, tls_domain: Option<String>) {
         self.state.lock().tls_domain = tls_domain;
+    }
+
+    pub fn set_enable_ech_bootstrap(&self, enable_ech: bool) {
+        self.state.lock().enable_ech = enable_ech;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -482,6 +500,10 @@ impl Config {
 
     pub fn set_keepalive_timeout(&self, seconds: Option<u32>) {
         self.state.lock().keepalive.timeout = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_bootstrap_ech_timeout(&self, seconds: u32) {
+        self.state.lock().bootstrap_ech_timeout = Duration::from_secs(seconds.into());
     }
 }
 

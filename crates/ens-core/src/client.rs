@@ -3,7 +3,7 @@ use std::{
 };
 
 use telio_crypto::{PublicKey, SecretKey, SharedSecret};
-use telio_sockets::SocketPool;
+use telio_sockets::{External, SocketPool};
 use telio_utils::exponential_backoff::{self, Backoff};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -18,7 +18,7 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{
-    net::lookup_host,
+    net::{lookup_host, TcpStream},
     select,
     sync::{
         mpsc::{Receiver, Sender},
@@ -46,6 +46,8 @@ const AUTHENTICATION_KEY: &str = "authentication";
 const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
+const MISSING_HOST_MSG: &str = "missing host in vpn uri";
+const MISSING_PORT_MSG: &str = "missing port in vpn uri";
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -581,6 +583,35 @@ fn authentication_interceptor(
     }
 }
 
+async fn connect_tcp<'a>(
+    uri: &'a Uri,
+    pool: &SocketPool,
+    tls: &TlsOptions,
+) -> std::io::Result<(&'a str, ServerName<'static>, External<TcpStream>)> {
+    let Some(host) = uri.host() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            MISSING_HOST_MSG,
+        ));
+    };
+    let Some(port) = uri.port_u16() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            MISSING_PORT_MSG,
+        ));
+    };
+
+    let server_name = tls.server_name(host)?;
+    let socket = pool.new_external_tcp_v4(None)?;
+    let Some(resolved) = lookup_host((host, port)).await?.next() else {
+        return Err(std::io::Error::other(format!(
+            "None of the IPs resolved from {host} accepted ENS over TLS"
+        )));
+    };
+
+    Ok((host, server_name, socket.connect(resolved).await?))
+}
+
 async fn create_external_channel(
     vpn_uri: &Uri,
     tls: TlsOptions,
@@ -595,32 +626,10 @@ async fn create_external_channel(
         let pool = pool.clone();
         let root_certificate = root_certificate.clone();
         async move {
-            let Some(host) = uri.host() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "missing host in vpn uri",
-                ));
-            };
-            let Some(port) = uri.port_u16() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "missing port in vpn uri",
-                ));
-            };
-
-            let socket = pool.new_external_tcp_v4(None)?;
-            let domain = tls.server_name(host)?;
-
-            if let Some(resolved) = lookup_host((host, port)).await?.next() {
-                let tcp_stream = socket.connect(resolved).await?;
-                let tls_connector = make_tls_connector(allow_only_pq, &root_certificate)?;
-                let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
-                return Ok::<_, std::io::Error>(TokioIo::new(tls_stream));
-            }
-
-            Err(std::io::Error::other(format!(
-                "None of the IPs resolved from {host} accepted ENS over TLS"
-            )))
+            let (_, domain, tcp_stream) = connect_tcp(&uri, &pool, &tls).await?;
+            let tls_connector = make_tls_connector(allow_only_pq, &root_certificate)?;
+            let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
+            Ok::<_, std::io::Error>(TokioIo::new(tls_stream))
         }
     };
 

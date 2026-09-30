@@ -1,6 +1,100 @@
-use std::num::TryFromIntError;
+use std::{num::TryFromIntError, sync::Arc, time::Duration};
 
-use rustls::{crypto::hpke::Hpke, pki_types::EchConfigListBytes};
+use http::Uri;
+use log::{info, warn};
+use rustls::{
+    client::EchConfig,
+    crypto::{aws_lc_rs::hpke::ALL_SUPPORTED_SUITES, hpke::Hpke},
+    pki_types::EchConfigListBytes,
+};
+use telio_sockets::SocketPool;
+
+use super::{connect_error, connect_tcp, make_tls_connector, EchMode, Error, TlsOptions};
+
+pub(super) async fn bootstrap(
+    uri: &Uri,
+    tls: &TlsOptions,
+    pool: Arc<SocketPool>,
+    allow_only_pq: bool,
+    root_certificate: &[u8],
+    timeout: Duration,
+) -> Result<EchConfig, Error> {
+    let bootstrap = handshake(uri, tls, pool, allow_only_pq, root_certificate);
+
+    let retry_configs = tokio::time::timeout(timeout, bootstrap)
+        .await
+        .map_err(|e| Error::EchBootstrappingFailed { source: e.into() })??;
+
+    let ech_config = EchConfig::new(
+        EchConfigListBytes::from(retry_configs),
+        ALL_SUPPORTED_SUITES,
+    )
+    .map_err(|e| {
+        warn!("ECH bootstrapping failed, invalid retry configs: {e:?}");
+        Error::EchBootstrappingRejected
+    })?;
+
+    info!("ECH bootstrapping success");
+    Ok(ech_config)
+}
+
+async fn handshake(
+    uri: &Uri,
+    tls: &TlsOptions,
+    pool: Arc<SocketPool>,
+    allow_only_pq: bool,
+    root_certificate: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let (host, expected_tls_hostname, tcp_stream) =
+        connect_tcp(uri, &pool, tls).await.map_err(connect_error)?;
+
+    let domain =
+        tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
+            Error::Internal {
+                reason: format!("malformed server name: {e}"),
+            }
+        })?;
+
+    let tls_connector = make_tls_connector(
+        allow_only_pq,
+        root_certificate,
+        EchMode::BootstrapWithExpectedServerName(expected_tls_hostname),
+    )
+    .map_err(|source| Error::EchBootstrappingFailed { source })?;
+
+    // Getting an error here is desired - this is the way tls/rustls transmit
+    // the retry configs with up-to-date crypto keys that will be used in the
+    // second connection to establish TLS with ECH
+    let Err(e) = tls_connector.connect(domain, tcp_stream).await else {
+        return Err(Error::EchBootstrappingRejected);
+    };
+
+    match e.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()) {
+        // This is a successful ECH bootstrap.
+        Some(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+        )) => {
+            use rustls::internal::msgs::codec::Codec;
+            Ok(retry_configs.get_encoding())
+        }
+        // App asked for ECH bootstrapping but the server is not returning
+        // fresh retry configs, so it's not possible to complete the bootstrap.
+        Some(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(None),
+        )) => Err(Error::EchBootstrappingRejected),
+        // Server presented an invalid certificate, which is not a transient
+        // connection failure, so we will not automatically retry.
+        Some(rustls::Error::InvalidCertificate(_)) => Err(Error::UntrustedCertificate {
+            vpn_uri: uri.to_string(),
+            reason: e.to_string(),
+        }),
+        // Things like captive portals can inject invalid (from the
+        // point of view of TLS) bytes, but are not necessarily
+        // persistent errors - user can log into the captive portal
+        // and gain access to the internet, etc...
+        _ => Err(Error::EchBootstrappingFailed { source: e }),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyConfigError {

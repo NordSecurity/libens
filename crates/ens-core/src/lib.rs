@@ -100,6 +100,8 @@ pub enum EnsError {
     AlreadyInitialized,
     #[error("Unknown error: {reason}")]
     UnknownError { reason: String },
+    #[error("Invalid input: {reason}")]
+    InvalidInput { reason: String },
 }
 
 impl From<client::Error> for EnsError {
@@ -123,7 +125,9 @@ impl From<client::Error> for EnsError {
             client::Error::InvalidMetadata(invalid_metadata_value) => Self::InternalError {
                 reason: format!("Invalid grpc metadata value: {invalid_metadata_value}"),
             },
-            client::Error::InvalidKey { reason } => Self::UnknownError { reason },
+            client::Error::InvalidKey { reason } | client::Error::InvalidCredentials { reason } => {
+                Self::InvalidInput { reason }
+            }
             client::Error::Internal { reason } => Self::InternalError { reason },
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
@@ -194,7 +198,7 @@ pub fn init(app_version: String) -> Result<()> {
             return Err(EnsError::AlreadyInitialized);
         }
 
-        let user_agent = build_user_agent(&app_version).map_err(|e| EnsError::UnknownError {
+        let user_agent = build_user_agent(&app_version).map_err(|e| EnsError::InvalidInput {
             reason: format!("incorrect user-agent: {e}"),
         })?;
 
@@ -353,7 +357,7 @@ pub struct Credentials {
 impl Credentials {
     fn validate(&self) -> std::result::Result<(), client::Error> {
         if self.username.contains(':') {
-            return Err(client::Error::Internal {
+            return Err(client::Error::InvalidCredentials {
                 reason: "in a http basic auth, username can't contain ':'".to_owned(),
             });
         }
@@ -537,7 +541,7 @@ async fn connect_impl(
         config
             .buffer_size
             .try_into()
-            .map_err(|e| EnsError::UnknownError {
+            .map_err(|e| EnsError::InvalidInput {
                 reason: format!("buffer_size has to be non zero: {e}"),
             })?,
         socket_pool,
@@ -1141,7 +1145,7 @@ mod tests {
             callback.clone(),
         );
 
-        assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("key conversion failed"));
     }
 
     #[test_log::test]
@@ -1169,7 +1173,27 @@ mod tests {
             callback.clone(),
         );
 
-        assert_matches!(connection, Err(EnsError::InternalError { reason }) if reason.contains("':'"));
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("':'"));
+    }
+
+    #[test_log::test]
+    fn test_connect_fails_when_buffer_size_is_zero() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_buffer_size(0);
+
+        let connection = connect_local(
+            server_config.port,
+            test_auth(&server_config),
+            RecordedCallback::default(),
+            config,
+        );
+
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("buffer_size"));
     }
 
     #[rstest]

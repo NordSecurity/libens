@@ -46,6 +46,9 @@ interface EnsError {
 
     /// Other, unspecified error
     UnknownError(string reason);
+
+    /// An argument passed to the library is invalid.
+    InvalidInput(string reason);
 };
 
 /// Classification of a connection-level error notification received from

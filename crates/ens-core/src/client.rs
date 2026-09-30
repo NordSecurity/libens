@@ -68,6 +68,8 @@ pub enum Error {
     InvalidMetadata(#[from] InvalidMetadataValue),
     #[error("Invalid key: {reason}")]
     InvalidKey { reason: String },
+    #[error("Invalid credentials: {reason}")]
+    InvalidCredentials { reason: String },
     #[error("Internal error: {reason}")]
     Internal { reason: String },
     #[error("'{vpn_uri}' presented an untrusted certificate: {reason}")]

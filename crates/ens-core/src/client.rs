@@ -41,6 +41,9 @@ use llt_proto::ens::{
 
 use crate::{runtime::is_unexpected_task_failure, Authentication, Credentials, EnsError, KeyKind};
 
+#[expect(dead_code)]
+mod ech;
+
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
 const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";

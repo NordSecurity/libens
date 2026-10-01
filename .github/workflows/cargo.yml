@@ -13,7 +13,7 @@ env:
   RUST_LOG: debug
   NIGHTLY_VERSION: "nightly-2025-12-01"
   COVERAGE_DIR: coverage
-  COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub
+  COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub --ignore-filename-regex ens-core/src/test_support
   ECH_STUB_DIR: crates/ens-core/tests/echstub
 
 permissions:
@@ -115,7 +115,7 @@ jobs:
         with:
           key: llvm-cov-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo install --locked cargo-llvm-cov@0.8.7
+      - run: cargo install --locked cargo-llvm-cov@0.9.1
       - name: Compute coverage from unit and integration tests
         run: cargo llvm-cov ${{ env.COVERAGE_ARGS }} --html --output-dir ${{ env.COVERAGE_DIR }} -- --test-threads 30
       - name: Print coverage summary

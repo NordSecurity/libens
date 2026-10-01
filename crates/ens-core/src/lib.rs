@@ -44,8 +44,8 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 
 use crate::{
     client::{
-        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_KEEPALIVE_INTERVAL,
-        DEFAULT_KEEPALIVE_TIMEOUT,
+        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
+        DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_message, catch_panic_result},
@@ -132,6 +132,16 @@ impl From<client::Error> for EnsError {
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
+            client::Error::EchBootstrappingFailed { source } => Self::TransportError {
+                reason: format!("ECH bootstrap failed: {source:?}"),
+            },
+            rejected @ client::Error::EchBootstrappingRejected => {
+                // NOTE: this should never happen, the ECH offer rejection should
+                // be exposed as a disconnect
+                Self::InternalError {
+                    reason: rejected.to_string(),
+                }
+            }
         }
     }
 }
@@ -414,9 +424,11 @@ struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
     tls_domain: Option<String>,
+    enable_ech: bool,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
 }
 
 pub struct Config {
@@ -436,6 +448,7 @@ impl Config {
             buffer_size: 5,
             allow_only_pq: true,
             tls_domain: None,
+            enable_ech: false,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -445,6 +458,7 @@ impl Config {
                 interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
                 timeout: Some(DEFAULT_KEEPALIVE_TIMEOUT),
             },
+            bootstrap_ech_timeout: DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
         };
 
         Self {
@@ -462,6 +476,10 @@ impl Config {
 
     pub fn set_tls_domain(&self, tls_domain: Option<String>) {
         self.state.lock().tls_domain = tls_domain;
+    }
+
+    pub fn set_enable_ech_bootstrap(&self, enable_ech: bool) {
+        self.state.lock().enable_ech = enable_ech;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -482,6 +500,10 @@ impl Config {
 
     pub fn set_keepalive_timeout(&self, seconds: Option<u32>) {
         self.state.lock().keepalive.timeout = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_bootstrap_ech_timeout(&self, seconds: u32) {
+        self.state.lock().bootstrap_ech_timeout = Duration::from_secs(seconds.into());
     }
 }
 
@@ -630,6 +652,37 @@ async fn connect_impl(
         event_processing_task: Mutex::new(Some(event_processing_task)),
         vpn,
     }))
+}
+
+// Runs only the ECH bootstrap against `vpn`, ignoring the ECH setting in `config`
+pub fn bootstrap_ech(vpn: SocketAddr, config: &Arc<Config>) -> Result<Vec<u8>> {
+    catch_panic_result(|| {
+        let config = config.state.lock().clone();
+
+        let handle = get_runtime()?;
+
+        block_in_place(|| handle.block_on(bootstrap_ech_impl(vpn, config)))
+    })
+}
+
+async fn bootstrap_ech_impl(vpn: SocketAddr, mut config: ConfigState) -> Result<Vec<u8>> {
+    config.enable_ech = true;
+    let tls = TlsOptions::new(&config)?;
+    let socket_pool = make_socket_pool(None)?;
+
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| EnsError::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+
+    let (client, _receiver) =
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
+
+    Ok(client.bootstrap_ech(vpn.ip(), vpn.port(), &tls).await?)
 }
 
 fn make_socket_protector(
@@ -833,6 +886,7 @@ mod tests {
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
     use rstest::rstest;
+    use std::net::Ipv4Addr;
     use std::sync::Once;
     use std::time::Instant;
     use telio_crypto::SecretKey;
@@ -893,6 +947,8 @@ mod tests {
     const INVALID_TLS_DOMAIN_REASON: &str = "tls_domain is incorrect";
     const STUB_CERTIFICATE_DOMAIN: &str = "localhost";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+    const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(10);
+    const BOOTSTRAP_ECH_TIMEOUT_SECONDS: u32 = 1;
 
     const OLD_SERVER_INFO: &str = "bar";
     const NEW_SERVER_INFO: &str = "baz";
@@ -982,6 +1038,46 @@ mod tests {
         assert!(reason.contains("not valid for name"));
         assert_eq!(server_config.streams(), 0);
         assert!(callback.notifications.lock().is_empty());
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_with_invalid_tls_domain_returns_invalid_input() {
+        run_init();
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let vpn = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let bootstrapped = bootstrap_ech(vpn, &Arc::new(config));
+
+        assert_matches!(bootstrapped, Err(EnsError::InvalidInput{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_against_silent_server_returns() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let vpn = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let mut accepted = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_bootstrap_ech_timeout(BOOTSTRAP_ECH_TIMEOUT_SECONDS);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(bootstrap_ech(vpn, &Arc::new(config)));
+        });
+
+        let bootstrapped = done_rx.recv_timeout(BOOTSTRAP_DEADLINE);
+        assert_matches!(bootstrapped, Ok(Err(_)));
     }
 
     #[test_log::test]
@@ -1846,13 +1942,6 @@ mod tests {
         );
     }
 
-    fn fast_backoff() -> Config {
-        let config = Config::new();
-        config.set_backoff_initial(BACKOFF_SECONDS);
-        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
-        config
-    }
-
     #[test_log::test]
     fn test_untrusted_certificate_on_connect_ends_the_session() {
         run_init();
@@ -1892,12 +1981,16 @@ mod tests {
         let relay = runtime.block_on(TcpRelay::spawn(trusted.port));
 
         let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
         let _connection = connect_to_port(
             relay.port,
             &trusted,
             test_auth(&trusted),
             callback.clone(),
-            fast_backoff(),
+            config,
         )
         .unwrap();
 

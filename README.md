@@ -15,6 +15,7 @@ The version in use is pinned in `crates/ens-core/Cargo.toml`.
 - `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
 - `cli` (`ens-cli`) - tool for manual testing
 - `tests/go` - integration tests for the generated go bindings
+- `doc/integrating_libens.md` - integration guide for app developers
 
 ## Building
 

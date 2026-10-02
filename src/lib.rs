@@ -8,6 +8,12 @@ use std::net::SocketAddr;
 
 pub use ens_core::*;
 
+#[cfg(doc)]
+pub mod integration_guide {
+    #![doc = include_str!("../doc/integrating_libens.md")]
+    #![doc = include_str!("../doc/multi-code.html")]
+}
+
 uniffi::include_scaffolding!("ens");
 
 impl UniffiCustomTypeConverter for SocketAddr {

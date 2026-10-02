@@ -3,7 +3,7 @@
 # Integrating libens
 
 For NordVPN app developers. Apps use libens only through the bindings
-generated from [`ens.udl`](../ens.udl):
+generated from [`ens.udl`](https://github.com/NordSecurity/libens/blob/main/ens.udl):
 
 | Language | Bindings                             | Import                                              |
 |----------|--------------------------------------|-----------------------------------------------------|

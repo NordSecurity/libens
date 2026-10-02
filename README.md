@@ -26,6 +26,17 @@ cargo build --all
 cargo build --release --lib   # only the shared library
 ```
 
+## Docs
+
+The integration guide is rendered into rustdoc, with a language picker for the
+code examples:
+
+```sh
+cargo doc --no-deps --package libens
+```
+
+Output: `target/doc/ens/integration_guide/index.html`.
+
 ## CI
 
 Every push builds all platforms via `ci/build.py`, which wraps the

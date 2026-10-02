@@ -1,0 +1,48 @@
+apply plugin: 'com.android.library'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.8.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+android {
+    namespace = 'com.nordsec.ens.test'
+    compileSdkVersion 34
+
+    defaultConfig {
+        minSdkVersion 26
+        targetSdkVersion 34
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // The stub is executed as a child process, so it has to be unpacked onto
+    // the filesystem instead of being loaded straight from the apk.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    androidTestImplementation "net.java.dev.jna:jna:5.17.0@aar"
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+}

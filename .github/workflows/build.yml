@@ -99,6 +99,44 @@ jobs:
           CGO_LDFLAGS: -L${{ github.workspace }}/target/debug -lens -Wl,-rpath,${{ github.workspace }}/target/debug
         run: go test -v ./...
 
+  test-cs-bindings:
+    needs: [bindings, build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "35.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: test-cs-bindings
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "10.0"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libens-bindings
+          path: libens-bindings
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libens-linux-x86_64
+          path: libens-linux
+      - name: Copy the generated bindings into the test project
+        run: |
+          mkdir -p tests/cs/bindings
+          cp libens-bindings/windows/cs/ens.cs tests/cs/bindings/
+      - name: Build the stub
+        run: cargo build --package ens-stub
+      - name: Run the tests
+        working-directory: tests/cs
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/libens-linux
+          ENS_STUB: ${{ github.workspace }}/target/debug/ens-stub
+        run: dotnet test
+
   build-linux:
     needs: compute-tag
     strategy:

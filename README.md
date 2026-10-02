@@ -37,6 +37,9 @@ cargo doc --no-deps --package libens
 
 Output: `target/doc/ens/integration_guide/index.html`.
 
+The `gh-pages` workflow, started manually, publishes the docs from `main` to
+GitHub Pages, replacing the previous version.
+
 ## CI
 
 Every push builds all platforms via `ci/build.py`, which wraps the

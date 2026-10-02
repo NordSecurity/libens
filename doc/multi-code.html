@@ -1,0 +1,91 @@
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/purecss@3.0.0/build/pure-min.css" integrity="sha384-X38yfunGUhNzHpBaEBsWLO+A0HDYOQi8ufWDkZ0k9e0eXz/tH3II7uKZ9msv++Ls" crossorigin="anonymous">
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" integrity="sha512-tN7Ec6zAFaVSG3TpNAKtk4DOHNpSwKHxxrsiw4GHKESGPs5njn/0sMCUMl2svV4wo4BK/rCP7juYz+zx+l6oeQ==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js" integrity="sha512-7Z9J3l1+EYfeaPKcGXu3MS/7T+w19WtKQY/n+xzmw4hZhJ9tyYmcUS+4QqAlzhicE5LAfMQSF3iFTK9bQdTxXg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js" integrity="sha512-SkmBfuA2hqjzEVpmnMt/LINrjop3GKWqsuLSSB3e7iBmYK7JuWw4ldmmxwD9mdm2IRTTi0OxSAfEGvgEi0i2Kw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+
+<script>
+class MultiCodeSelect extends HTMLElement {
+  static langs = ['go', 'swift', 'cs', 'kotlin'];
+  static active = 'go';
+  static tracked = [];
+  
+  static update(to) {
+    MultiCodeSelect.active = to;
+    MultiCodeSelect.tracked.forEach(s => s.render())
+  }
+
+  constructor() {
+    super();
+    
+    MultiCodeSelect.tracked.push(this);
+  }
+
+  connectedCallback() {
+      this.render();
+  }
+
+  render() {
+    this.innerHTML = `
+      <div class="pure-button-group" role="group" style="font-size: 85%">
+        ${MultiCodeSelect.langs.map(lang => {
+          const active = lang == MultiCodeSelect.active ? 'pure-button-active' : '';
+        
+          return `
+          <button class="pure-button ${active}" onclick="MultiCodeSelect.update('${lang}')">${lang}</button>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+}
+
+class MultiCode extends HTMLElement {
+    constructor() {
+      super();
+      MultiCodeSelect.tracked.push(this)
+    }
+
+    connectedCallback() {
+      this.hideNonActiveLangBlocks();
+    }
+
+    render() {
+      this.hideNonActiveLangBlocks();
+    }
+
+    hideNonActiveLangBlocks() {
+      const preElements = this.querySelectorAll('pre');
+      preElements.forEach((preElement) => {
+        const cls = Array.from(preElement.classList);
+        const lang = MultiCodeSelect.active;
+
+        if (cls.includes(lang) || cls.includes(`language-${lang}`)) {
+          preElement.parentNode.style.display = '';
+        } else {
+          preElement.parentNode.style.display = 'none';
+        }
+      });
+    }
+
+    findCodeBlock(element) {
+      if (element.tagName.toLowerCase() === 'code') {
+        return element;
+      }
+      for (let i = 0; i < element.children.length; i++) {
+        const codeBlock = this.findCodeBlock(element.children[i]);
+        if (codeBlock) {
+          return codeBlock;
+        }
+      }
+      return null;
+    }
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  customElements.define('multi-code', MultiCode);
+  customElements.define('multi-code-select', MultiCodeSelect);
+});
+
+</script>

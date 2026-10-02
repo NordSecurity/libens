@@ -15,6 +15,7 @@ The version in use is pinned in `crates/ens-core/Cargo.toml`.
 - `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
 - `cli` (`ens-cli`) - tool for manual testing
 - `tests/go` - integration tests for the generated go bindings
+- `doc/integrating_libens.md` - integration guide for app developers
 
 ## Building
 
@@ -24,6 +25,20 @@ Needs the `protoc` compiler, used by `llt-proto` to compile the wire format.
 cargo build --all
 cargo build --release --lib   # only the shared library
 ```
+
+## Docs
+
+The integration guide is rendered into rustdoc, with a language picker for the
+code examples:
+
+```sh
+cargo doc --no-deps --package libens
+```
+
+Output: `target/doc/ens/integration_guide/index.html`.
+
+The `gh-pages` workflow, started manually, publishes the docs from `main` to
+GitHub Pages, replacing the previous version.
 
 ## CI
 

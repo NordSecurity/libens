@@ -1775,9 +1775,6 @@ name = "libens"
 version = "0.0.1"
 dependencies = [
  "ens-core",
- "jni",
- "log",
- "rustls-platform-verifier",
  "uniffi",
  "winresource",
 ]

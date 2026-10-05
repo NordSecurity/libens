@@ -126,6 +126,26 @@ go test ./...
 
 `ENS_STUB` overrides the stub binary path.
 
+`tests/cs` drives the stub through the generated c# bindings. The generator
+emits `internal` types, so the bindings are compiled into the test assembly
+rather than referenced as a package. Linux only, against the released
+`libens.so`.
+
+```sh
+uniffi-bindgen-cs ./ens.udl --config uniffi.toml --out-dir dist/windows/cs
+mkdir -p tests/cs/bindings
+cp dist/windows/cs/ens.cs tests/cs/bindings/
+python3 ci/build.py build linux x86_64
+cargo build --package ens-stub
+```
+
+```sh
+cd tests/cs
+export LD_LIBRARY_PATH="$PWD/../../dist/linux/release/x86_64"
+export ENS_STUB="$PWD/../../target/debug/ens-stub"
+dotnet test
+```
+
 `tests/kotlin` drives the stub through the generated kotlin bindings, as android
 instrumented tests on an x86_64 emulator. The stub is cross compiled for android
 and shipped inside the test apk as a jni library, because android only executes

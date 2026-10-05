@@ -155,6 +155,32 @@ The library logs under the `libens` tag and the stub under `ens-stub`:
 adb logcat -d -s libens:V ens-stub:V
 ```
 
+`tests/swift` drives the stub through the generated swift bindings, linked
+against the same `libensFFI.xcframework` that is shipped to consumers. Macos
+only, and the xcframework covers every apple platform, so all of its slices
+have to be built first:
+
+```sh
+uniffi-bindgen generate ./ens.udl --language swift --config uniffi.toml --out-dir dist/apple/Sources
+for slice in "macos x86_64" "macos aarch64" "ios aarch64" "ios-sim aarch64" \
+             "ios-sim x86_64" "tvos aarch64" "tvos-sim aarch64" "tvos-sim x86_64"; do
+    python3 ci/build.py build $slice
+done
+python3 ci/build.py lipo
+python3 ci/build.py xcframework
+```
+
+The bindings and the xcframework are copied into the test package, which spawns
+the stub itself:
+
+```sh
+mkdir -p tests/swift/Sources/EnsSwift tests/swift/Frameworks
+cp dist/apple/Sources/ens.swift tests/swift/Sources/EnsSwift/
+cp -R dist/darwin/libensFFI.xcframework tests/swift/Frameworks/
+cargo build --package ens-stub
+ENS_STUB="$PWD/target/debug/ens-stub" swift test --package-path tests/swift
+```
+
 ## CLI
 
 `ens-cli` resolves servers and credentials through the NordVPN API, then opens

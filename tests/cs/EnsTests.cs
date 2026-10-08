@@ -14,6 +14,8 @@ public class EnsTests
     private const string MaintenanceInfo = "planned maintenance";
     private const string WrongPassword = "wrong";
     private const string ShutdownReason = "shutdown";
+    private const string AuthRejectionReason =
+        "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\"";
 
     [Fact]
     public void TestNotificationOverKeyAuthentication()
@@ -66,9 +68,7 @@ public class EnsTests
         using var connection = ConnectToStub(server, new Authentication.WithCredentials(
             new Credentials(server.Handshake.Username!, WrongPassword, CredentialsKind.OpenVpn)), callback);
 
-        var expected = $"'http://127.0.0.1:{server.Handshake.Port}' rejected the authentication";
-
-        Assert.Equal(expected, callback.WaitDisconnect());
+        Assert.Equal(AuthRejectionReason, callback.WaitDisconnect());
         Assert.Equal(0, callback.NotificationCount);
     }
 

@@ -10,6 +10,8 @@ final class EnsTests: XCTestCase {
     private static let maintenanceInfo = "planned maintenance"
     private static let wrongPassword = "wrong"
     private static let shutdownReason = "shutdown"
+    private static let authRejectionReason =
+        "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
     private static let callbackTimeout: TimeInterval = 10
 
     override func setUp() {
@@ -84,11 +86,9 @@ final class EnsTests: XCTestCase {
             server, .withCredentials(credentials: credentials), callback)
         defer { try? connection.shutdown() }
 
-        let expected = "'http://127.0.0.1:\(server.handshake.port)' rejected the authentication"
-
         wait(for: [callback.ended], timeout: EnsTests.callbackTimeout)
 
-        XCTAssertEqual(callback.disconnectReason, expected)
+        XCTAssertEqual(callback.disconnectReason, EnsTests.authRejectionReason)
         XCTAssertTrue(callback.notifications.isEmpty)
     }
 

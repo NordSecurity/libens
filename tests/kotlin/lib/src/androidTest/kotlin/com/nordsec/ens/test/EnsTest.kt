@@ -33,6 +33,8 @@ private const val PRIVATE_KEY_LEN = 32
 private const val SERVER_MAINTENANCE_CODE = 2
 private const val MAINTENANCE_INFO = "planned maintenance"
 private const val WRONG_PASSWORD = "wrong"
+private const val AUTH_REJECTION_REASON =
+    "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
 private const val SHUTDOWN_REASON = "shutdown"
 
 @RunWith(AndroidJUnit4::class)
@@ -124,9 +126,7 @@ class EnsTest {
 
             callback.awaitDisconnect()
 
-            val expected =
-                "'http://127.0.0.1:${server.handshake.port}' rejected the authentication"
-            assertEquals(expected, callback.disconnectReason)
+            assertEquals(AUTH_REJECTION_REASON, callback.disconnectReason)
             assertTrue(callback.notifications.isEmpty())
         } finally {
             connection?.shutdown()

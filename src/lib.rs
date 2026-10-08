@@ -14,7 +14,7 @@ impl UniffiCustomTypeConverter for SocketAddr {
     type Builtin = String;
 
     fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
-        Ok(val.parse().map_err(|e| EnsError::InternalError {
+        Ok(val.parse().map_err(|e| EnsError::InvalidInput {
             reason: format!("Invalid IpAddr address: '{val}': {e}"),
         })?)
     }

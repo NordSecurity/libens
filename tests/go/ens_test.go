@@ -18,7 +18,7 @@ const (
 	maintenanceInfo       = "planned maintenance"
 	shutdownReason        = "shutdown"
 	wrongPassword         = "wrong"
-	authRejectionReason   = "'http://127.0.0.1:%d' rejected the authentication"
+	authRejectionReason   = "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
 )
 
 type recorder struct {
@@ -123,7 +123,7 @@ func TestAuthenticationRejection(t *testing.T) {
 	}, callback)
 	defer connection.Destroy()
 
-	assertDisconnect(t, callback, fmt.Sprintf(authRejectionReason, server.handshake.Port))
+	assertDisconnect(t, callback, authRejectionReason)
 
 	if len(callback.notifications) != 0 {
 		t.Errorf("A rejected client received %d notifications", len(callback.notifications))
@@ -185,7 +185,12 @@ func assertDisconnect(t *testing.T, callback *recorder, expected string) {
 	t.Helper()
 
 	reason := callback.waitDisconnect(t)
-	if reason == nil || *reason != expected {
-		t.Errorf("Expected %q, got %v", expected, reason)
+	if reason == nil {
+		t.Errorf("Expected %q, got no reason", expected)
+		return
+	}
+
+	if *reason != expected {
+		t.Errorf("Expected %q, got %q", expected, *reason)
 	}
 }

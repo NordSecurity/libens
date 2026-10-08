@@ -51,7 +51,7 @@ To collect merged coverage from unit and integration tests into
 `target/llvm-cov/html/index.html`:
 
 ```sh
-cargo llvm-cov --all --all-features --exclude ens-cli --exclude ens-stub --html
+cargo llvm-cov --all --all-features --exclude ens-cli --exclude ens-stub --ignore-filename-regex ens-core/src/test_support --html
 ```
 
 To run lints:

@@ -46,6 +46,9 @@ interface EnsError {
 
     /// Other, unspecified error
     UnknownError(string reason);
+
+    /// An argument passed to the library is invalid.
+    InvalidInput(string reason);
 };
 
 /// Classification of a connection-level error notification received from
@@ -192,8 +195,10 @@ callback interface ProtectCallback {
     void protect(i32 socket_fd);
 };
 
+/// Settings for `connect`. `connect` copies them, so changes apply only to
+/// connections created afterwards.
 interface Config {
-    constructor();  
+    constructor();
     
     /// Capacity of the internal queue holding error notifications before they
     /// are passed to the `ErrorNotificationCallback`. Must be non zero.
@@ -204,6 +209,22 @@ interface Config {
     /// post quantum X25519MLKEM768 key exchange.
     /// [default true]
     void set_allow_only_pq(boolean allow_only_pq);
+
+    /// Server name sent as TLS SNI. The server certificate must be valid for
+    /// it. When set to null, no SNI is sent and the certificate must be valid
+    /// for the server IP.
+    /// [default null]
+    void set_tls_domain(string? tls_domain);
+
+    /// Enables Encrypted Client Hello. Each connection first offers ECH with a
+    /// throwaway key, the server rejects it and returns its ECH configuration,
+    /// and the client reconnects with it (`tls_domain` becomes the inner
+    /// SNI). If the server returns no usable ECH configuration, the session
+    /// ends instead of falling back to plain TLS. Without `tls_domain` there
+    /// is no hostname to hide, so ECH gives almost no privacy: the server is
+    /// identified by its IP, which any observer sees.
+    /// [default false]
+    void set_enable_ech_bootstrap(boolean enable_ech);
 
     /// DER encoded root certificate used to verify the ENS server instead of
     /// the one built into the library. Intended for testing.
@@ -239,6 +260,11 @@ interface Config {
     /// 0 resets it back to the default.
     /// [default 20s]
     void set_keepalive_timeout(u32? seconds);
+
+    /// Upper limit for the ECH bootstrap, in seconds. Setting it to 0 resets it
+    /// back to the default.
+    /// [default 30s]
+    void set_bootstrap_ech_timeout(u32 seconds);
 };
 
 namespace ens {

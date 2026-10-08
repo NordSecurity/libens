@@ -1,4 +1,4 @@
-#[path = "../src/test_support.rs"]
+#[path = "../src/test_support/mod.rs"]
 mod test_support;
 
 use ens_core::{set_log_callback, LogLevel};

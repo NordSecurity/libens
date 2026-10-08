@@ -1,4 +1,4 @@
-#[path = "../src/test_support.rs"]
+#[path = "../src/test_support/mod.rs"]
 mod test_support;
 
 use std::sync::Arc;

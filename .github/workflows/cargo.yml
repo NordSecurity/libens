@@ -10,9 +10,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_LOG: debug
   NIGHTLY_VERSION: "nightly-2025-12-01"
   COVERAGE_DIR: coverage
-  COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub
+  COVERAGE_ARGS: --all --all-features --exclude ens-cli --exclude ens-stub --ignore-filename-regex ens-core/src/test_support
+  ECH_STUB_DIR: crates/ens-core/tests/echstub
 
 permissions:
   contents: read
@@ -101,12 +103,19 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
+          cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: llvm-cov-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo install --locked cargo-llvm-cov@0.8.7
+      - run: cargo install --locked cargo-llvm-cov@0.9.1
       - name: Compute coverage from unit and integration tests
         run: cargo llvm-cov ${{ env.COVERAGE_ARGS }} --html --output-dir ${{ env.COVERAGE_DIR }} -- --test-threads 30
       - name: Print coverage summary
@@ -146,12 +155,19 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
+          cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --all --all-features -- --test-threads 30
 
   cargo-test-release:
     name: cargo test (release)
@@ -164,12 +180,19 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
+          cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: test-release-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --all
-      - run: cargo test --release --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --release --all --all-features -- --test-threads 30
 
   cargo-test-windows:
     name: cargo test (windows)
@@ -177,6 +200,13 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ env.ECH_STUB_DIR }}/go.mod
+          cache: false
+      - name: Warm up Go build cache
+        run: go build -buildvcs=false -o ${{ runner.temp }}/echstub .
+        working-directory: ${{ env.ECH_STUB_DIR }}
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -187,4 +217,4 @@ jobs:
           key: test-windows
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --all
-      - run: cargo test --all --all-features -- --nocapture --test-threads 30
+      - run: cargo test --all --all-features -- --test-threads 30

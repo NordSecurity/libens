@@ -44,8 +44,8 @@ pub use telio_utils::{Hidden, HiddenBytes, HiddenString};
 
 use crate::{
     client::{
-        ErrorNotificationService, KeepaliveConfig, DEFAULT_KEEPALIVE_INTERVAL,
-        DEFAULT_KEEPALIVE_TIMEOUT,
+        ErrorNotificationService, KeepaliveConfig, TlsOptions, DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
+        DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIMEOUT,
     },
     logging::LogCallbackHolder,
     panics::{catch_panic, catch_panic_message, catch_panic_result},
@@ -100,6 +100,8 @@ pub enum EnsError {
     AlreadyInitialized,
     #[error("Unknown error: {reason}")]
     UnknownError { reason: String },
+    #[error("Invalid input: {reason}")]
+    InvalidInput { reason: String },
 }
 
 impl From<client::Error> for EnsError {
@@ -123,11 +125,23 @@ impl From<client::Error> for EnsError {
             client::Error::InvalidMetadata(invalid_metadata_value) => Self::InternalError {
                 reason: format!("Invalid grpc metadata value: {invalid_metadata_value}"),
             },
-            client::Error::InvalidKey { reason } => Self::UnknownError { reason },
+            client::Error::InvalidKey { reason } | client::Error::InvalidCredentials { reason } => {
+                Self::InvalidInput { reason }
+            }
             client::Error::Internal { reason } => Self::InternalError { reason },
             untrusted @ client::Error::UntrustedCertificate { .. } => Self::TransportError {
                 reason: untrusted.to_string(),
             },
+            client::Error::EchBootstrappingFailed { source } => Self::TransportError {
+                reason: format!("ECH bootstrap failed: {source:?}"),
+            },
+            rejected @ client::Error::EchBootstrappingRejected => {
+                // NOTE: this should never happen, the ECH offer rejection should
+                // be exposed as a disconnect
+                Self::InternalError {
+                    reason: rejected.to_string(),
+                }
+            }
         }
     }
 }
@@ -194,7 +208,7 @@ pub fn init(app_version: String) -> Result<()> {
             return Err(EnsError::AlreadyInitialized);
         }
 
-        let user_agent = build_user_agent(&app_version).map_err(|e| EnsError::UnknownError {
+        let user_agent = build_user_agent(&app_version).map_err(|e| EnsError::InvalidInput {
             reason: format!("incorrect user-agent: {e}"),
         })?;
 
@@ -353,7 +367,7 @@ pub struct Credentials {
 impl Credentials {
     fn validate(&self) -> std::result::Result<(), client::Error> {
         if self.username.contains(':') {
-            return Err(client::Error::Internal {
+            return Err(client::Error::InvalidCredentials {
                 reason: "in a http basic auth, username can't contain ':'".to_owned(),
             });
         }
@@ -409,9 +423,12 @@ pub trait ProtectCallback: Send + Sync {
 struct ConfigState {
     buffer_size: usize,
     allow_only_pq: bool,
+    tls_domain: Option<String>,
+    enable_ech: bool,
     root_certificate_override: Option<Vec<u8>>,
     backoff: ExponentialBackoffBounds,
     keepalive: KeepaliveConfig,
+    bootstrap_ech_timeout: Duration,
 }
 
 pub struct Config {
@@ -430,6 +447,8 @@ impl Config {
         let state = ConfigState {
             buffer_size: 5,
             allow_only_pq: true,
+            tls_domain: None,
+            enable_ech: false,
             root_certificate_override: None,
             backoff: ExponentialBackoffBounds {
                 initial: Duration::from_secs(2),
@@ -439,6 +458,7 @@ impl Config {
                 interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
                 timeout: Some(DEFAULT_KEEPALIVE_TIMEOUT),
             },
+            bootstrap_ech_timeout: DEFAULT_BOOTSTRAP_ECH_TIMEOUT,
         };
 
         Self {
@@ -452,6 +472,14 @@ impl Config {
 
     pub fn set_allow_only_pq(&self, allow_only_pq: bool) {
         self.state.lock().allow_only_pq = allow_only_pq;
+    }
+
+    pub fn set_tls_domain(&self, tls_domain: Option<String>) {
+        self.state.lock().tls_domain = tls_domain;
+    }
+
+    pub fn set_enable_ech_bootstrap(&self, enable_ech: bool) {
+        self.state.lock().enable_ech = enable_ech;
     }
 
     pub fn set_root_certificate_override(&self, root_certificate_override: Option<Vec<u8>>) {
@@ -472,6 +500,10 @@ impl Config {
 
     pub fn set_keepalive_timeout(&self, seconds: Option<u32>) {
         self.state.lock().keepalive.timeout = seconds.map(|s| Duration::from_secs(s.into()));
+    }
+
+    pub fn set_bootstrap_ech_timeout(&self, seconds: u32) {
+        self.state.lock().bootstrap_ech_timeout = Duration::from_secs(seconds.into());
     }
 }
 
@@ -518,6 +550,7 @@ async fn connect_impl(
     callback: Box<dyn ErrorNotificationCallback>,
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
+    let tls = TlsOptions::new(&config)?;
     let connection_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
     let callback = GuardedCallback::new(callback);
@@ -533,19 +566,8 @@ async fn connect_impl(
         .user_agent
         .clone();
 
-    let (mut client, mut receiver) = ErrorNotificationService::new(
-        config
-            .buffer_size
-            .try_into()
-            .map_err(|e| EnsError::UnknownError {
-                reason: format!("buffer_size has to be non zero: {e}"),
-            })?,
-        socket_pool,
-        config.allow_only_pq,
-        config.root_certificate_override,
-        config.keepalive,
-        user_agent,
-    );
+    let (mut client, mut receiver) =
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
 
     let backoff: ExponentialBackoff = ExponentialBackoff::new(config.backoff).unwrap_or_else(|e| {
         let ret = ExponentialBackoff::fallback();
@@ -554,8 +576,8 @@ async fn connect_impl(
     });
 
     client
-        .start_monitor_on_port(vpn.ip(), vpn.port(), authentication, backoff)
-        .await;
+        .start_monitor_on_port(vpn.ip(), vpn.port(), tls, authentication, backoff)
+        .await?;
 
     let state = Arc::new(Mutex::new(ConnectionState::Active(client)));
 
@@ -630,6 +652,37 @@ async fn connect_impl(
         event_processing_task: Mutex::new(Some(event_processing_task)),
         vpn,
     }))
+}
+
+// Runs only the ECH bootstrap against `vpn`, ignoring the ECH setting in `config`
+pub fn bootstrap_ech(vpn: SocketAddr, config: &Arc<Config>) -> Result<Vec<u8>> {
+    catch_panic_result(|| {
+        let config = config.state.lock().clone();
+
+        let handle = get_runtime()?;
+
+        block_in_place(|| handle.block_on(bootstrap_ech_impl(vpn, config)))
+    })
+}
+
+async fn bootstrap_ech_impl(vpn: SocketAddr, mut config: ConfigState) -> Result<Vec<u8>> {
+    config.enable_ech = true;
+    let tls = TlsOptions::new(&config)?;
+    let socket_pool = make_socket_pool(None)?;
+
+    let user_agent = STATE
+        .lock()
+        .as_ref()
+        .ok_or_else(|| EnsError::NotInitialized {
+            reason: "global state not initialized".to_owned(),
+        })?
+        .user_agent
+        .clone();
+
+    let (client, _receiver) =
+        ErrorNotificationService::try_from_config(&config, socket_pool, user_agent)?;
+
+    Ok(client.bootstrap_ech(vpn.ip(), vpn.port(), &tls).await?)
 }
 
 fn make_socket_protector(
@@ -833,6 +886,7 @@ mod tests {
     use llt_proto::ens::Error as EnsProtoError;
     use log::info;
     use rstest::rstest;
+    use std::net::Ipv4Addr;
     use std::sync::Once;
     use std::time::Instant;
     use telio_crypto::SecretKey;
@@ -888,7 +942,13 @@ mod tests {
 
     const MAINTENANCE_INFO: &str = "planned maintenance";
     const REJECTION_MESSAGE: &str = "token revoked";
+    const TLS_DOMAIN: &str = "secret.example.com";
+    const INVALID_TLS_DOMAIN: &str = "not a name";
+    const INVALID_TLS_DOMAIN_REASON: &str = "tls_domain is incorrect";
+    const STUB_CERTIFICATE_DOMAIN: &str = "localhost";
     const RECONNECT_WINDOW: Duration = Duration::from_secs(3);
+    const BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(10);
+    const BOOTSTRAP_ECH_TIMEOUT_SECONDS: u32 = 1;
 
     const OLD_SERVER_INFO: &str = "bar";
     const NEW_SERVER_INFO: &str = "baz";
@@ -908,6 +968,116 @@ mod tests {
         ids.iter()
             .filter(|id| state.active_connections.contains_key(*id))
             .count()
+    }
+
+    #[test_log::test]
+    fn connect_with_invalid_tls_domain_returns_invalid_input() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let upstream = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let connection = connect_local(
+            upstream.port,
+            test_auth(&upstream),
+            RecordedCallback::default(),
+            config,
+        );
+
+        assert_matches!(connection, Err(EnsError::InvalidInput{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+        assert_eq!(upstream.streams(), 0);
+    }
+
+    #[test_log::test]
+    fn connect_with_tls_domain_in_certificate() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_tls_domain(Some(STUB_CERTIFICATE_DOMAIN.to_owned()));
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        server_config.send_blocking(maintenance(MAINTENANCE_INFO));
+        wait_for(|| !callback.notifications.lock().is_empty());
+
+        assert_eq!(callback.infos(), vec![Some(MAINTENANCE_INFO.to_owned())]);
+        assert!(callback.disconnects.lock().is_empty());
+    }
+
+    #[test_log::test]
+    fn connect_with_tls_domain_not_in_certificate_ends_the_session() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        let _connection = connect_to_test_server_with_config(
+            &server_config,
+            test_auth(&server_config),
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        let reason = wait_for_disconnect_reason(&callback).unwrap();
+        assert!(reason.contains("untrusted certificate"));
+        assert!(reason.contains("not valid for name"));
+        assert_eq!(server_config.streams(), 0);
+        assert!(callback.notifications.lock().is_empty());
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_with_invalid_tls_domain_returns_invalid_input() {
+        run_init();
+
+        let config = Config::new();
+        config.set_tls_domain(Some(INVALID_TLS_DOMAIN.to_owned()));
+        let vpn = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let bootstrapped = bootstrap_ech(vpn, &Arc::new(config));
+
+        assert_matches!(bootstrapped, Err(EnsError::InvalidInput{ reason }) if reason.contains(INVALID_TLS_DOMAIN_REASON));
+    }
+
+    #[test_log::test]
+    fn bootstrap_ech_against_silent_server_returns() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let vpn = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let mut accepted = vec![];
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let config = Config::new();
+        config.set_tls_domain(Some(TLS_DOMAIN.to_owned()));
+        config.set_bootstrap_ech_timeout(BOOTSTRAP_ECH_TIMEOUT_SECONDS);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(bootstrap_ech(vpn, &Arc::new(config)));
+        });
+
+        let bootstrapped = done_rx.recv_timeout(BOOTSTRAP_DEADLINE);
+        assert_matches!(bootstrapped, Ok(Err(_)));
     }
 
     #[test_log::test]
@@ -1141,7 +1311,7 @@ mod tests {
             callback.clone(),
         );
 
-        assert_matches!(connection, Err(EnsError::UnknownError { reason }) if reason.contains("key conversion failed"));
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("key conversion failed"));
     }
 
     #[test_log::test]
@@ -1169,7 +1339,27 @@ mod tests {
             callback.clone(),
         );
 
-        assert_matches!(connection, Err(EnsError::InternalError { reason }) if reason.contains("':'"));
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("':'"));
+    }
+
+    #[test_log::test]
+    fn test_connect_fails_when_buffer_size_is_zero() {
+        run_init();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_server());
+
+        let config = Config::new();
+        config.set_buffer_size(0);
+
+        let connection = connect_local(
+            server_config.port,
+            test_auth(&server_config),
+            RecordedCallback::default(),
+            config,
+        );
+
+        assert_matches!(connection, Err(EnsError::InvalidInput { reason }) if reason.contains("buffer_size"));
     }
 
     #[rstest]
@@ -1185,7 +1375,6 @@ mod tests {
             global_user_agent(),
             make_auth(),
         ));
-        let vpn_port = server_config.port;
 
         let wrong_auth = make_auth().to_authentication(&server_config.public_key);
 
@@ -1195,12 +1384,9 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
 
-        assert_eq!(
-            reason,
-            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
-        );
+        assert!( reason.starts_with("persistent error code: 'The request does not have valid authentication credentials', message:") );
         assert!(callback.notifications.lock().is_empty());
-        assert_eq!(0, tracked_connections(&[connection.id]));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
@@ -1217,7 +1403,6 @@ mod tests {
             global_user_agent(),
             auth.clone(),
         ));
-        let vpn_port = server_config.port;
 
         let wrong_vpn_public_key = SecretKey::gen().public();
 
@@ -1233,10 +1418,10 @@ mod tests {
 
         assert_eq!(
             reason,
-            format!("'http://127.0.0.1:{vpn_port}' rejected the authentication")
+            "persistent error code: 'The request does not have valid authentication credentials', message: \"Challenge not authenticated\""
         );
         assert!(callback.notifications.lock().is_empty());
-        assert_eq!(0, tracked_connections(&[connection.id]));
+        wait_for(|| tracked_connections(&[connection.id]) == 0);
     }
 
     #[test_log::test]
@@ -1428,7 +1613,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
         assert_eq!(reason, closed_reason(vpn_port));
-        assert_eq!(0, tracked_connections(&[id]));
+        wait_for(|| tracked_connections(&[id]) == 0);
 
         drop(connection);
 
@@ -1641,13 +1826,12 @@ mod tests {
         server_config.send_blocking(Command::Error(Status::new(code, REJECTION_MESSAGE)));
         wait_for(|| !callback.disconnects.lock().is_empty());
 
-        let vpn_port = server_config.port;
-        assert_eq!(
-            *callback.disconnects.lock(),
-            vec![Some(format!(
-                "'http://127.0.0.1:{vpn_port}' rejected the authentication"
-            ))]
-        );
+        let expected = match code {
+            Code::PermissionDenied => "persistent error code: 'The caller does not have permission to execute the specified operation', message: \"token revoked\"".to_owned(),
+            Code::Unauthenticated =>  "persistent error code: 'The request does not have valid authentication credentials', message: \"token revoked\"".to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(*callback.disconnects.lock(), vec![Some(expected)]);
 
         std::thread::sleep(RECONNECT_WINDOW);
         assert_eq!(server_config.streams(), 1);
@@ -1758,13 +1942,6 @@ mod tests {
         );
     }
 
-    fn fast_backoff() -> Config {
-        let config = Config::new();
-        config.set_backoff_initial(BACKOFF_SECONDS);
-        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
-        config
-    }
-
     #[test_log::test]
     fn test_untrusted_certificate_on_connect_ends_the_session() {
         run_init();
@@ -1804,12 +1981,16 @@ mod tests {
         let relay = runtime.block_on(TcpRelay::spawn(trusted.port));
 
         let callback = RecordedCallback::default();
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
         let _connection = connect_to_port(
             relay.port,
             &trusted,
             test_auth(&trusted),
             callback.clone(),
-            fast_backoff(),
+            config,
         )
         .unwrap();
 

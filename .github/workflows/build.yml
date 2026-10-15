@@ -184,7 +184,7 @@ jobs:
           script: gradle -p tests/kotlin :lib:connectedDebugAndroidTest --info; RC=$?; adb logcat -d -s libens:V ens-stub:V; exit $RC
 
   test-swift-bindings:
-    needs: package-xcframework
+    needs: [bindings, build-apple]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -199,13 +199,19 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: libens-apple
+          name: libens-apple-macos-aarch64
+          path: libens-macos
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libens-bindings
+          path: dist
       - name: Assemble the test package
         run: |
-          unzip -q libens-apple.zip
-          mkdir -p tests/swift/Sources/EnsSwift tests/swift/Frameworks
+          mkdir -p tests/swift/Sources/EnsSwift tests/swift/Sources/ensFFI
           cp dist/apple/Sources/ens.swift tests/swift/Sources/EnsSwift/
-          cp -R dist/darwin/libensFFI.xcframework tests/swift/Frameworks/
+          cp dist/apple/Sources/ensFFI.h tests/swift/Sources/ensFFI/
+          cp dist/apple/Sources/ensFFI.modulemap tests/swift/Sources/ensFFI/module.modulemap
+          install_name_tool -id @rpath/libens.dylib libens-macos/macos/release/aarch64/libens.dylib
       - name: Build the stub
         run: cargo build --package ens-stub
       - name: Run the tests
@@ -213,6 +219,7 @@ jobs:
         working-directory: tests/swift
         env:
           ENS_STUB: ${{ github.workspace }}/target/debug/ens-stub
+          LIBENS_LIB_DIR: ${{ github.workspace }}/libens-macos/macos/release/aarch64
 
   build-linux:
     needs: compute-tag
@@ -450,36 +457,8 @@ jobs:
           path: dist/darwin
           if-no-files-found: error
 
-  package-xcframework:
-    needs: [bindings, build-apple]
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: libens-apple-*
-          merge-multiple: true
-          path: dist/darwin
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: libens-bindings
-          path: dist
-      - name: Create fat binaries
-        run: python3 ci/build.py lipo
-      - name: Create xcframework
-        run: python3 ci/build.py xcframework
-      - name: Archive xcframework
-        run: zip -ry libens-apple.zip dist/darwin/libensFFI.xcframework dist/apple
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: libens-apple
-          path: libens-apple.zip
-          if-no-files-found: error
-
   trigger-gitlab:
-    needs: [compute-tag, bindings, build-linux, build-windows, build-android, package-xcframework]
+    needs: [compute-tag, bindings, build-linux, build-windows, build-android, build-apple]
     if: github.event_name == 'push'
     permissions:
       contents: read

@@ -9,6 +9,10 @@ public sealed class LibraryFixture : IDisposable
 {
     private const string AppVersion = "cs-tests";
 
+    private static int logCount;
+
+    public static int LogCount => Volatile.Read(ref logCount);
+
     public LibraryFixture()
     {
         EnsMethods.SetLogCallback(LogLevel.Debug, new ConsoleLogCallback());
@@ -19,8 +23,11 @@ public sealed class LibraryFixture : IDisposable
 
     private sealed class ConsoleLogCallback : LogCallback
     {
-        public void Log(LogLevel logLevel, string message) =>
+        public void Log(LogLevel logLevel, string message)
+        {
+            Interlocked.Increment(ref logCount);
             Console.WriteLine($"[libens:{logLevel}] {message}");
+        }
     }
 }
 

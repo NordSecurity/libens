@@ -7,6 +7,12 @@ import XCTest
 final class LibraryFixture: NSObject, XCTestObservation {
     private static let appVersion = "swift-tests"
 
+    static let logged: XCTestExpectation = {
+        let expectation = XCTestExpectation(description: "log")
+        expectation.assertForOverFulfill = false
+        return expectation
+    }()
+
     private static let started: Void = {
         let fixture = LibraryFixture()
         XCTestObservationCenter.shared.addTestObserver(fixture)
@@ -26,6 +32,7 @@ final class LibraryFixture: NSObject, XCTestObservation {
 
 private final class ConsoleLogCallback: LogCallback {
     func log(logLevel: LogLevel, message: String) {
+        LibraryFixture.logged.fulfill()
         print("[libens:\(logLevel)] \(message)")
     }
 }

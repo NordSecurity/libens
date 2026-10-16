@@ -2,6 +2,7 @@ package ens_test
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -11,15 +12,38 @@ import (
 )
 
 const (
-	appVersion            = "go-tests"
-	privateKeyLen         = 32
-	callbackTimeout       = 10 * time.Second
-	serverMaintenanceCode = 2
-	maintenanceInfo       = "planned maintenance"
-	shutdownReason        = "shutdown"
-	wrongPassword         = "wrong"
-	authRejectionReason   = "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
+	appVersion                 = "go-tests"
+	privateKeyLen              = 32
+	callbackTimeout            = 10 * time.Second
+	connectionLimitReachedCode = 1
+	serverMaintenanceCode      = 2
+	unauthenticatedCode        = 3
+	supersededCode             = 4
+	unsupportedCipherCode      = 5
+	unknownCode                = 99
+	maintenanceInfo            = "planned maintenance"
+	malformedAddress           = "not-an-address"
+	shutdownReason             = "shutdown"
+	wrongPassword              = "wrong"
+	authRejectionReason        = "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
 )
+
+var logs = newLogRecorder()
+
+type logRecorder struct {
+	messages chan string
+}
+
+func newLogRecorder() *logRecorder {
+	return &logRecorder{messages: make(chan string, 1)}
+}
+
+func (l *logRecorder) Log(_ ens.LogLevel, message string) {
+	select {
+	case l.messages <- message:
+	default:
+	}
+}
 
 type recorder struct {
 	notifications chan ens.ConnectionErrorNotification
@@ -66,6 +90,11 @@ func (r *recorder) waitDisconnect(t *testing.T) *string {
 }
 
 func TestMain(m *testing.M) {
+	if err := ens.SetLogCallback(ens.LogLevelDebug, logs); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot set the log callback: %v\n", err)
+		os.Exit(1)
+	}
+
 	if err := ens.Init(appVersion); err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot initialize libens: %v\n", err)
 		os.Exit(1)
@@ -84,30 +113,69 @@ func TestMain(m *testing.M) {
 func TestNotificationOverKeyAuthentication(t *testing.T) {
 	server := startStub(t, nordLynxSchema)
 
-	privateKey := make([]byte, privateKeyLen)
-	if _, err := rand.Read(privateKey); err != nil {
-		t.Fatalf("Cannot generate a private key: %v", err)
-	}
-
-	receiveOneNotification(t, server, ens.AuthenticationWithKeys{
-		Keys: ens.Keys{
-			LocalPrivateKey: privateKey,
-			VpnPublicKey:    server.publicKey(t),
-			Kind:            ens.KeyKindNordLynx,
-		},
-	})
+	receiveOneNotification(t, server, keyAuthentication(t, server.publicKey(t)))
 }
 
 func TestNotificationOverPasswordAuthentication(t *testing.T) {
 	server := startStub(t, openVpnSchema)
 
-	receiveOneNotification(t, server, ens.AuthenticationWithCredentials{
-		Credentials: ens.Credentials{
-			Username: server.handshake.Username,
-			Password: server.handshake.Password,
-			Kind:     ens.CredentialsKindOpenVpn,
-		},
-	})
+	receiveOneNotification(t, server, credentialsAuthentication(server, ens.CredentialsKindOpenVpn))
+}
+
+func TestNotificationOverNordWhisperAuthentication(t *testing.T) {
+	server := startStub(t, nordWhisperSchema)
+
+	receiveOneNotification(t, server, credentialsAuthentication(server, ens.CredentialsKindNordWhisper))
+}
+
+func TestNotificationKinds(t *testing.T) {
+	server := startStub(t, nordLynxSchema)
+
+	expected := []struct {
+		code int32
+		kind ens.ConnectionErrorNotificationKind
+	}{
+		{connectionLimitReachedCode, ens.ConnectionErrorNotificationKindConnectionLimitReached{}},
+		{serverMaintenanceCode, ens.ConnectionErrorNotificationKindServerMaintenance{}},
+		{unauthenticatedCode, ens.ConnectionErrorNotificationKindUnauthenticated{}},
+		{supersededCode, ens.ConnectionErrorNotificationKindSuperseded{}},
+		{unsupportedCipherCode, ens.ConnectionErrorNotificationKindUnsupportedCipher{}},
+		{unknownCode, ens.ConnectionErrorNotificationKindUnknown{Kind: unknownCode}},
+	}
+
+	callback := newRecorder()
+	connection := connect(t, server, keyAuthentication(t, server.publicKey(t)), callback)
+	defer connection.Destroy()
+
+	for _, notification := range expected {
+		server.notify(t, notification.code, nil)
+
+		received := callback.waitNotification(t)
+		if received.Kind != notification.kind {
+			t.Errorf("Expected %#v, got %#v", notification.kind, received.Kind)
+		}
+	}
+}
+
+func TestMalformedAddress(t *testing.T) {
+	_, err := ens.Connect(
+		malformedAddress,
+		nil,
+		keyAuthentication(t, make([]byte, privateKeyLen)),
+		newRecorder(),
+		ens.NewConfig(),
+	)
+	if !errors.Is(err, ens.ErrEnsErrorInvalidInput) {
+		t.Errorf("Expected an invalid input error, got %v", err)
+	}
+}
+
+func TestLogCallback(t *testing.T) {
+	select {
+	case <-logs.messages:
+	default:
+		t.Fatal("No log message arrived")
+	}
 }
 
 func TestAuthenticationRejection(t *testing.T) {
@@ -164,7 +232,8 @@ func receiveOneNotification(t *testing.T, server *stub, authentication ens.Authe
 	connection := connect(t, server, authentication, callback)
 	defer connection.Destroy()
 
-	server.notify(t, serverMaintenanceCode, maintenanceInfo)
+	info := maintenanceInfo
+	server.notify(t, serverMaintenanceCode, &info)
 
 	notification := callback.waitNotification(t)
 	if _, ok := notification.Kind.(ens.ConnectionErrorNotificationKindServerMaintenance); !ok {
@@ -192,5 +261,32 @@ func assertDisconnect(t *testing.T, callback *recorder, expected string) {
 
 	if *reason != expected {
 		t.Errorf("Expected %q, got %q", expected, *reason)
+	}
+}
+
+func keyAuthentication(t *testing.T, vpnPublicKey []byte) ens.Authentication {
+	t.Helper()
+
+	privateKey := make([]byte, privateKeyLen)
+	if _, err := rand.Read(privateKey); err != nil {
+		t.Fatalf("Cannot generate a private key: %v", err)
+	}
+
+	return ens.AuthenticationWithKeys{
+		Keys: ens.Keys{
+			LocalPrivateKey: privateKey,
+			VpnPublicKey:    vpnPublicKey,
+			Kind:            ens.KeyKindNordLynx,
+		},
+	}
+}
+
+func credentialsAuthentication(server *stub, kind ens.CredentialsKind) ens.Authentication {
+	return ens.AuthenticationWithCredentials{
+		Credentials: ens.Credentials{
+			Username: server.handshake.Username,
+			Password: server.handshake.Password,
+			Kind:     kind,
+		},
 	}
 }

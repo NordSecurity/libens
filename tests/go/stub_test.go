@@ -12,16 +12,17 @@ import (
 )
 
 const (
-	nordLynxSchema = "nordlynx"
-	openVpnSchema  = "openvpn"
-	stubEnvVar     = "ENS_STUB"
-	notifyCommand  = "notification"
+	nordLynxSchema    = "nordlynx"
+	nordWhisperSchema = "nordwhisper"
+	openVpnSchema     = "openvpn"
+	stubEnvVar        = "ENS_STUB"
+	notifyCommand     = "notification"
 )
 
 type command struct {
-	Command        string `json:"command"`
-	Code           int32  `json:"code"`
-	AdditionalInfo string `json:"additional_info"`
+	Command        string  `json:"command"`
+	Code           int32   `json:"code"`
+	AdditionalInfo *string `json:"additional_info"`
 }
 
 type handshake struct {
@@ -68,7 +69,7 @@ func startStub(t *testing.T, schema string) *stub {
 	return &stub{handshake: readHandshake(t, stdout), stdin: stdin}
 }
 
-func (s *stub) notify(t *testing.T, code int32, additionalInfo string) {
+func (s *stub) notify(t *testing.T, code int32, additionalInfo *string) {
 	t.Helper()
 
 	encoded, err := json.Marshal(command{

@@ -2,6 +2,8 @@
 
 import PackageDescription
 
+let libDir = Context.environment["LIBENS_LIB_DIR"] ?? ""
+
 let package = Package(
     name: "EnsSwift",
     platforms: [
@@ -10,10 +12,13 @@ let package = Package(
     targets: [
         .target(
             name: "EnsSwift",
-            dependencies: ["ensFFI"]),
-        .binaryTarget(
+            dependencies: ["ensFFI"],
+            linkerSettings: [
+                .unsafeFlags(["-L", libDir, "-lens", "-Xlinker", "-rpath", "-Xlinker", libDir]),
+            ]),
+        .systemLibrary(
             name: "ensFFI",
-            path: "Frameworks/libensFFI.xcframework"),
+            path: "Sources/ensFFI"),
         .testTarget(
             name: "EnsTests",
             dependencies: ["EnsSwift"]),

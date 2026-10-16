@@ -8,9 +8,20 @@ final class NotificationRecorder: ErrorNotificationCallback {
     private(set) var notifications: [ConnectionErrorNotification] = []
     private(set) var disconnectReason: String?
 
+    private let received = DispatchSemaphore(value: 0)
+
+    init() {
+        notified.assertForOverFulfill = false
+    }
+
     func notify(notification: ConnectionErrorNotification) {
         notifications.append(notification)
         notified.fulfill()
+        received.signal()
+    }
+
+    func waitNotification(timeout: TimeInterval) -> Bool {
+        received.wait(timeout: .now() + timeout) == .success
     }
 
     func disconnected(reason: String?) {

@@ -8,9 +8,9 @@ publish = false
 authors = ["LLT TCP team"]
 
 [dependencies]
-telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b" }
-telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b" }
-telio-crypto = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b" }
+telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
+telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
+telio-crypto = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
 parking_lot = "0.12.5"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
@@ -48,5 +48,5 @@ rcgen = { version = "0.14.7", default-features = false, features = ["pem", "aws_
 rstest = { version = "0.26.1", default-features = false }
 test-log = "0.2.21"
 tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
-telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="e32fbd15ddfccb3a67c34f6bd1240fbd18791f4b", features = ["mockall"]  }
+telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785", features = ["mockall"]  }
 

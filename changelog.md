@@ -4,6 +4,7 @@
 ---
 
 * Fix RUSTSEC-2026-0382
+* Censor IP addresses printed in a debug form
 
 ---
 <br>

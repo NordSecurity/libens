@@ -264,7 +264,8 @@ val openVpn = Authentication.WithCredentials(
 it.
 
 Both run on a library thread. Don't block them, move all work to the app's own
-threads. An exception thrown from `notify` ends the session.
+threads. `notify` must not let any error escape. Doing so is a caller bug and
+may crash the process.
 
 <multi-code-select></multi-code-select>
 

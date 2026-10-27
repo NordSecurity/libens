@@ -1022,6 +1022,7 @@ pub mod tests {
     const BACKOFF: Duration = Duration::from_millis(100);
     const EVENT_DEADLINE: Duration = Duration::from_secs(10);
     const BOOTSTRAP_ECH_TIMEOUT: Duration = Duration::from_secs(1);
+    const KEEPALIVE_INTERVAL_SECONDS: u32 = 30;
 
     #[derive(Clone)]
     pub enum TestAuthConfig {
@@ -2070,6 +2071,30 @@ pub mod tests {
             Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::UnknownIssuer
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn service_takes_values_from_config() {
+        let config = crate::Config::new();
+        config.set_allow_only_pq(false);
+        config.set_keepalive_interval(Some(KEEPALIVE_INTERVAL_SECONDS));
+        config.set_keepalive_timeout(None);
+
+        let (service, _) = ErrorNotificationService::try_from_config(
+            &config.state.lock(),
+            make_socket_pool(),
+            TEST_USER_AGENT,
+        )
+        .unwrap();
+
+        assert!(!service.allow_only_pq);
+        assert_eq!(
+            service.keepalive,
+            KeepaliveConfig {
+                interval: Some(Duration::from_secs(KEEPALIVE_INTERVAL_SECONDS.into())),
+                timeout: None,
+            }
         );
     }
 }

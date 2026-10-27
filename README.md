@@ -15,6 +15,8 @@ The version in use is pinned in `crates/ens-core/Cargo.toml`.
 - `.` (`libens`) - `cdylib` wrapper, UniFFI scaffolding generated from `ens.udl`
 - `cli` (`ens-cli`) - tool for manual testing
 - `tests/go` - integration tests for the generated go bindings
+- `system-tests` - end to end tests in a natlab virtual network against the real ENS
+  service of a NordLynx server, nothing stubbed
 - `doc/integrating_libens.md` - integration guide for app developers
 
 ## Building
@@ -214,6 +216,46 @@ cp dist/apple/Sources/ens.swift tests/swift/Sources/EnsSwift/
 cp -R dist/darwin/libensFFI.xcframework tests/swift/Frameworks/
 cargo build --package ens-stub
 ENS_STUB="$PWD/target/debug/ens-stub" swift test --package-path tests/swift
+```
+
+### System tests
+
+`system-tests/` runs libens end to end in a
+[natlab](https://codehub.digitalarsenal.net/nord-projects/nordvpn/infra/llt/vpn/client/natlab)
+virtual network. Unlike the bindings tests, nothing is stubbed: the server is a
+NordLynx VM (`nlx-01`) running the real ENS service, and the clients are lab
+containers behind NAT. Each client runs `system-tests/remote/ens_remote.py`, a
+Pyro5 server driving libens through its python bindings. The lab is configured by
+`.natlab.yml`. Every GitLab `libens-release` pipeline triggers it.
+
+Linux x86_64 with `/dev/kvm` only. Needs `NATLAB_REGISTRY`, a `docker login` to
+it and a natlab checkout. Put `libens.so` and the bindings in an artifacts
+directory:
+
+```sh
+python3 ci/build.py build linux x86_64
+uniffi-bindgen generate ./ens.udl --language python --config uniffi.toml --out-dir dist/linux/python
+mkdir -p "$ARTIFACTS" && cp -R dist "$ARTIFACTS"
+```
+
+Then, from the natlab checkout:
+
+```sh
+uv run natlab service prepare --lab labs/base --consumer "$LIBENS" --artifacts "$ARTIFACTS" --project libens --state "$PWD/state.json"
+uv run natlab --state state.json start --build
+uv sync --project "$LIBENS/system-tests"
+uv run --project "$LIBENS/system-tests" --no-sync --with-editable . pytest "$LIBENS/system-tests" --lab-state state.json --lab-attach
+uv run natlab --state state.json down
+```
+
+To run the python lints:
+
+```sh
+cd system-tests
+uv sync
+uv run ruff check .
+uv run black --check .
+uv run mypy .
 ```
 
 ## CLI

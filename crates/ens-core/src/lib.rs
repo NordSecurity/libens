@@ -932,6 +932,7 @@ mod tests {
     }
 
     const MALFORMED_PRIVATE_KEY: &[u8] = &[0x01, 0x02, 0x03];
+    const TRACKED_ALLOCATION_SIZE: usize = 1024 * 1024;
 
     const BEFORE_OUTAGE: &str = "before the outage";
     const AFTER_OUTAGE: &str = "after the outage";
@@ -2007,5 +2008,17 @@ mod tests {
         assert_eq!(untrusted.streams(), 0);
         assert_eq!(trusted.streams(), 1);
         assert_eq!(callback.disconnects.lock().len(), 1);
+    }
+
+    #[test_log::test]
+    fn version_matches_crate() {
+        assert_eq!(get_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test_log::test]
+    fn memory_usage_tracks_allocations() {
+        let buffer = vec![0u8; TRACKED_ALLOCATION_SIZE];
+
+        assert!(get_memory_usage() >= buffer.len() as u64);
     }
 }

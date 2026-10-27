@@ -1,0 +1,13 @@
+version: 1
+lab: base
+tests: system-tests
+deps: system-tests
+mount: /libens
+services: [nlx-01, cone-client-01, cone-client-02]
+binaries:
+  - from: dist/linux/release/x86_64/libens.so
+    to: system-tests/remote/libens.so
+    mode: "0644"
+  - from: dist/linux/python/ens.py
+    to: system-tests/remote/ens.py
+    mode: "0644"

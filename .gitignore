@@ -18,3 +18,7 @@ target/
 /coverage
 
 dist/
+
+/system-tests/remote/ens.py
+/system-tests/remote/libens.so
+__pycache__/

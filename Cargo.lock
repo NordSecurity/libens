@@ -979,7 +979,6 @@ dependencies = [
  "tonic",
  "tower",
  "uuid",
- "x25519-dalek",
  "zeroize",
 ]
 

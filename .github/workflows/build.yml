@@ -229,7 +229,7 @@ jobs:
         arch: [x86_64, aarch64]
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/nordsecurity/build-linux-rust1.97.1:v8.0.0
+      image: ghcr.io/nordsecurity/build-linux-rust1.99.1:v8.3.0
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -352,7 +352,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64, i686, armv7]
     runs-on: ubuntu-24.04
-    container: ghcr.io/nordsecurity/build-android-rust1.89.0:v7.2.2
+    container: ghcr.io/nordsecurity/build-android-rust1.99.1:v7.4.0
     env:
       LIB_VERSION: ${{ needs.compute-tag.outputs.build_tag }}
     steps:
@@ -379,7 +379,7 @@ jobs:
   build-android-stub:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
-    container: ghcr.io/nordsecurity/build-android-rust1.89.0:v7.2.2
+    container: ghcr.io/nordsecurity/build-android-rust1.99.1:v7.4.0
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

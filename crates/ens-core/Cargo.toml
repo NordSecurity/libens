@@ -47,7 +47,7 @@ assert_matches = "1.5.0"
 bstr = { version = "1.13.1", default-features = false }
 ens-stub = { path = "../ens-stub" }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "aws_lc_rs"]}
-rstest = { version = "0.26.1", default-features = false }
+rstest = { version = "0.28.0", default-features = false }
 test-log = "0.2.21"
 tonic = { version = "0.14.9", features = ["tls-aws-lc"] }
 telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785", features = ["mockall"]  }

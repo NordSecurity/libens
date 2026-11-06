@@ -16,6 +16,8 @@ parking_lot = "0.12.5"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
 thiserror = { version = "2", default-features = false }
 log = { version = "0.4.35", default-features = false, features = ["std"] }
+# later libc versions make several Apple items available only for macOS, which breaks `nix` compilation for iOS and tvOS
+libc = "=0.2.189"
 built = { version = "0.8.1", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
 tonic = { version = "0.14.9", default-features = false }

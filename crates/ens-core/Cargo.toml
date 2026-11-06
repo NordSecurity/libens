@@ -11,23 +11,23 @@ authors = ["LLT TCP team"]
 telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
 telio-sockets = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
 telio-crypto = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785" }
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
 parking_lot = "0.12.5"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
 thiserror = { version = "2", default-features = false }
-log = { version = "0.4.34", default-features = false, features = ["std"] }
-built = { version = "0.8.0", default-features = false }
+log = { version = "0.4.35", default-features = false, features = ["std"] }
+built = { version = "0.8.1", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs"] }
-tonic = { version = "0.14.5", default-features = false }
+tonic = { version = "0.14.9", default-features = false }
 http = { version = "1.5.0", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false }
 base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8.7", default-features = false }
-hyper-util = { version = "0.1.20",  default-features = false, features = ["tokio"] }
-uuid = { version = "1.20.0",  default-features = false, features = ["v4"] }
+hyper-util = { version = "0.1.21",  default-features = false, features = ["tokio"] }
+uuid = { version = "1.29.0",  default-features = false, features = ["v4"] }
 tower = { version = "0.5.3", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
-zeroize = { version = "1.8.2",  default-features = false, features = ["zeroize_derive"] }
+zeroize = { version = "1.9.1",  default-features = false, features = ["zeroize_derive"] }
 x25519-dalek = { version = "2.0.1", default-features = false }
 crypto_box = { version = "0.9.1", default-features = false }
 hex = { version = "0.4.3", default-features = false }
@@ -38,15 +38,15 @@ rand = "0.9.5"
 empty-line-after-doc-comments = "allow"
 
 [build-dependencies]
-built = { version = "0.8.0", features = ["chrono", "git2"] }
+built = { version = "0.8.1", features = ["chrono", "git2"] }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
 bstr = { version = "1.13.1", default-features = false }
 ens-stub = { path = "../ens-stub" }
-rcgen = { version = "0.14.7", default-features = false, features = ["pem", "aws_lc_rs"]}
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "aws_lc_rs"]}
 rstest = { version = "0.26.1", default-features = false }
 test-log = "0.2.21"
-tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
+tonic = { version = "0.14.9", features = ["tls-aws-lc"] }
 telio-utils = { git = "https://github.com/NordSecurity/libtelio.git", rev="d65e452e6fc37ab2f5cc18ef72a40f50f9506785", features = ["mockall"]  }
 

@@ -16,7 +16,7 @@ env_logger = { version = "0.11.11", default-features = false }
 http = { version = "1.5.0", default-features = false }
 http-auth-basic = "0.3.7"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
-log = { version = "0.4.34", default-features = false, features = ["std"] }
+log = { version = "0.4.35", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
 rand = "0.9.5"
 rcgen = { version = "0.14.7", default-features = false, features = ["pem", "aws_lc_rs"] }

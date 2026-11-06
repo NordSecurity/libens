@@ -18,7 +18,7 @@ http-auth-basic = "0.3.7"
 llt-proto = { git = "https://github.com/NordSecurity/llt-proto.git", tag = "v2.0.0" }
 log = { version = "0.4.35", default-features = false, features = ["std"] }
 parking_lot = "0.12.5"
-rand = "0.9.5"
+rand = "0.10.3"
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "aws_lc_rs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

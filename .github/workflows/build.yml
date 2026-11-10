@@ -60,6 +60,7 @@ jobs:
           uniffi-bindgen generate ./ens.udl --language swift  --config uniffi.toml --out-dir dist/apple/Sources
           uniffi-bindgen-cs ./ens.udl --config uniffi.toml --out-dir dist/windows/cs
           uniffi-bindgen-go ./ens.udl --config uniffi.toml --out-dir dist/linux/go
+          uniffi-bindgen generate ./ens.udl --language python --config uniffi.toml --out-dir dist/linux/python
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: libens-bindings
@@ -68,6 +69,7 @@ jobs:
             dist/apple/Sources
             dist/windows/cs
             dist/linux/go
+            dist/linux/python
           if-no-files-found: error
 
   test-go-bindings:
@@ -470,7 +472,7 @@ jobs:
       trigger-token: ${{ secrets.CODEHUB_TOKEN }}
       project-id: ${{ secrets.CODEHUB_PROJECT_ID }}
     with:
-      triggered-ref: master
+      triggered-ref: LLT-7517_ens_integration_tests
       cancel-outdated-pipelines: ${{ github.ref_name != 'main' }}
       variables: |
         GITHUB_RUN_ID=${{ github.run_id }}

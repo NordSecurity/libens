@@ -357,11 +357,32 @@ impl CredentialsKind {
     }
 }
 
+pub struct ConnectionId(Uuid);
+
+impl ConnectionId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    #[must_use]
+    pub fn as_string(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct Credentials {
     pub username: HiddenString,
     pub password: HiddenString,
     pub kind: CredentialsKind,
+    pub connection_id: Arc<ConnectionId>,
 }
 
 impl Credentials {
@@ -532,10 +553,10 @@ pub fn connect(
 
         if let Ok(connection) = connection.as_ref() {
             if let Some(state) = STATE.lock().as_mut() {
-                let id = connection.id;
+                let handle_id = connection.handle_id;
                 state
                     .active_connections
-                    .insert(id, Arc::downgrade(connection));
+                    .insert(handle_id, Arc::downgrade(connection));
             }
         }
 
@@ -551,7 +572,7 @@ async fn connect_impl(
     config: ConfigState,
 ) -> Result<Arc<Connection>> {
     let tls = TlsOptions::new(&config)?;
-    let connection_id = Uuid::new_v4();
+    let handle_id = Uuid::new_v4();
     let authentication = authentication.try_into()?;
     let callback = GuardedCallback::new(callback);
     let protect = make_socket_protector(protect_cb);
@@ -587,7 +608,7 @@ async fn connect_impl(
     let callback_thread_id_clone = callback_thread_id.clone();
 
     let event_processing_task = tokio::task::spawn(async move {
-        let _active_connection = ActiveConnectionGuard(connection_id);
+        let _active_connection = ActiveConnectionGuard(handle_id);
         loop {
             match receiver.recv().await {
                 Some(client::Event::Notification {
@@ -646,7 +667,7 @@ async fn connect_impl(
     });
 
     Ok(Arc::new(Connection {
-        id: connection_id,
+        handle_id,
         state,
         callback_thread_id,
         event_processing_task: Mutex::new(Some(event_processing_task)),
@@ -792,7 +813,7 @@ impl Drop for CallbackThreadGuard<'_> {
 
 #[derive(Debug)]
 pub struct Connection {
-    id: Uuid,
+    handle_id: Uuid,
     vpn: SocketAddr,
     state: Arc<Mutex<ConnectionState>>,
     // Set to Some(_) when the event processing task is about to call one of
@@ -961,13 +982,14 @@ mod tests {
     const NOTIFICATIONS_OVERFLOWING_BUFFER: usize = 3;
     const SLOW_CALLBACK_DELAY: Duration = Duration::from_millis(500);
 
-    fn tracked_connections(ids: &[Uuid]) -> usize {
+    fn tracked_connections(handle_ids: &[Uuid]) -> usize {
         let state = STATE.lock();
         let Some(state) = state.as_ref() else {
             return 0;
         };
-        ids.iter()
-            .filter(|id| state.active_connections.contains_key(*id))
+        handle_ids
+            .iter()
+            .filter(|handle_id| state.active_connections.contains_key(*handle_id))
             .count()
     }
 
@@ -1335,6 +1357,7 @@ mod tests {
                     username: Hidden("user:name".to_owned()),
                     password: Hidden("password".to_owned()),
                     kind: CredentialsKind::OpenVPN,
+                    connection_id: Arc::new(ConnectionId::new()),
                 },
             },
             callback.clone(),
@@ -1387,7 +1410,7 @@ mod tests {
 
         assert!( reason.starts_with("persistent error code: 'The request does not have valid authentication credentials', message:") );
         assert!(callback.notifications.lock().is_empty());
-        wait_for(|| tracked_connections(&[connection.id]) == 0);
+        wait_for(|| tracked_connections(&[connection.handle_id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
@@ -1422,7 +1445,7 @@ mod tests {
             "persistent error code: 'The request does not have valid authentication credentials', message: \"Challenge not authenticated\""
         );
         assert!(callback.notifications.lock().is_empty());
-        wait_for(|| tracked_connections(&[connection.id]) == 0);
+        wait_for(|| tracked_connections(&[connection.handle_id]) == 0);
     }
 
     #[test_log::test]
@@ -1550,7 +1573,7 @@ mod tests {
             format!("{CALLBACK_PANIC_REASON}: {CALLBACK_PANIC_MESSAGE}")
         );
         assert_eq!(callback.notifications.lock().len(), 1);
-        wait_for(|| tracked_connections(&[connection.id]) == 0);
+        wait_for(|| tracked_connections(&[connection.handle_id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
@@ -1583,7 +1606,7 @@ mod tests {
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
         assert_eq!(reason, closed_reason(vpn_port));
-        wait_for(|| tracked_connections(&[connection.id]) == 0);
+        wait_for(|| tracked_connections(&[connection.handle_id]) == 0);
 
         assert_matches!(connection.shutdown(), Ok(()));
         assert_eq!(*callback.disconnects.lock(), vec![Some(reason)]);
@@ -1608,13 +1631,13 @@ mod tests {
             callback.clone(),
         )
         .unwrap();
-        let id = connection.id;
+        let handle_id = connection.handle_id;
 
         server_config.send_blocking(Command::End);
 
         let reason = wait_for_disconnect_reason(&callback).unwrap();
         assert_eq!(reason, closed_reason(vpn_port));
-        wait_for(|| tracked_connections(&[id]) == 0);
+        wait_for(|| tracked_connections(&[handle_id]) == 0);
 
         drop(connection);
 
@@ -1633,7 +1656,7 @@ mod tests {
             auth.clone(),
         ));
 
-        let mut ids = Vec::new();
+        let mut handle_ids = Vec::new();
 
         for _ in 0..RECONNECT_COUNT {
             let callback = RecordedCallback::default();
@@ -1643,18 +1666,18 @@ mod tests {
                 callback.clone(),
             )
             .unwrap();
-            ids.push(connection.id);
+            handle_ids.push(connection.handle_id);
 
-            assert_eq!(tracked_connections(&ids), 1);
+            assert_eq!(tracked_connections(&handle_ids), 1);
 
             drop(connection);
 
             // The entry is dropped together with the event processing task, so
             // it doesn't disappear immediately.
-            wait_for(|| tracked_connections(&ids) == 0);
+            wait_for(|| tracked_connections(&handle_ids) == 0);
         }
 
-        assert_eq!(tracked_connections(&ids), 0,);
+        assert_eq!(tracked_connections(&handle_ids), 0,);
     }
 
     #[rstest]
@@ -1797,11 +1820,58 @@ mod tests {
         );
     }
 
+    #[test_log::test]
+    fn test_connection_id_is_reused_on_reconnect() {
+        run_init();
+
+        let auth = TestAuthConfig::new_openvpn();
+
+        let runtime = get_runtime().unwrap();
+        let server_config = runtime.block_on(spawn_authenticating_server(
+            global_user_agent(),
+            auth.clone(),
+        ));
+
+        let authentication = auth.to_authentication(&server_config.public_key);
+        let Authentication::WithCredentials { credentials } = &authentication else {
+            unreachable!("invalid credential type");
+        };
+        let connection_id = credentials.connection_id.as_string();
+
+        let config = Config::new();
+        config.set_backoff_initial(BACKOFF_SECONDS);
+        config.set_backoff_maximal(Some(BACKOFF_SECONDS));
+
+        let callback = RecordedCallback::default();
+        let connection = connect_to_test_server_with_config(
+            &server_config,
+            authentication,
+            callback.clone(),
+            config,
+        )
+        .unwrap();
+
+        for streams in 1..=RECONNECT_COUNT {
+            wait_for(|| server_config.streams() == streams);
+            server_config.send_blocking(Command::Error(Status::internal(REJECTION_MESSAGE)));
+        }
+        wait_for(|| server_config.streams() == RECONNECT_COUNT + 1);
+
+        assert!(callback.disconnects.lock().is_empty());
+        assert_eq!(
+            server_config.connection_ids(),
+            vec![connection_id; RECONNECT_COUNT + 1]
+        );
+
+        connection.shutdown().unwrap();
+    }
+
     #[rstest]
     #[case::unauthenticated(Code::Unauthenticated)]
     #[case::permission_denied(Code::PermissionDenied)]
+    #[case::invalid_argument(Code::InvalidArgument)]
     #[test_log::test]
-    fn test_auth_rejection_mid_stream_ends_the_session(#[case] code: Code) {
+    fn test_rejection_mid_stream_ends_the_session(#[case] code: Code) {
         run_init();
 
         let runtime = get_runtime().unwrap();
@@ -1830,6 +1900,7 @@ mod tests {
         let expected = match code {
             Code::PermissionDenied => "persistent error code: 'The caller does not have permission to execute the specified operation', message: \"token revoked\"".to_owned(),
             Code::Unauthenticated =>  "persistent error code: 'The request does not have valid authentication credentials', message: \"token revoked\"".to_owned(),
+            Code::InvalidArgument =>  "persistent error code: 'Client specified an invalid argument', message: \"token revoked\"".to_owned(),
             _ => unreachable!(),
         };
         assert_eq!(*callback.disconnects.lock(), vec![Some(expected)]);

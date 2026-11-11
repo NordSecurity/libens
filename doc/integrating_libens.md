@@ -203,7 +203,10 @@ The variant must match the VPN protocol of the monitored connection.
 
 **OpenVPN and NordWhisper** - `WithCredentials`. The service `username` and
 `password`. The same ones sent to the VPN server. The username can't contain
-`:`.
+`:`. The `connection_id` identifies the VPN session: create a new `ConnectionId`
+when the user starts a VPN session, pass `as_string()` to the VPN protocol
+and reuse the same one for every ENS and VPN reconnection within that session.
+Never persist it.
 
 <multi-code-select></multi-code-select>
 
@@ -218,11 +221,14 @@ nordLynx := ens.AuthenticationWithKeys{
     },
 }
 
+connectionId := ens.NewConnectionId()
+
 openVpn := ens.AuthenticationWithCredentials{
     Credentials: ens.Credentials{
-        Username: username,
-        Password: password,
-        Kind:     ens.CredentialsKindOpenVpn,
+        Username:     username,
+        Password:     password,
+        Kind:         ens.CredentialsKindOpenVpn,
+        ConnectionId: connectionId,
     },
 }
 ```
@@ -233,26 +239,33 @@ let nordLynx = Authentication.withKeys(keys: Keys(
     vpnPublicKey: serverPublicKey,
     kind: .nordLynx))
 
+let connectionId = ConnectionId()
+
 let openVpn = Authentication.withCredentials(credentials: Credentials(
     username: username,
     password: password,
-    kind: .openVpn))
+    kind: .openVpn,
+    connectionId: connectionId))
 ```
 
 ```cs
 var nordLynx = new Authentication.WithKeys(
     new Keys(privateKey, serverPublicKey, KeyKind.NordLynx));
 
+var connectionId = new ConnectionId();
+
 var openVpn = new Authentication.WithCredentials(
-    new Credentials(username, password, CredentialsKind.OpenVpn));
+    new Credentials(username, password, CredentialsKind.OpenVpn, connectionId));
 ```
 
 ```kotlin
 val nordLynx = Authentication.WithKeys(
     Keys(privateKey, serverPublicKey, KeyKind.NORD_LYNX))
 
+val connectionId = ConnectionId()
+
 val openVpn = Authentication.WithCredentials(
-    Credentials(username, password, CredentialsKind.OPEN_VPN))
+    Credentials(username, password, CredentialsKind.OPEN_VPN, connectionId))
 ```
 
 </multi-code>

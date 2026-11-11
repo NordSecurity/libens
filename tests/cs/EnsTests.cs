@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using uniffi.ens;
 using Xunit;
 
@@ -23,6 +24,7 @@ public class EnsTests
     private const string ShutdownReason = "shutdown";
     private const string AuthRejectionReason =
         "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\"";
+    private const string UuidV4Pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
     [Fact]
     public void TestNotificationOverKeyAuthentication()
@@ -53,13 +55,23 @@ public class EnsTests
     public void TestNotificationOverNordWhisperAuthentication() =>
         ReceiveOverPasswordAuthentication(NordWhisperSchema, CredentialsKind.NordWhisper);
 
+    [Fact]
+    public void TestConnectionIdIsUuidV4()
+    {
+        using var first = new ConnectionId();
+        using var second = new ConnectionId();
+
+        Assert.Matches(UuidV4Pattern, first.AsString());
+        Assert.NotEqual(first.AsString(), second.AsString());
+    }
+
     private static void ReceiveOverPasswordAuthentication(string schema, CredentialsKind kind)
     {
         using var server = StubServer.Start(schema);
 
         var callback = new NotificationRecorder();
         using var connection = ConnectToStub(server, new Authentication.WithCredentials(
-            new Credentials(server.Handshake.Username!, server.Handshake.Password!, kind)), callback);
+            new Credentials(server.Handshake.Username!, server.Handshake.Password!, kind, new ConnectionId())), callback);
 
         server.Notify(ServerMaintenanceCode, MaintenanceInfo);
 
@@ -80,7 +92,7 @@ public class EnsTests
 
         var callback = new NotificationRecorder();
         using var connection = ConnectToStub(server, new Authentication.WithCredentials(
-            new Credentials(server.Handshake.Username!, WrongPassword, CredentialsKind.OpenVpn)), callback);
+            new Credentials(server.Handshake.Username!, WrongPassword, CredentialsKind.OpenVpn, new ConnectionId())), callback);
 
         Assert.Equal(AuthRejectionReason, callback.WaitDisconnect());
         Assert.Equal(0, callback.NotificationCount);

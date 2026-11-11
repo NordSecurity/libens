@@ -20,6 +20,7 @@ final class EnsTests: XCTestCase {
     private static let authRejectionReason =
         "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
     private static let callbackTimeout: TimeInterval = 10
+    private static let uuidV4Pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 
     override func setUp() {
         LibraryFixture.start()
@@ -60,6 +61,14 @@ final class EnsTests: XCTestCase {
         try receiveOverPasswordAuthentication(schema: EnsTests.nordWhisperSchema, kind: .nordWhisper)
     }
 
+    func testConnectionIdIsUuidV4() {
+        let first = ConnectionId().asString()
+        let second = ConnectionId().asString()
+
+        XCTAssertNotNil(first.range(of: EnsTests.uuidV4Pattern, options: .regularExpression), first)
+        XCTAssertNotEqual(first, second)
+    }
+
     private func receiveOverPasswordAuthentication(schema: String, kind: CredentialsKind) throws {
         let server = try StubServer(schema: schema)
         defer { XCTAssertNoThrow(try server.shutdown()) }
@@ -68,7 +77,8 @@ final class EnsTests: XCTestCase {
         let credentials = Credentials(
             username: server.handshake.username!,
             password: server.handshake.password!,
-            kind: kind)
+            kind: kind,
+            connectionId: ConnectionId())
         let connection = try EnsTests.connect(
             server, .withCredentials(credentials: credentials), callback)
         defer { try? connection.shutdown() }
@@ -96,7 +106,8 @@ final class EnsTests: XCTestCase {
         let credentials = Credentials(
             username: server.handshake.username!,
             password: EnsTests.wrongPassword,
-            kind: .openVpn)
+            kind: .openVpn,
+            connectionId: ConnectionId())
         let connection = try EnsTests.connect(
             server, .withCredentials(credentials: credentials), callback)
         defer { try? connection.shutdown() }

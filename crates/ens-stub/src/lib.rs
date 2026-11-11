@@ -39,7 +39,7 @@ use tonic::{
     transport::{Identity, Server, ServerTlsConfig},
     Request, Response, Status,
 };
-use uuid::Uuid;
+use uuid::{Uuid, Version};
 
 use llt_proto::ens::{
     ens_server::{self, EnsServer},
@@ -56,6 +56,7 @@ const ERROR_STREAM_CHANNEL_SIZE: usize = 1;
 const AUTHENTICATION_CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
 const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
+const CONNECTION_ID_KEY: &str = "ens-connection-id";
 const USER_AGENT_KEY: &str = "user-agent";
 
 const NORDLYNX_PROTOCOL: &str = "nordlynx";
@@ -218,6 +219,12 @@ impl ServerConfig {
         self.stub.0.streams.load(Ordering::SeqCst)
     }
 
+    /// The connection ids of the accepted requests
+    #[must_use]
+    pub fn connection_ids(&self) -> Vec<String> {
+        self.stub.0.connection_ids.lock().clone()
+    }
+
     /// Queues a command for the error notification stream. The commands are
     /// buffered, so they can be sent before the client connects.
     pub fn send_blocking(&self, command: Command) {
@@ -316,6 +323,7 @@ struct StubState {
     command_rx: AsyncReceiver<Command>,
     streams: AtomicUsize,
     challenges: Mutex<HashSet<Uuid>>,
+    connection_ids: Mutex<Vec<String>>,
     vpn_server_private_key: SecretKey,
 }
 
@@ -328,6 +336,7 @@ impl GrpcStub {
             command_rx,
             streams: AtomicUsize::new(0),
             challenges: Mutex::new(HashSet::default()),
+            connection_ids: Mutex::default(),
             vpn_server_private_key,
         }))
     }
@@ -409,6 +418,14 @@ impl Interceptor for CheckAuthenticationInterceptor {
         self.check(&req)
             .inspect_err(|e| warn!("Rejecting a request: {e}"))?;
 
+        if let Some(id) = req
+            .metadata()
+            .get(CONNECTION_ID_KEY)
+            .and_then(|id| id.to_str().ok())
+        {
+            self.stub.0.connection_ids.lock().push(id.to_owned());
+        }
+
         Ok(req)
     }
 }
@@ -448,7 +465,8 @@ impl CheckAuthenticationInterceptor {
             }
             ExpectedAuth::NordWhisper { username, password }
             | ExpectedAuth::OpenVpn { username, password } => {
-                check_credentials(req, username, password)
+                check_credentials(req, username, password)?;
+                check_connection_id(req)
             }
         }
     }
@@ -520,6 +538,29 @@ fn check_credentials(
 
     if received.password != password {
         return Err(Status::unauthenticated("Incorrect password"));
+    }
+
+    Ok(())
+}
+
+fn check_connection_id(req: &Request<()>) -> std::result::Result<(), Status> {
+    let received = req
+        .metadata()
+        .get(CONNECTION_ID_KEY)
+        .and_then(|id| id.to_str().ok())
+        .ok_or_else(|| {
+            Status::unauthenticated(format!("Missing {CONNECTION_ID_KEY} in metadata"))
+        })?;
+
+    let canonical = Uuid::try_parse(received)
+        .ok()
+        .filter(|id| id.get_version() == Some(Version::Random))
+        .is_some_and(|id| id.hyphenated().to_string() == received);
+
+    if !canonical {
+        return Err(Status::invalid_argument(format!(
+            "Malformed {CONNECTION_ID_KEY}: {received:?}"
+        )));
     }
 
     Ok(())
@@ -618,6 +659,10 @@ mod tests {
         request
             .metadata_mut()
             .insert(NORD_VPN_PROTOCOL_KEY, protocol.parse().unwrap());
+        request.metadata_mut().insert(
+            CONNECTION_ID_KEY,
+            Uuid::new_v4().to_string().parse().unwrap(),
+        );
 
         request
     }
@@ -733,6 +778,39 @@ mod tests {
             .call(request)
             .unwrap_err();
         assert_eq!(rejected.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn a_bad_connection_id_is_rejected() {
+        const MALFORMED: [&str; 4] = [
+            "not a uuid",
+            "6F9619FF-8B86-4D11-B42D-00C04FC964FF",
+            "6f9619ff-8b86-1d11-b42d-00c04fc964ff",
+            "6f9619ff8b864d11b42d00c04fc964ff",
+        ];
+
+        let stub = stub();
+        let auth = ExpectedAuth::new_openvpn();
+        let (username, password) = auth.credentials().unwrap();
+
+        let mut missing = credentials_request(username, password, OPENVPN_PROTOCOL);
+        missing.metadata_mut().remove(CONNECTION_ID_KEY);
+        let rejected = interceptor(&stub, auth.clone(), None)
+            .call(missing)
+            .unwrap_err();
+        assert_eq!(rejected.code(), Code::Unauthenticated);
+
+        for id in MALFORMED {
+            let mut request = credentials_request(username, password, OPENVPN_PROTOCOL);
+            request
+                .metadata_mut()
+                .insert(CONNECTION_ID_KEY, id.parse().unwrap());
+
+            let rejected = interceptor(&stub, auth.clone(), None)
+                .call(request)
+                .unwrap_err();
+            assert_eq!(rejected.code(), Code::InvalidArgument, "{id}");
+        }
     }
 
     #[tokio::test]

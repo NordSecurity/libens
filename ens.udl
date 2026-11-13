@@ -116,6 +116,18 @@ enum CredentialsKind {
     "NordWhisper"
 };
 
+/// Identifier of a single VPN session, shared by its ENS connection and its
+/// VPN connection. Generate a new one for every VPN session started by the
+/// user and reuse it for all reconnections within that session.
+interface ConnectionId {
+    /// Generates a new random identifier.
+    constructor();
+
+    /// Textual form of the identifier, to pass to the VPN protocol
+    /// (OpenVPN, NordWhisper, etc.).
+    string as_string();
+};
+
 /// Service credentials used to authenticate to ENS for OpenVPN and
 /// NordWhisper VPN sessions.
 ///
@@ -133,6 +145,9 @@ dictionary Credentials {
     HiddenString password;
     /// Which VPN protocol this credential pair authenticates.
     CredentialsKind kind;
+    /// Identifier of the VPN session this ENS connection belongs to.
+    /// Must be the same value given to the VPN protocol for this session.
+    ConnectionId connection_id;
 };
 
 /// Which VPN protocol the accompanying `Keys` are for. Reserved for

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"testing"
 	"time"
 
@@ -29,6 +30,8 @@ const (
 )
 
 var logs = newLogRecorder()
+
+var uuidV4 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 type logRecorder struct {
 	messages chan string
@@ -128,6 +131,21 @@ func TestNotificationOverNordWhisperAuthentication(t *testing.T) {
 	receiveOneNotification(t, server, credentialsAuthentication(server, ens.CredentialsKindNordWhisper))
 }
 
+func TestConnectionIdIsUuidV4(t *testing.T) {
+	first := ens.NewConnectionId()
+	defer first.Destroy()
+	second := ens.NewConnectionId()
+	defer second.Destroy()
+
+	if !uuidV4.MatchString(first.AsString()) {
+		t.Fatalf("Not a canonical uuid v4: %q", first.AsString())
+	}
+
+	if first.AsString() == second.AsString() {
+		t.Fatalf("Connection ids repeat: %q", first.AsString())
+	}
+}
+
 func TestNotificationKinds(t *testing.T) {
 	server := startStub(t, nordLynxSchema)
 
@@ -184,9 +202,10 @@ func TestAuthenticationRejection(t *testing.T) {
 	callback := newRecorder()
 	connection := connect(t, server, ens.AuthenticationWithCredentials{
 		Credentials: ens.Credentials{
-			Username: server.handshake.Username,
-			Password: wrongPassword,
-			Kind:     ens.CredentialsKindOpenVpn,
+			Username:     server.handshake.Username,
+			Password:     wrongPassword,
+			Kind:         ens.CredentialsKindOpenVpn,
+			ConnectionId: ens.NewConnectionId(),
 		},
 	}, callback)
 	defer connection.Destroy()
@@ -284,9 +303,10 @@ func keyAuthentication(t *testing.T, vpnPublicKey []byte) ens.Authentication {
 func credentialsAuthentication(server *stub, kind ens.CredentialsKind) ens.Authentication {
 	return ens.AuthenticationWithCredentials{
 		Credentials: ens.Credentials{
-			Username: server.handshake.Username,
-			Password: server.handshake.Password,
-			Kind:     kind,
+			Username:     server.handshake.Username,
+			Password:     server.handshake.Password,
+			Kind:         kind,
+			ConnectionId: ens.NewConnectionId(),
 		},
 	}
 }

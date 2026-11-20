@@ -345,6 +345,7 @@ jobs:
           path: |
             dist/windows/release/${{ matrix.arch }}/ens.dll
             dist/windows/release/${{ matrix.arch }}/ens.dll.lib
+            dist/windows/release/${{ matrix.arch }}/ens.pdb
           if-no-files-found: error
 
   build-android:

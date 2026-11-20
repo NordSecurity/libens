@@ -4,6 +4,8 @@ package_name = "com.nordsec.ens"
 
 [bindings.csharp]
 cdylib_name = "ens"
+access_modifier = "public"
 
 [bindings.python]
 cdylib_name = "ens"
+

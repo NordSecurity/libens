@@ -7,6 +7,7 @@ import com.nordsec.ens.Config
 import com.nordsec.ens.Connection
 import com.nordsec.ens.ConnectionErrorNotification
 import com.nordsec.ens.ConnectionErrorNotificationKind
+import com.nordsec.ens.ConnectionId
 import com.nordsec.ens.CredentialsKind
 import com.nordsec.ens.Credentials
 import com.nordsec.ens.EnsException
@@ -26,6 +27,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.AfterClass
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -52,6 +54,7 @@ private const val WRONG_PASSWORD = "wrong"
 private const val AUTH_REJECTION_REASON =
     "persistent error code: 'The request does not have valid authentication credentials', message: \"Incorrect password\""
 private const val SHUTDOWN_REASON = "shutdown"
+private val UUID_V4 = Regex("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
 @RunWith(AndroidJUnit4::class)
 class EnsTest {
@@ -103,6 +106,16 @@ class EnsTest {
     fun testNotificationOverNordWhisperAuthentication() =
         receiveOverPasswordAuthentication(NORDWHISPER_SCHEMA, CredentialsKind.NORD_WHISPER)
 
+    @Test
+    fun testConnectionIdIsUuidV4() {
+        ConnectionId().use { first ->
+            ConnectionId().use { second ->
+                assertTrue(first.asString(), UUID_V4.matches(first.asString()))
+                assertNotEquals(first.asString(), second.asString())
+            }
+        }
+    }
+
     private fun receiveOverPasswordAuthentication(schema: String, kind: CredentialsKind) {
         val server = StubServer(schema)
         val callback = NotificationRecorder()
@@ -110,6 +123,7 @@ class EnsTest {
             server.handshake.username!!,
             server.handshake.password!!,
             kind,
+            ConnectionId(),
         )
         var connection: Connection? = null
 
@@ -141,6 +155,7 @@ class EnsTest {
             server.handshake.username!!,
             WRONG_PASSWORD,
             CredentialsKind.OPEN_VPN,
+            ConnectionId(),
         )
         var connection: Connection? = null
 

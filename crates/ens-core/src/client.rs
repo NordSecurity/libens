@@ -46,6 +46,7 @@ mod ech;
 const CONTEXT: &str = "ens-auth";
 const AUTHENTICATION_KEY: &str = "authentication";
 const NORD_VPN_PROTOCOL_KEY: &str = "nord-vpn-protocol";
+const CONNECTION_ID_KEY: &str = "ens-connection-id";
 const DEFAULT_ROOT_CERTIFICATE: &[u8] =
     include_bytes!("../../../data/default_root_certificate.der");
 const MISSING_HOST_MSG: &str = "missing host in vpn uri";
@@ -378,7 +379,10 @@ trait IsPersistentError: std::fmt::Display {
 
 impl IsPersistentError for Status {
     fn is_persistent(&self) -> bool {
-        matches!(self.code(), Code::Unauthenticated | Code::PermissionDenied)
+        matches!(
+            self.code(),
+            Code::Unauthenticated | Code::PermissionDenied | Code::InvalidArgument
+        )
     }
 }
 
@@ -955,6 +959,10 @@ async fn prepare_connection_headers(
                 credentials.basic_auth()?,
             ),
             (NORD_VPN_PROTOCOL_KEY, credentials.kind.protocol_name()),
+            (
+                CONNECTION_ID_KEY,
+                AsciiMetadataValue::try_from(credentials.connection_id.as_string())?,
+            ),
         ],
         ClientAuthentication::Keys { keys } => {
             let authenticated_challenge = get_login_challenge(
@@ -1005,7 +1013,7 @@ pub mod tests {
             spawn_plain_server, BadRetryLasts, Command, EchMode as StubEchMode, GoEchStub,
             RelayMode, RetryConfig, ServerConfig, TcpRelay,
         },
-        CredentialsKind, Keys, STATE,
+        ConnectionId, CredentialsKind, Keys, STATE,
     };
 
     use super::*;
@@ -1100,6 +1108,7 @@ pub mod tests {
                             username,
                             password,
                             kind: CredentialsKind::NordWhisper,
+                            connection_id: Arc::new(ConnectionId::new()),
                         },
                     }
                 }
@@ -1108,6 +1117,7 @@ pub mod tests {
                         username,
                         password,
                         kind: CredentialsKind::OpenVPN,
+                        connection_id: Arc::new(ConnectionId::new()),
                     },
                 },
             }

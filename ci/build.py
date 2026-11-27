@@ -120,6 +120,7 @@ LIBENS_CONFIG = {
             "libens": {
                 "ens": "ens.dll",
                 "ens.lib": "ens.dll.lib",
+                "ens.pdb": "ens.pdb",
             },
         },
         "env": {"RUSTFLAGS": (f"{WINDOWS_CONTROL_FLOW_GUARD}", "set")},

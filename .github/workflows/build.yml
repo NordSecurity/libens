@@ -345,6 +345,7 @@ jobs:
           path: |
             dist/windows/release/${{ matrix.arch }}/ens.dll
             dist/windows/release/${{ matrix.arch }}/ens.dll.lib
+            dist/windows/release/${{ matrix.arch }}/ens.pdb
           if-no-files-found: error
 
   build-android:
@@ -472,7 +473,7 @@ jobs:
       trigger-token: ${{ secrets.CODEHUB_TOKEN }}
       project-id: ${{ secrets.CODEHUB_PROJECT_ID }}
     with:
-      triggered-ref: master
+      triggered-ref: LLT-7791_add_nuget_packaging
       cancel-outdated-pipelines: ${{ github.ref_name != 'main' }}
       variables: |
         GITHUB_RUN_ID=${{ github.run_id }}
